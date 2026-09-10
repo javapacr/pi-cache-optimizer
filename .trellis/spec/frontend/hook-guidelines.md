@@ -72,8 +72,8 @@ Primary hooks/events:
 - Unknown/custom transports, unsupported wrappers, malformed tools, blank/missing names, any supported tool array with a top-level `cache_control`, and Anthropic arrays containing `defer_loading` are no-ops.
 - Compose the returned sorted payload with the existing TTL-order repair, retention safety, prompt-cache-key fallback, routing, and adapter behavior. Never add Anthropic trailing breakpoints.
 - For every effective `anthropic-messages` model, validate final cache breakpoints in `tools → system → messages` order and downgrade a visible invalid 5-minute-to-1-hour transition. Preserve legal third-party 1-hour retention unless this exact provider/model previously returned Anthropic's explicit TTL-ordering error in the current process.
-- Only inject OpenAI-compatible `prompt_cache_key` fallback for `openai-completions` / `openai-responses` APIs.
-- Preserve existing non-empty `prompt_cache_key` / `promptCacheKey` values.
+- Only inject OpenAI-compatible `prompt_cache_key` fallback for `openai-completions` / `openai-responses` APIs whose effective `supportsPromptCacheKey` compat is not explicitly `false`; resolve that capability with the same provider/model/runtime/modelOverride precedence used by other compat behavior.
+- Preserve existing non-empty `prompt_cache_key` / `promptCacheKey` values; an opt-out suppresses only this extension's fallback and never removes caller/Pi-provided keys.
 - Use Pi session id fallback; do not derive keys from prompt content.
 - For virtual routing providers, resolve the upstream model via the routing registry when available.
 
@@ -106,7 +106,7 @@ Primary hooks/events:
 ## Common Mistakes
 
 - Doing final stats attribution from live/global router state instead of assistant message metadata.
-- Injecting OpenAI cache keys or affinity headers into custom transports such as `kiro-api`.
+- Injecting OpenAI cache keys or affinity headers into custom transports such as `kiro-api`, or ignoring an explicit effective `supportsPromptCacheKey: false` opt-out.
 - Treating `ctx.model.compat` as the only effective compat source for extension providers; `registerProvider()` model replacement can omit provider/custom-model compat even though exact `models.json` configuration remains authoritative.
 - Normalizing Anthropic TTLs by provider/model name instead of validating the effective API and final wire-order payload.
 - Treating a provider id alone (including `llama.cpp`) as proof of transport capabilities; prefer Pi's explicit model/compat fingerprint and honor overrides.
