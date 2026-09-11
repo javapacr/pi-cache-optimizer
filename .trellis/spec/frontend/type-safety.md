@@ -45,6 +45,7 @@ External inputs are not trusted, including:
 
 - assistant messages
 - persisted stats JSON
+- extension config and receipts
 - route snapshots from global routing registry adapters
 - cache hints service inputs
 - command arguments
@@ -53,6 +54,8 @@ External inputs are not trusted, including:
 Preferred patterns:
 
 - Use small type guards such as `asRecord`, `isNonEmptyString`, and enum parsers.
+- Validate extension config/receipts with versioned allowlists, exact provider/model
+  strings, hashes, and basename-only backup names before runtime use or rollback.
 - Parse and clamp numeric counters before persisting.
 - Drop malformed persisted entries rather than throwing.
 - Treat malformed route snapshots as absent.

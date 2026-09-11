@@ -114,6 +114,8 @@ const SHARD_GLOBAL_EPOCH_PATH = join(SHARD_EPOCH_DIR, "global.json");
 const SHARD_CLEANUP_LOCK_PATH = join(SHARD_MAINTENANCE_DIR, "cleanup.lock");
 const SHARD_CLEANUP_MARKER_PATH = join(SHARD_MAINTENANCE_DIR, "last-cleanup");
 const CONFIG_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-config.json");
+const CONFIG_RECEIPT_FILE_NAME = "pi-cache-optimizer-config-receipt.json";
+const CONFIG_RECEIPT_PATH = join(STATE_DIR, CONFIG_RECEIPT_FILE_NAME);
 const FIX_RECEIPT_FILE_NAME = "pi-cache-optimizer-fix-receipt.json";
 const FIX_RECEIPT_PATH = join(STATE_DIR, FIX_RECEIPT_FILE_NAME);
 const MODELS_TRANSACTION_LOCK_PATH = join(STATE_DIR, "pi-cache-optimizer-models-transaction.lock");
@@ -176,6 +178,31 @@ type FooterStatsModeSource = "config" | "env" | "default";
 type PersistedCacheOptimizerConfigV1 = {
   version: 1;
   footerMode?: FooterStatsMode;
+};
+type PersistedCacheOptimizerConfigV2 = {
+  version: 2;
+  footerMode?: FooterStatsMode;
+  promptCacheKey?: {
+    omit?: string[];
+  };
+};
+type PersistedCacheOptimizerConfig = PersistedCacheOptimizerConfigV1 | PersistedCacheOptimizerConfigV2;
+type PromptCacheKeyConfigReceipt = {
+  version: 2;
+  kind: "pi-cache-optimizer-config-receipt";
+  transactionId: string;
+  provider: string;
+  modelId: string;
+  beforeHash: string;
+  afterHash: string;
+  backupFile: string;
+  targetExistedBefore: boolean;
+  targetHadModelKey: boolean;
+  addedModelKey: string;
+  createdAt: number;
+  appliedAt: number;
+  status?: "rolled_back";
+  rolledBackAt?: number;
 };
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
@@ -1870,6 +1897,7 @@ const CACHE_OPTIMIZER_COMMANDS = [
 const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode"] as const;
 const CACHE_OPTIMIZER_FOOTER_MODES = ["total", "session", "process"] as const;
 const CACHE_OPTIMIZER_STATS_ARGUMENTS = ["all", "contributors"] as const;
+const CACHE_OPTIMIZER_FIX_ARGUMENTS = ["prompt-cache-key"] as const;
 
 function filterCommandCompletionItems(
   values: readonly string[],
@@ -1920,6 +1948,12 @@ function getCacheOptimizerArgumentCompletions(argumentPrefix: string): CommandCo
       : null;
   }
 
+  if (parts[0].toLowerCase() === "fix") {
+    return parts.length === 2
+      ? filterCommandCompletionItems(CACHE_OPTIMIZER_FIX_ARGUMENTS, parts[1], "fix")
+      : null;
+  }
+
   if (parts[0].toLowerCase() !== "config") return null;
 
   if (parts.length === 2) {
@@ -1937,36 +1971,368 @@ function getCacheOptimizerArgumentCompletions(argumentPrefix: string): CommandCo
   return null;
 }
 
-function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCacheOptimizerConfigV1 | undefined {
+function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCacheOptimizerConfig | undefined {
   const record = asRecord(value);
-  if (!record || record.version !== 1) return undefined;
+  if (!record || (record.version !== 1 && record.version !== 2)) return undefined;
+  const allowedTopLevel = new Set(record.version === 1 ? ["version", "footerMode"] : ["version", "footerMode", "promptCacheKey"]);
+  if (Object.keys(record).some((key) => !allowedTopLevel.has(key))) return undefined;
   const footerMode = parseFooterStatsMode(record.footerMode);
   if (record.footerMode !== undefined && !footerMode) return undefined;
-  return { version: 1, ...(footerMode ? { footerMode } : {}) };
+  if (record.version === 1) return { version: 1, ...(footerMode ? { footerMode } : {}) };
+
+  const rawPromptCacheKey = record.promptCacheKey;
+  if (rawPromptCacheKey !== undefined && !asRecord(rawPromptCacheKey)) return undefined;
+  const promptCacheKey = asRecord(rawPromptCacheKey);
+  if (promptCacheKey && Object.keys(promptCacheKey).some((key) => key !== "omit")) return undefined;
+  const omit = promptCacheKey?.omit;
+  if (omit !== undefined && (!Array.isArray(omit) || omit.some((value): value is string => !isNonEmptyString(value)))) return undefined;
+  const stringOmit = omit as string[] | undefined;
+  const uniqueOmit = stringOmit ? [...new Set(stringOmit.map((value) => value.trim()))].sort() : undefined;
+  return {
+    version: 2,
+    ...(footerMode ? { footerMode } : {}),
+    ...(uniqueOmit && uniqueOmit.length > 0 ? { promptCacheKey: { omit: uniqueOmit } } : {}),
+  };
+}
+
+function normalizePersistedCacheOptimizerConfig(value: PersistedCacheOptimizerConfig | undefined): PersistedCacheOptimizerConfigV2 {
+  if (!value) return { version: 2 };
+  return value.version === 2
+    ? value
+    : { version: 2, ...(value.footerMode ? { footerMode: value.footerMode } : {}) };
+}
+
+function readPersistedCacheOptimizerConfig(configPath: string = CONFIG_FILE_PATH): PersistedCacheOptimizerConfigV2 {
+  try {
+    return normalizePersistedCacheOptimizerConfig(parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8"))));
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to read optimizer config; using defaults`, error);
+    return { version: 2 };
+  }
 }
 
 function readPersistedFooterMode(configPath: string = CONFIG_FILE_PATH): FooterStatsMode | undefined {
+  return readPersistedCacheOptimizerConfig(configPath).footerMode;
+}
+
+async function writePersistedCacheOptimizerConfigUnlocked(
+  config: PersistedCacheOptimizerConfigV2,
+  configPath: string,
+): Promise<void> {
+  await mkdir(dirname(configPath), { recursive: true });
+  const payloadText = JSON.stringify(normalizePersistedCacheOptimizerConfig(config), null, 2) + "\n";
+  let targetInfo: Awaited<ReturnType<typeof lstat>> | undefined;
+  let targetMode = 0o600;
+  let targetHash: string | undefined;
   try {
-    const parsed = parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8")));
-    if (!parsed) throw new Error("invalid footer config schema");
-    return parsed.footerMode;
+    targetInfo = await lstat(configPath);
+    if (targetInfo.isSymbolicLink() || !targetInfo.isFile()) throw new Error("optimizer config is not a regular file; no changes were made");
+    const targetText = await readFile(configPath, "utf8");
+    targetMode = targetInfo.mode & 0o7777;
+    targetHash = hashText(targetText);
   } catch (error) {
-    if (getErrorCode(error) !== "ENOENT") {
-      console.warn(`${LOG_PREFIX}: failed to read footer config; using environment/default mode`, error);
-    }
-    return undefined;
+    if (getErrorCode(error) !== "ENOENT") throw error;
   }
+  if (targetInfo) {
+    await atomicReplaceTextFilePreservingMode(configPath, payloadText, targetMode, "config", {
+      identity: targetInfo,
+      hash: targetHash,
+      mode: targetMode,
+    });
+    return;
+  }
+
+  const tempPath = uniqueTempPath(configPath, "config");
+  try {
+    await writeFile(tempPath, payloadText, { encoding: "utf8", mode: targetMode, flag: "wx" });
+    await chmod(tempPath, targetMode);
+    try {
+      await lstat(configPath);
+      throw new Error("optimizer config appeared during write; no changes were made");
+    } catch (error) {
+      if (getErrorCode(error) !== "ENOENT") throw error;
+    }
+    await rename(tempPath, configPath);
+  } catch (error) {
+    await unlink(tempPath).catch((cleanupError) => { if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary config`, cleanupError); });
+    throw error;
+  }
+}
+
+async function writePersistedCacheOptimizerConfig(
+  config: PersistedCacheOptimizerConfigV2,
+  configPath: string = CONFIG_FILE_PATH,
+): Promise<void> {
+  await withModelsJsonTransactionLock(() => writePersistedCacheOptimizerConfigUnlocked(config, configPath));
+}
+
+async function writePersistedFooterModeUnlocked(
+  mode: FooterStatsMode,
+  configPath: string,
+): Promise<void> {
+  let version: 1 | 2 = 1;
+  let raw: PersistedCacheOptimizerConfig | undefined;
+  let targetExists = false;
+  try {
+    raw = parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8")));
+    targetExists = true;
+    if (!raw) throw new Error("invalid footer config schema");
+    version = raw.version === 2 ? 2 : 1;
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") throw new Error("invalid footer config schema");
+  }
+  const current = normalizePersistedCacheOptimizerConfig(raw);
+  if (version === 1 && !current.promptCacheKey) {
+    await mkdir(dirname(configPath), { recursive: true });
+    const targetInfo = targetExists ? await lstat(configPath) : undefined;
+    if (targetInfo && (targetInfo.isSymbolicLink() || !targetInfo.isFile())) throw new Error("optimizer config is not a regular file; no changes were made");
+    const targetText = targetInfo ? await readFile(configPath, "utf8") : undefined;
+    const targetMode = targetInfo ? targetInfo.mode & 0o7777 : 0o600;
+    const tempPath = uniqueTempPath(configPath, "config-footer");
+    try {
+      await writeFile(tempPath, JSON.stringify({ version: 1, footerMode: mode }, null, 2) + "\n", { encoding: "utf8", mode: targetMode, flag: "wx" });
+      await chmod(tempPath, targetMode);
+      if (targetInfo && targetText !== undefined) {
+        await validateAtomicTarget(configPath, { identity: targetInfo, hash: hashText(targetText), mode: targetMode });
+      } else {
+        try {
+          await lstat(configPath);
+          throw new Error("optimizer config appeared during footer write; no changes were made");
+        } catch (error) {
+          if (getErrorCode(error) !== "ENOENT") throw error;
+        }
+      }
+      await rename(tempPath, configPath);
+    } catch (error) {
+      await unlink(tempPath).catch(() => {});
+      throw error;
+    }
+    return;
+  }
+  await writePersistedCacheOptimizerConfigUnlocked({ ...current, version: 2, footerMode: mode }, configPath);
 }
 
 async function writePersistedFooterMode(
   mode: FooterStatsMode,
   configPath: string = CONFIG_FILE_PATH,
 ): Promise<void> {
+  await withModelsJsonTransactionLock(() => writePersistedFooterModeUnlocked(mode, configPath));
+}
+
+function configReceiptBackupPath(receipt: PromptCacheKeyConfigReceipt, receiptPath: string = CONFIG_RECEIPT_PATH): string {
+  return join(dirname(receiptPath), receipt.backupFile);
+}
+
+function parsePromptCacheKeyConfigReceipt(value: unknown): PromptCacheKeyConfigReceipt | undefined {
+  const record = asRecord(value);
+  if (!record || (record.version !== 1 && record.version !== 2) || record.kind !== "pi-cache-optimizer-config-receipt") return undefined;
+  const allowed = new Set(record.version === 1
+    ? ["version", "kind", "transactionId", "provider", "modelId", "beforeHash", "afterHash", "backupFile", "targetExistedBefore", "createdAt", "appliedAt", "status", "rolledBackAt"]
+    : ["version", "kind", "transactionId", "provider", "modelId", "beforeHash", "afterHash", "backupFile", "targetExistedBefore", "targetHadModelKey", "addedModelKey", "createdAt", "appliedAt", "status", "rolledBackAt"]);
+  if (Object.keys(record).some((key) => !allowed.has(key))) return undefined;
+  if (![record.transactionId, record.provider, record.modelId].every(isSafeReceiptText)) return undefined;
+  if (!isSha256(record.beforeHash) || !isSha256(record.afterHash) || record.beforeHash === record.afterHash) return undefined;
+  if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || !record.backupFile.startsWith("pi-cache-optimizer-config.backup-")) return undefined;
+  if (typeof record.targetExistedBefore !== "boolean" || !isReceiptTimestamp(record.createdAt) || !isReceiptTimestamp(record.appliedAt)) return undefined;
+  const addedModelKey = `${record.provider}/${record.modelId}`;
+  const targetHadModelKey = record.version === 1 ? false : record.targetHadModelKey;
+  if (typeof targetHadModelKey !== "boolean") return undefined;
+  if (record.version === 2 && (!isSafeReceiptText(record.addedModelKey) || record.addedModelKey !== addedModelKey)) return undefined;
+  if (record.status !== undefined && record.status !== "rolled_back") return undefined;
+  if (record.status === "rolled_back" && (!isReceiptTimestamp(record.rolledBackAt) || record.rolledBackAt < record.appliedAt)) return undefined;
+  if (record.status === undefined && record.rolledBackAt !== undefined) return undefined;
+  return {
+    version: 2,
+    kind: "pi-cache-optimizer-config-receipt",
+    transactionId: String(record.transactionId),
+    provider: String(record.provider),
+    modelId: String(record.modelId),
+    beforeHash: String(record.beforeHash).toLowerCase(),
+    afterHash: String(record.afterHash).toLowerCase(),
+    backupFile: String(record.backupFile),
+    targetExistedBefore: record.targetExistedBefore,
+    targetHadModelKey,
+    addedModelKey,
+    createdAt: Number(record.createdAt),
+    appliedAt: Number(record.appliedAt),
+    ...(record.status === "rolled_back" ? { status: "rolled_back", rolledBackAt: Number(record.rolledBackAt) } : {}),
+  };
+}
+
+function isActionablePromptCacheKeyConfigReceipt(receipt: PromptCacheKeyConfigReceipt | undefined): receipt is PromptCacheKeyConfigReceipt {
+  return receipt !== undefined && receipt.status === undefined;
+}
+
+async function readPromptCacheKeyConfigReceipt(receiptPath: string = CONFIG_RECEIPT_PATH): Promise<PromptCacheKeyConfigReceipt | undefined> {
+  try {
+    const info = await lstat(receiptPath);
+    if (info.isSymbolicLink() || !info.isFile()) return undefined;
+    const receipt = parsePromptCacheKeyConfigReceipt(JSON.parse(await readFile(receiptPath, "utf8")));
+    return receipt;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writePromptCacheKeyConfigReceipt(receipt: PromptCacheKeyConfigReceipt, receiptPath: string = CONFIG_RECEIPT_PATH): Promise<void> {
+  if (!parsePromptCacheKeyConfigReceipt(receipt)) throw new Error("invalid prompt cache key config receipt");
+  await mkdir(dirname(receiptPath), { recursive: true });
+  const tempPath = uniqueTempPath(receiptPath, "config-receipt");
+  try {
+    await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await chmod(tempPath, 0o600);
+    await rename(tempPath, receiptPath);
+  } catch (error) {
+    await unlink(tempPath).catch((cleanupError) => { if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary config receipt`, cleanupError); });
+    throw error;
+  }
+}
+
+async function applyPromptCacheKeyConfigFixUnderLock(
+  model: PiModel,
+  configPath: string = CONFIG_FILE_PATH,
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): Promise<{ receipt: PromptCacheKeyConfigReceipt; backupPath: string }> {
   await mkdir(dirname(configPath), { recursive: true });
-  const payload: PersistedCacheOptimizerConfigV1 = { version: 1, footerMode: mode };
-  const tempPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tempPath, JSON.stringify(payload, null, 2) + "\n", "utf8");
-  await rename(tempPath, configPath);
+  let originalText = "";
+  let targetExistedBefore = false;
+  let mode = 0o600;
+  try {
+    const info = await lstat(configPath);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error("optimizer config is not a regular file; no changes were made");
+    originalText = await readFile(configPath, "utf8");
+    targetExistedBefore = true;
+    mode = info.mode & 0o7777;
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") throw error;
+  }
+  const parsedCurrent = targetExistedBefore ? parsePersistedCacheOptimizerConfig(JSON.parse(originalText)) : undefined;
+  if (targetExistedBefore && !parsedCurrent) throw new Error("optimizer config is invalid; no changes were made");
+  const current = normalizePersistedCacheOptimizerConfig(parsedCurrent);
+  const key = modelKey(model);
+  const existingOmit = current.promptCacheKey?.omit ?? [];
+  const targetHadModelKey = existingOmit.includes(key);
+  const omit = [...new Set([...existingOmit, key])].sort();
+  const next: PersistedCacheOptimizerConfigV2 = { ...current, version: 2, promptCacheKey: { omit } };
+  const modifiedText = JSON.stringify(next, null, 2) + "\n";
+  const beforeHash = hashText(originalText);
+  const afterHash = hashText(modifiedText);
+  const originalInfo = targetExistedBefore ? await lstat(configPath) : undefined;
+  const backupFile = `pi-cache-optimizer-config.backup-${backupTimestamp()}`;
+  const backupPath = join(dirname(configPath), backupFile);
+  if (targetExistedBefore) {
+    await copyFile(configPath, backupPath, fsConstants.COPYFILE_EXCL);
+    await chmod(backupPath, mode);
+  }
+  const tempPath = uniqueTempPath(configPath, "config-fix");
+  let committedInfo: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    await writeFile(tempPath, modifiedText, { encoding: "utf8", mode, flag: "wx" });
+    await chmod(tempPath, mode);
+    if (originalInfo) {
+      await validateAtomicTarget(configPath, { identity: originalInfo, hash: beforeHash, mode });
+    } else {
+      try {
+        await lstat(configPath);
+        throw new Error("optimizer config appeared during the fix; no changes were made");
+      } catch (error) {
+        if (getErrorCode(error) !== "ENOENT") throw error;
+      }
+    }
+    await rename(tempPath, configPath);
+    committedInfo = await lstat(configPath);
+    const receipt: PromptCacheKeyConfigReceipt = {
+      version: 2,
+      kind: "pi-cache-optimizer-config-receipt",
+      transactionId: randomUUID(),
+      provider: model.provider,
+      modelId: model.id,
+      beforeHash,
+      afterHash,
+      backupFile,
+      targetExistedBefore,
+      targetHadModelKey,
+      addedModelKey: key,
+      createdAt: Date.now(),
+      appliedAt: Date.now(),
+    };
+    await writePromptCacheKeyConfigReceipt(receipt, receiptPath);
+    return { receipt, backupPath };
+  } catch (error) {
+    await unlink(tempPath).catch(() => {});
+    if (targetExistedBefore && committedInfo) {
+      await atomicRestoreFileFromBackup(backupPath, configPath, mode, { identity: committedInfo, hash: afterHash, mode }).catch(() => {});
+    } else if (!targetExistedBefore && committedInfo) {
+      await validateAtomicTarget(configPath, { identity: committedInfo, hash: afterHash, mode }).then(() => unlink(configPath)).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function applyPromptCacheKeyConfigFix(
+  model: PiModel,
+  configPath: string = CONFIG_FILE_PATH,
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): Promise<{ receipt: PromptCacheKeyConfigReceipt; backupPath: string }> {
+  return withModelsJsonTransactionLock(() => applyPromptCacheKeyConfigFixUnderLock(model, configPath, receiptPath));
+}
+
+async function rollbackPromptCacheKeyConfigUnderLock(
+  receipt: PromptCacheKeyConfigReceipt,
+  configPath: string = CONFIG_FILE_PATH,
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): Promise<void> {
+  const currentInfo = await lstat(configPath);
+  if (currentInfo.isSymbolicLink() || !currentInfo.isFile()) throw new Error("optimizer config is not a regular file; refusing to overwrite user changes");
+  const currentText = await readFile(configPath, "utf8");
+  if (hashText(currentText) !== receipt.afterHash) throw new Error("optimizer config changed after the fix; refusing to overwrite user changes");
+  const current = parsePersistedCacheOptimizerConfig(JSON.parse(currentText));
+  if (!current) throw new Error("optimizer config is invalid; refusing to overwrite user changes");
+  const key = `${receipt.provider}/${receipt.modelId}`;
+  if (receipt.addedModelKey !== key) throw new Error("prompt-cache-key receipt identity does not match; refusing to change user config");
+  if (receipt.targetHadModelKey) throw new Error("prompt-cache-key was already configured before this fix; refusing to remove user configuration");
+  const omit = current.version === 2 ? current.promptCacheKey?.omit ?? [] : [];
+  if (!omit.includes(receipt.addedModelKey)) throw new Error("prompt-cache-key opt-out is no longer present; refusing to change user config");
+  const backupPath = configReceiptBackupPath(receipt, receiptPath);
+  if (receipt.targetExistedBefore) {
+    const backupInfo = await lstat(backupPath);
+    if (backupInfo.isSymbolicLink() || !backupInfo.isFile()) throw new Error("config backup is not a regular file");
+    const backupText = await readFile(backupPath, "utf8");
+    if (hashText(backupText) !== receipt.beforeHash) throw new Error("config backup hash does not match the fix receipt");
+    await atomicRestoreFileFromBackup(
+      backupPath,
+      configPath,
+      backupInfo.mode & 0o7777,
+      { backupHash: receipt.beforeHash, identity: currentInfo, hash: hashText(currentText), mode: currentInfo.mode & 0o7777 },
+    );
+  } else {
+    if (current.footerMode || omit.length > 1) {
+      const restored: PersistedCacheOptimizerConfigV2 = {
+        version: 2,
+        ...(current.footerMode ? { footerMode: current.footerMode } : {}),
+        ...(omit.length > 1 ? { promptCacheKey: { omit: omit.filter((item) => item !== receipt.addedModelKey) } } : {}),
+      };
+      await atomicReplaceTextFilePreservingMode(
+        configPath,
+        JSON.stringify(restored, null, 2) + "\n",
+        currentInfo.mode & 0o7777,
+        "config-rollback",
+        { identity: currentInfo, hash: hashText(currentText), mode: currentInfo.mode & 0o7777 },
+      );
+    } else {
+      await validateAtomicTarget(configPath, { identity: currentInfo, hash: hashText(currentText), mode: currentInfo.mode & 0o7777 });
+      await unlink(configPath);
+    }
+  }
+  await writePromptCacheKeyConfigReceipt({ ...receipt, status: "rolled_back", rolledBackAt: Date.now() }, receiptPath);
+}
+
+async function rollbackPromptCacheKeyConfig(
+  receipt: PromptCacheKeyConfigReceipt,
+  configPath: string = CONFIG_FILE_PATH,
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): Promise<void> {
+  return withModelsJsonTransactionLock(() => rollbackPromptCacheKeyConfigUnderLock(receipt, configPath, receiptPath));
 }
 
 function resolveFooterStatsMode(
@@ -1985,7 +2351,8 @@ function footerStatsMode(
   return resolveFooterStatsMode(configuredMode, env).mode;
 }
 
-let persistedFooterStatsMode = readPersistedFooterMode();
+let persistedCacheOptimizerConfig = readPersistedCacheOptimizerConfig();
+let persistedFooterStatsMode = persistedCacheOptimizerConfig.footerMode;
 
 function isDisabledEnv(value: string | undefined): boolean {
   if (!value) return false;
@@ -2106,6 +2473,25 @@ function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
 function shouldInjectOpenAIPromptCacheKeyForModel(model: PiModel | undefined): boolean {
   if (!isOpenAICompatibleApi(model?.api)) return false;
   return getCompat(model).supportsPromptCacheKey !== false;
+}
+
+function isPromptCacheKeyOmittedForModel(model: PiModel | undefined, config: PersistedCacheOptimizerConfigV2 = persistedCacheOptimizerConfig): boolean {
+  if (!model || !isOpenAICompatibleApi(model.api)) return false;
+  return config.promptCacheKey?.omit?.includes(modelKey(model)) === true;
+}
+
+function setPersistedCacheOptimizerConfig(config: PersistedCacheOptimizerConfigV2): void {
+  persistedCacheOptimizerConfig = normalizePersistedCacheOptimizerConfig(config);
+  persistedFooterStatsMode = persistedCacheOptimizerConfig.footerMode;
+}
+
+function omitOpenAIPromptCacheKeys(payload: unknown): unknown | undefined {
+  const record = asRecord(payload);
+  if (!record || (!Object.prototype.hasOwnProperty.call(record, "prompt_cache_key") && !Object.prototype.hasOwnProperty.call(record, "promptCacheKey"))) return undefined;
+  const copy = { ...record };
+  delete copy.prompt_cache_key;
+  delete copy.promptCacheKey;
+  return copy;
 }
 
 function collectAnthropicCacheControlsInWireOrder(payload: unknown): UnknownRecord[] {
@@ -3289,6 +3675,41 @@ function hasPromptCacheRetentionUnsupportedErrorMessage(message: unknown): boole
   const record = getAssistantRecord(message);
   return record?.stopReason === "error" &&
     hasPromptCacheRetentionUnsupportedText(record.errorMessage);
+}
+
+function hasPromptCacheKeyUnsupportedText(value: unknown): boolean {
+  const normalized = lower(value).replace(/["'`]/g, "").replace(/[_-]+/g, "_").replace(/\s+/g, " ").trim();
+  const key = "(?:prompt ?cache ?key|prompt_cache_key)";
+  if (!new RegExp(key).test(normalized)) return false;
+
+  // Only classify a field-level capability rejection. Value validation,
+  // conditional restrictions, and generic invalid-parameter messages are not
+  // proof that the endpoint lacks support for the field.
+  return [
+    new RegExp(`unsupported (?:parameter|field|input|argument)[: ]+.*${key}`),
+    new RegExp(`unknown (?:parameter|field|input|argument)[: ]+.*${key}`),
+    new RegExp(`unrecognized (?:parameter|field|input|argument)[: ]+.*${key}`),
+    new RegExp(`(?:parameter|field|input|argument)[: ]+${key} (?:is )?(?:unsupported|unknown|unrecognized|not supported|not allowed|not permitted)`),
+    new RegExp(`${key} (?:is )?(?:unsupported|unknown|unrecognized|not supported|not allowed|not permitted)`),
+    new RegExp(`extra inputs?(?: are)? (?:not permitted|not allowed)[: ]+.*${key}`),
+    new RegExp(`(?:not supported|not permitted|not allowed)[: ]+.*${key}`),
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function hasPromptCacheKeyUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
+  if (!headers) return false;
+  return Object.entries(headers).some(([key, value]) => hasPromptCacheKeyUnsupportedText(`${key}: ${value}`));
+}
+
+function hasPromptCacheKeyUnsupportedErrorMessage(message: unknown): boolean {
+  const record = getAssistantRecord(message);
+  return record?.stopReason === "error" &&
+    getOptionalAssistantHttpStatus(record) === 400 &&
+    hasPromptCacheKeyUnsupportedText(record.errorMessage);
+}
+
+function isPromptCacheKeyUnsupportedApplicable(model: PiModel): boolean {
+  return isOpenAICompatibleApi(model.api);
 }
 
 function hasReasoningProtocolRejectionText(value: unknown): boolean {
@@ -6111,7 +6532,7 @@ function getCompatCheckNotApplicableLines(model: PiModel): string[] {
   return ["ℹ️ Compat check not applicable for this model."];
 }
 
-function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400?: boolean; anthropicTtlOrderError?: boolean; sessionAffinity403?: boolean; openAISdkHeader403?: boolean } = {}): string {
+function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400?: boolean; promptCacheKey400?: boolean; anthropicTtlOrderError?: boolean; sessionAffinity403?: boolean; openAISdkHeader403?: boolean } = {}): string {
   const lines: string[] = [];
   lines.push(`Provider: ${model.provider}`);
   lines.push(`Model:    ${model.id}`);
@@ -6159,6 +6580,13 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
   } else {
     lines.push(...getCompatCheckNotApplicableLines(model));
+  }
+
+  if (options.promptCacheKey400 && isPromptCacheKeyUnsupportedApplicable(model)) {
+    lines.push("");
+    lines.push("⚠️  This model previously rejected prompt_cache_key with an explicit HTTP 400 signal.");
+    lines.push("   /cache-optimizer fix will offer a precise model-scoped opt-out.");
+    lines.push("   The opt-out removes both prompt_cache_key and promptCacheKey from the final request body.");
   }
 
   if (isPromptCacheRetention400Applicable(model)) {
@@ -9249,6 +9677,8 @@ export const __internals_for_tests = {
   addOpenAIPromptCacheKey,
   clampPromptCacheKey,
   hasEffectivePromptCacheKey,
+  omitOpenAIPromptCacheKeys,
+  isPromptCacheKeyOmittedForModel,
   isNonEmptyString,
   shouldInjectOpenAIPromptCacheKey,
   shouldInjectOpenAIPromptCacheKeyForModel,
@@ -9285,6 +9715,9 @@ export const __internals_for_tests = {
   isOpenAISdkHeader403Applicable,
   hasPromptCacheRetentionUnsupportedSignal,
   hasPromptCacheRetentionUnsupportedErrorMessage,
+  hasPromptCacheKeyUnsupportedSignal,
+  hasPromptCacheKeyUnsupportedErrorMessage,
+  isPromptCacheKeyUnsupportedApplicable,
   hasReasoningProtocolRejectionText,
   hasReasoningProtocolRejectionSignal,
   hasReasoningProtocolRejectionErrorMessage,
@@ -9479,11 +9912,22 @@ export const __internals_for_tests = {
   selectFooterStatsForModel,
   parseFooterStatsMode,
   parsePersistedCacheOptimizerConfig,
+  readPersistedCacheOptimizerConfig,
+  writePersistedCacheOptimizerConfig,
   readPersistedFooterMode,
   writePersistedFooterMode,
+  setPersistedCacheOptimizerConfig,
   resolveFooterStatsMode,
   footerStatsMode,
   CONFIG_FILE_PATH,
+  CONFIG_RECEIPT_PATH,
+  parsePromptCacheKeyConfigReceipt,
+  isActionablePromptCacheKeyConfigReceipt,
+  readPromptCacheKeyConfigReceipt,
+  writePromptCacheKeyConfigReceipt,
+  applyPromptCacheKeyConfigFix,
+  rollbackPromptCacheKeyConfig,
+  configReceiptBackupPath,
   FOOTER_MODE_ENV,
   // Routing-provider protocol helpers
   PI_ROUTING_REGISTRY_SYMBOL,
@@ -9596,6 +10040,8 @@ export default function (pi: ExtensionAPI) {
   const reasoningProtocolFallbackState = getReasoningProtocolFallbackState();
   const reasoningProtocolRejectedModels = reasoningProtocolFallbackState.modelKeys;
   const warnedReasoningProtocolRejectedModels = reasoningProtocolFallbackState.warnedModelKeys;
+  const promptCacheKeyRejectedModels = new Set<string>();
+  const warnedPromptCacheKeyRejectedModels = new Set<string>();
   let cacheStatsByModel: Record<string, CacheStats> = {};
   let cacheStatsProcessByModel: Record<string, CacheStats> = {};
   let cacheStatsTotalsByModel: Record<string, CacheStats> = {};
@@ -9619,7 +10065,13 @@ export default function (pi: ExtensionAPI) {
   let currentSessionHashSet = false;
   let lastActualRoutedModel: PersistedRoutedModelRef | undefined;
   let latestCacheHint: PiCacheHintSnapshot | undefined;
-  let pendingProviderResponseModel: PiModel | undefined;
+  // Pi's response hooks do not expose a request id. Track one FIFO lifecycle
+  // record per request and mark records when their response hook arrives. A
+  // finalized assistant message consumes the oldest completed record, falling
+  // back to the oldest request only when a transport emitted no response hook.
+  // This preserves response A when request B/C starts before message_end(A).
+  type ProviderRequestState = { model: PiModel; responseReceived: boolean };
+  const providerRequestStates: ProviderRequestState[] = [];
   let shardCreatedAt = Date.now();
   const PERSIST_DEBOUNCE_MS = 2000;
   const SHARD_REFRESH_DEBOUNCE_MS = 250;
@@ -9664,6 +10116,21 @@ export default function (pi: ExtensionAPI) {
       compatKeys: { ...regular.compatKeys, ...observed.compatKeys },
       forceModelLevel: regular.forceModelLevel || observed.forceModelLevel,
     };
+  }
+
+  function promptCacheKeyFixApplies(model: PiModel): boolean {
+    return isPromptCacheKeyUnsupportedApplicable(model) && promptCacheKeyRejectedModels.has(modelKey(model));
+  }
+
+  function buildPromptCacheKeyConfigPreview(model: PiModel): string[] {
+    const key = modelKey(model);
+    return [
+      `Target: ${key}`,
+      `Action: persist prompt_cache_key mode = omit in ${CONFIG_FILE_PATH}.`,
+      "The final request body will omit both prompt_cache_key and promptCacheKey.",
+      "This can reduce provider-side prompt-cache reuse for this model; it does not change prompts, credentials, headers, or other models.",
+      "The setting applies after Pi core has built the payload, including when Pi already supplied a key.",
+    ];
   }
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
@@ -10162,7 +10629,7 @@ export default function (pi: ExtensionAPI) {
       shardWatcher?.close();
       shardWatcher = undefined;
       latestCacheHint = undefined;
-      pendingProviderResponseModel = undefined;
+      providerRequestStates.length = 0;
       delete getProtocolGlobal().__piCacheOptimizerCacheKey__;
       uninstallCacheHintsService();
       restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV);
@@ -10304,9 +10771,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-    pendingProviderResponseModel = runtimeOptimizerEnabled
-      ? snapshotProviderRequestModel(requestModel)
-      : undefined;
+    if (runtimeOptimizerEnabled) {
+      const snapshot = snapshotProviderRequestModel(requestModel);
+      if (snapshot) providerRequestStates.push({ model: snapshot, responseReceived: false });
+    }
     let requestPayload: unknown = event.payload;
     let toolOrderChanged = false;
 
@@ -10360,6 +10828,11 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    if (isPromptCacheKeyOmittedForModel(requestModel)) {
+      const omitted = omitOpenAIPromptCacheKeys(requestPayload);
+      return omitted ?? (toolOrderChanged ? requestPayload : undefined);
+    }
+
     if (!shouldInjectOpenAIPromptCacheKey() || !shouldInjectOpenAIPromptCacheKeyForModel(requestModel)) {
       return toolOrderChanged ? requestPayload : undefined;
     }
@@ -10369,16 +10842,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
-    // Keep the request snapshot until the corresponding assistant message ends.
-    // Pi's response hook exposes only status/headers; the finalized error may
-    // carry the useful protocol text later in message_end. A subsequent request
-    // replaces this process-local snapshot, and shutdown clears it.
-    const correlatedModel = pendingProviderResponseModel;
-    const model = correlatedModel ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
-    if (!runtimeOptimizerEnabled || !model) {
-      pendingProviderResponseModel = undefined;
-      return;
-    }
+    const responseState = providerRequestStates.find((state) => !state.responseReceived);
+    if (responseState) responseState.responseReceived = true;
+    const model = responseState?.model ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+    if (!runtimeOptimizerEnabled || !model) return;
 
     // Keep only the category, never the provider's complete error text. This
     // is evidence for a later, model-scoped `/fix`; it never edits config from
@@ -10396,22 +10863,36 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    // ── 400: prompt_cache_retention unsupported ──
-    if (event.status === 400) {
-      if (!isPromptCacheRetention400Applicable(model)) return;
-      if (!hasPromptCacheRetentionUnsupportedSignal(event.headers)) return;
+    // ── 400: prompt_cache_key unsupported ──
+    if (event.status === 400 && isPromptCacheKeyUnsupportedApplicable(model) && hasPromptCacheKeyUnsupportedSignal(event.headers)) {
+      const key = modelKey(model);
+      promptCacheKeyRejectedModels.add(key);
+      if (!warnedPromptCacheKeyRejectedModels.has(key)) {
+        warnedPromptCacheKeyRejectedModels.add(key);
+        ctx.ui.notify(
+          `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
+          "warning",
+        );
+      }
+    }
 
+    // ── 400: prompt_cache_retention unsupported ──
+    if (
+      event.status === 400 &&
+      isPromptCacheRetention400Applicable(model) &&
+      hasPromptCacheRetentionUnsupportedSignal(event.headers)
+    ) {
       const key = modelKey(model);
       promptCacheRetention400Models.add(key);
-      if (warnedPromptCacheRetention400Models.has(key)) return;
-      warnedPromptCacheRetention400Models.add(key);
-      ctx.ui.notify(
-        `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongCacheRetention is enabled. ` +
-        getPromptCacheRetentionUnsupportedHint() +
-        ` Run /cache-optimizer doctor for the exact edit location.`,
-        "warning",
-      );
-      return;
+      if (!warnedPromptCacheRetention400Models.has(key)) {
+        warnedPromptCacheRetention400Models.add(key);
+        ctx.ui.notify(
+          `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongCacheRetention is enabled. ` +
+          getPromptCacheRetentionUnsupportedHint() +
+          ` Run /cache-optimizer doctor for the exact edit location.`,
+          "warning",
+        );
+      }
     }
 
     // ── 403: proxy/CDN/WAF blocking ──
@@ -10457,14 +10938,12 @@ export default function (pi: ExtensionAPI) {
     syncSessionHash(ctx);
     const msgRecord = asRecord(event.message);
     const requestModelForMessage = msgRecord?.role === "assistant"
-      ? pendingProviderResponseModel
+      ? (() => {
+        const completedIndex = providerRequestStates.findIndex((state) => state.responseReceived);
+        const index = completedIndex >= 0 ? completedIndex : 0;
+        return providerRequestStates.splice(index, 1)[0]?.model;
+      })()
       : undefined;
-    if (msgRecord?.role === "assistant") {
-      // If a transport failed before emitting after_provider_response, do not
-      // let its request snapshot be consumed by a later response. Normal
-      // responses already clear this in after_provider_response.
-      pendingProviderResponseModel = undefined;
-    }
 
     // Some providers expose an HTTP 400 error body only through the finalized
     // assistant error message; after_provider_response may contain the status
@@ -10484,6 +10963,24 @@ export default function (pi: ExtensionAPI) {
           reasoningProtocolRejectedModels,
           warnedReasoningProtocolRejectedModels,
         );
+      }
+    }
+    if (runtimeOptimizerEnabled && hasPromptCacheKeyUnsupportedErrorMessage(event.message)) {
+      const fallbackModel = requestModelForMessage ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+      const errorModel = messageModel
+        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
+        : undefined;
+      if (errorModel && isPromptCacheKeyUnsupportedApplicable(errorModel)) {
+        const key = modelKey(errorModel);
+        promptCacheKeyRejectedModels.add(key);
+        if (!warnedPromptCacheKeyRejectedModels.has(key)) {
+          warnedPromptCacheKeyRejectedModels.add(key);
+          ctx.ui.notify(
+            `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
+            "warning",
+          );
+        }
       }
     }
     if (runtimeOptimizerEnabled && hasPromptCacheRetentionUnsupportedErrorMessage(event.message)) {
@@ -10634,7 +11131,7 @@ export default function (pi: ExtensionAPI) {
   //   stats   — show detailed current-session models; `stats all` shows all local shards
   //   compat  — show compat suggestion with file path
   //   config footer-mode total|session|process — persist footer mode override
-  //   fix     — auto-fix compat issues (writes models.json, requires UI)
+  //   fix     — auto-fix compat issues (writes models.json or extension config, requires UI)
   //   rollback — undo the latest confirmed fix for the active model
   //   reset   — reset current provider/model footer stats bucket (local only)
   //   (no args) — interactive menu (with UI) or help summary
@@ -10657,7 +11154,7 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(`✅ Pi Cache Optimizer enabled for this Pi process. Local footer stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
       } else if (subcommand === "disable") {
         setRuntimeOptimizerEnabled(false);
-        pendingProviderResponseModel = undefined;
+        providerRequestStates.length = 0;
         await resetCurrentSessionStats();
         await flushPersistCacheStats(cmdCtx);
         await publishStatus(cmdCtx, model);
@@ -10668,7 +11165,7 @@ export default function (pi: ExtensionAPI) {
           cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
           return;
         }
-        const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)), anthropicTtlOrderError: anthropicTtlOrderErrorModels.has(modelKey(model)), sessionAffinity403: sendSessionAffinityHeaders403Models.has(modelKey(model)), openAISdkHeader403: openAISdkHeader403Models.has(modelKey(model)) });
+        const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)), promptCacheKey400: promptCacheKeyRejectedModels.has(modelKey(model)), anthropicTtlOrderError: anthropicTtlOrderErrorModels.has(modelKey(model)), sessionAffinity403: sendSessionAffinityHeaders403Models.has(modelKey(model)), openAISdkHeader403: openAISdkHeader403Models.has(modelKey(model)) });
         const adapter = selectAdapterForModel(model);
         const sk = model ? sessionModelKey(model) : undefined;
         const statsState = model ? cacheStatsTotalsByModel[modelKey(model)] : undefined;
@@ -10707,7 +11204,7 @@ export default function (pi: ExtensionAPI) {
         const nextMode = requestedMode as FooterStatsMode;
         try {
           await writePersistedFooterMode(nextMode);
-          persistedFooterStatsMode = nextMode;
+          setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
           lastStatusText = undefined;
           await publishStatus(cmdCtx, model);
           const resolved = resolveFooterStatsMode(persistedFooterStatsMode);
@@ -10740,6 +11237,34 @@ export default function (pi: ExtensionAPI) {
       } else if (subcommand === "rollback") {
         if (!model) {
           cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          return;
+        }
+        const configReceipt = await readPromptCacheKeyConfigReceipt();
+        const modelsReceipt = await readModelsJsonFixReceipt();
+        const useConfigReceipt = isActionablePromptCacheKeyConfigReceipt(configReceipt) &&
+          configReceipt.provider === model.provider &&
+          configReceipt.modelId === model.id &&
+          (!isActionableModelsJsonFixReceipt(modelsReceipt) || modelsReceipt.provider !== model.provider || modelsReceipt.modelId !== model.id || configReceipt.appliedAt >= modelsReceipt.appliedAt);
+        if (useConfigReceipt) {
+          if (!cmdCtx.hasUI) {
+            cmdCtx.ui.notify("❌ Rollback requires interactive confirmation. No changes were made.\nRun /cache-optimizer rollback in Pi's interactive UI to restore the prompt-cache-key setting.", "warning");
+            return;
+          }
+          const confirmed = await cmdCtx.ui.confirm(
+            "Cache Optimizer — Rollback prompt_cache_key opt-out",
+            `Model: ${modelKey(model)}\nAction: restore the extension config before the confirmed opt-out.\nFooter mode and unrelated configuration will be preserved.\nAfterward, run /reload or restart Pi.\n\nProceed with rollback?`,
+          );
+          if (!confirmed) {
+            cmdCtx.ui.notify("No changes were made. Rollback canceled by user.", "info");
+            return;
+          }
+          try {
+            await rollbackPromptCacheKeyConfig(configReceipt);
+            setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+            cmdCtx.ui.notify(`✅ Restored prompt_cache_key behavior for ${modelKey(model)}. Run /reload or restart Pi for the change to take effect.`, "info");
+          } catch (error) {
+            cmdCtx.ui.notify(`❌ Prompt cache key rollback refused: ${error instanceof Error ? error.message : String(error)}. No changes were made.`, "error");
+          }
           return;
         }
         if (!cmdCtx.hasUI) {
@@ -10872,7 +11397,58 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const suggestion = buildCommandFixSuggestion(model);
+        const promptCacheKeyRequested = commandParts[1] === "prompt-cache-key";
+        const promptCacheKeyFixRequested = promptCacheKeyRequested || promptCacheKeyFixApplies(model);
+        if (promptCacheKeyRequested && !isPromptCacheKeyUnsupportedApplicable(model)) {
+          cmdCtx.ui.notify("ℹ️ Prompt cache key opt-out applies only to a known OpenAI-compatible provider/model endpoint. No changes were made.", "info");
+          return;
+        }
+        const suggestion = promptCacheKeyFixRequested ? undefined : buildCommandFixSuggestion(model);
+
+        if (promptCacheKeyFixRequested) {
+          if (isPromptCacheKeyOmittedForModel(model)) {
+            cmdCtx.ui.notify(`✅ prompt_cache_key is already omitted for "${modelKey(model)}".`, "info");
+            return;
+          }
+          if (!cmdCtx.hasUI) {
+            cmdCtx.ui.notify(
+              "❌ Non-interactive terminal detected. Prompt cache key opt-out requires UI confirmation. No changes were made.\n" +
+              `Run /cache-optimizer fix prompt-cache-key in Pi's interactive UI for ${modelKey(model)}.`,
+              "warning",
+            );
+            return;
+          }
+          const preview = [
+            "📝 Preview of extension configuration change:",
+            ...buildPromptCacheKeyConfigPreview(model),
+            "",
+            "⚠️ Risk notice:",
+            "  1. This affects all sessions using this exact provider/model.",
+            "  2. Provider prompt-cache reuse may decrease because both key spellings are removed.",
+            "  3. This does not modify Pi's models.json, credentials, prompts, headers, or other models.",
+            "  4. The extension config will be backed up and Pi must be reloaded/restarted.",
+            "",
+            "Apply this persistent opt-out?",
+          ].join("\n");
+          const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Omit prompt_cache_key", preview);
+          if (!confirmed) {
+            cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
+            return;
+          }
+          try {
+            const result = await applyPromptCacheKeyConfigFix(model);
+            setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+            cmdCtx.ui.notify(
+              `✅ Prompt cache key opt-out saved for ${modelKey(model)}.\n` +
+              `Config backup saved to: ${result.backupPath}\n` +
+              "Run /reload or restart Pi for the change to take effect. Use /cache-optimizer rollback to restore it.",
+              "info",
+            );
+          } catch (error) {
+            cmdCtx.ui.notify(`❌ Could not save prompt cache key opt-out: ${error instanceof Error ? error.message : String(error)}. No changes were made.`, "error");
+          }
+          return;
+        }
 
         if (!suggestion) {
           const key = modelKey(model);
@@ -11305,7 +11881,8 @@ export default function (pi: ExtensionAPI) {
             "Doctor — Show cache configuration",
             "Stats — Show current-session model statistics",
             "Compat — Show compat suggestion",
-            "Fix — Auto-fix compat issues (writes models.json)",
+            "Fix — Auto-fix compat issues (writes models.json or extension config)",
+            "Disable prompt_cache_key — Omit it for the active model",
             "Rollback — Undo the latest confirmed fix",
             "Footer mode — Choose total, session, or process stats",
             "Reset — Reset local provider/model stats",
@@ -11325,8 +11902,10 @@ export default function (pi: ExtensionAPI) {
           } else if (choice === menuOptions[5]) {
             await handleCacheOptimizerCommand("fix", cmdCtx);
           } else if (choice === menuOptions[6]) {
-            await handleCacheOptimizerCommand("rollback", cmdCtx);
+            await handleCacheOptimizerCommand("fix prompt-cache-key", cmdCtx);
           } else if (choice === menuOptions[7]) {
+            await handleCacheOptimizerCommand("rollback", cmdCtx);
+          } else if (choice === menuOptions[8]) {
             const modeOptions = ["session — Current Pi conversation session (default)", "total — All local sessions today", "process — Current extension instance only", "Cancel"];
             const modeChoice = await cmdCtx.ui.select("Footer cache stats mode", modeOptions);
             const nextMode = modeChoice === modeOptions[0]
@@ -11337,7 +11916,7 @@ export default function (pi: ExtensionAPI) {
                   ? "process"
                   : undefined;
             if (nextMode) await handleCacheOptimizerCommand(`config footer-mode ${nextMode}`, cmdCtx);
-          } else if (choice === menuOptions[8]) {
+          } else if (choice === menuOptions[9]) {
             await handleCacheOptimizerCommand("reset", cmdCtx);
           }
           // choice === "cancel" or undefined → no action
@@ -11355,7 +11934,8 @@ export default function (pi: ExtensionAPI) {
         diagnosis.push("  stats contributors — Show per-session contributors for the active model");
         diagnosis.push("  compat  — Show compat suggestion with edit location");
         diagnosis.push("  config footer-mode total|session|process — Persist the footer stats mode");
-        diagnosis.push("  fix     — Auto-fix compat issues (writes models.json, requires UI)");
+        diagnosis.push("  fix     — Auto-fix compat issues (writes models.json or extension config, requires UI)");
+        diagnosis.push("  fix prompt-cache-key — Explicitly omit prompt_cache_key for the active model");
         diagnosis.push("  rollback — Undo the latest confirmed fix (requires UI confirmation)");
         diagnosis.push("  reset   — Reset local provider/model stats for current model (does not affect upstream)");
         diagnosis.push("");

@@ -17,6 +17,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Install](#install)
 - [Commands](#commands)
 - [Persistent opt-out](#persistent-opt-out)
+- [Per-model `prompt_cache_key` opt-out](#per-model-prompt_cache_key-opt-out)
 - [Opt-in deterministic tool ordering](#opt-in-deterministic-tool-ordering)
 - [Footer cache stats mode](#footer-cache-stats-mode)
 - [OpenAI-compatible proxy setup](#openai-compatible-proxy-setup)
@@ -76,10 +77,11 @@ This extension requires Pi 0.82+ and is validated against Pi 0.85.1. It uses the
 | `/cache-optimizer stats contributors` | Shows current/other contributing sessions for the active exact provider/model without exposing session ids. |
 | `/cache-optimizer reset` | Resets local footer stats for the active provider/model; upstream provider cache is not modified. |
 | `/cache-optimizer config footer-mode total\|session\|process` | Persist the footer stats mode. Persistent command configuration overrides the environment variable. |
-| `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. **Only modifies `models.json` after explicit user approval.** |
-| `/cache-optimizer rollback` | Reviews the latest matching confirmed fix and, after UI confirmation, restores it safely without overwriting unrelated `models.json` changes. |
+| `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. It writes `models.json` only for native compat fixes, or the extension config for an evidenced `prompt_cache_key` issue. |
+| `/cache-optimizer fix prompt-cache-key` | Explicitly configures the active OpenAI-compatible provider/model to omit `prompt_cache_key` and `promptCacheKey` from the final request body. Requires confirmation. |
+| `/cache-optimizer rollback` | Reviews the latest matching confirmed fix and, after UI confirmation, restores either the extension config or `models.json` fix safely. |
 
-`/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode`, and `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
+`/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer fix <Tab>` for `prompt-cache-key`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode`, and `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
 
 The interactive `/cache-optimizer` menu includes `Footer mode`, where you can choose `total`, `session`, or `process`. `enable` / `disable` are current-process switches. For a persistent opt-out, use environment variables below.
 
@@ -129,6 +131,18 @@ Persistent command configuration takes precedence over the environment variable:
 ```
 
 The explicit setting is stored in `pi-cache-optimizer-config.json` under Pi's agent directory. If no command override exists, `PI_CACHE_OPTIMIZER_FOOTER_MODE=total|session|process` is used; values are case-insensitive, and missing or invalid values fall back to `session`. To return an existing installation to environment-controlled behavior, manually delete `pi-cache-optimizer-config.json` and run `/reload`.
+
+## Per-model `prompt_cache_key` opt-out
+
+Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.85.1 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
+
+When the extension observes an explicit `prompt_cache_key` unsupported error for the exact provider/model, ordinary `/cache-optimizer fix` offers a confirmed model-scoped repair. If you already know that the endpoint rejects the field, use the explicit command:
+
+```text
+/cache-optimizer fix prompt-cache-key
+```
+
+The preview explains that the setting is stored in the extension-owned `pi-cache-optimizer-config.json`. After confirmation, the final `before_provider_request` stage removes both `prompt_cache_key` and `promptCacheKey`, including a key that Pi core supplied earlier. This can reduce provider prompt-cache hits for that exact model, while other models retain the existing fallback behavior. The file is updated atomically, a privacy-safe backup/receipt is created, and `/reload` or a Pi restart is required. `/cache-optimizer rollback` restores the previous extension configuration without resetting `footerMode`.
 
 ## OpenAI-compatible proxy setup
 
