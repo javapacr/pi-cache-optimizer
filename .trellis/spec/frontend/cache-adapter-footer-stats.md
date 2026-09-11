@@ -191,6 +191,10 @@ core's own cache transport.
   or `promptCacheKey` is authoritative and MUST NOT be overwritten. Values that
   are `undefined`, `null`, `""`, or whitespace-only are treated as missing and
   may be replaced by the session-id fallback.
+* An exact provider/model may be persistently configured with `promptCacheKey.omit`
+  in the extension-owned config. For that model, the final request payload MUST
+  remove both `prompt_cache_key` and `promptCacheKey`, including a key inserted by
+  Pi core; other models retain the normal behavior.
 * Opt-out: default behavior is enabled. Users can disable fallback injection
   with `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` (truthy: `1`, `true`, `yes`,
   `on`) or legacy-style `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` (disabled:
@@ -1110,8 +1114,14 @@ Persistently selects the footer display scope in
   logs a warning and falls back to environment/default behavior.
 * Changing the mode republishes the current footer immediately and does not reset
   or mutate any stats buckets.
-* The config file contains only versioned mode metadata; no session ids, counters,
-  prompts, credentials, payloads, headers, or model output.
+* The config file contains only versioned footer mode and exact provider/model
+  policy metadata; no session ids, counters, prompts, credentials, payloads,
+  headers, or model output.
+* v1 `{version: 1, footerMode}` files remain readable without loss; a prompt-cache-key
+  fix migrates them to v2 while preserving `footerMode`.
+* Config writes and rollback share the extension transaction lease. Before rename,
+  the target must still be the same regular file with the expected content hash and
+  mode; changed, replaced, symlinked, or malformed config is refused.
 
 ### `/cache-optimizer doctor`
 
@@ -1209,6 +1219,9 @@ only the status line as before.
 ### `/cache-optimizer fix`
 
 Auto-repairs safe compat issues detected for the **current active model only**.
+For an explicit prompt-cache-key unsupported signal, or for the informed command
+`/cache-optimizer fix prompt-cache-key`, it instead writes the extension-owned
+config and does not modify `models.json`.
 It covers the same safe defaults shown by doctor/compat:
 
 * Adaptive thinking: `forceAdaptiveThinking: true` for native
@@ -1222,6 +1235,9 @@ It covers the same safe defaults shown by doctor/compat:
 * Generic OpenAI-compatible proxy affinity: `sendSessionAffinityHeaders: true`
   when missing. It does **not** auto-enable optional generic
   `supportsLongCacheRetention`.
+* Prompt cache key opt-out: persist an exact provider/model `omit` strategy only
+  after preview and confirmation. The final request removes both key spellings;
+  this may reduce provider prompt-cache hits and requires `/reload` or restart.
 
 Safety contract:
 
@@ -1260,8 +1276,9 @@ Safety contract:
   slug.
 * Direct command execution and the interactive menu MUST call the same command
   handler for Enable, Disable, Doctor, Stats, Compat, Fix, Rollback, Footer mode,
-  and Reset. Security-sensitive transaction logic MUST NOT be duplicated in a
-  menu-only path.
+  and Reset. The menu MUST expose the explicit prompt-cache-key opt-out and route
+  it through the same confirmed handler. Security-sensitive transaction logic MUST
+  NOT be duplicated in a menu-only path.
 
 #### Wrong vs correct: preserving `models.json` during fix
 
@@ -1289,7 +1306,9 @@ if (postCheckFailed) {
 ### `/cache-optimizer rollback`
 
 Rollback is available through native completion, direct execution, the interactive
-menu, and non-interactive guidance. Fix and rollback use an extension-owned
+menu, and non-interactive guidance. It first considers the latest matching
+extension-config receipt, then the existing `models.json` receipt; footer mode is
+never removed as a side effect. Fix and rollback use an extension-owned
 cross-process exclusive-file transaction lease; stale recovery may unlink it only
 after checking owner PID plus file identity, and active live owners are never evicted
 only because a transaction runs longer than a timeout. It MUST require
@@ -1460,6 +1479,11 @@ compat). It does NOT read or expose:
 | Third-party `openai-completions` proxy returns HTTP 403 while `sendSessionAffinityHeaders` is enabled | Extension records a one-time model-scoped warning (`sendSessionAffinityHeaders403Models`) and `/cache-optimizer doctor` surfaces the session-affinity 403 hint with `/cache-optimizer fix` offering `sendSessionAffinityHeaders: false`. Pi 0.80.7+ `openai-responses` is excluded because it uses `sessionAffinityFormat`. |
 | `/cache-optimizer doctor` with session-affinity enabled but no 403 observed | Shows advisory text that some CDNs/WAFs block custom headers (session_id, x-client-request-id, x-session-affinity) and return 403 |
 | `/cache-optimizer fix` with 403-observed OpenAI-compatible model | Offers `sendSessionAffinityHeaders: false` as the compat-key suggestion (mirror of the 400 `supportsLongCacheRetention: false` path) |
+| `/cache-optimizer fix` after explicit field-level `prompt_cache_key` unsupported evidence | Shows a precise model-scoped extension-config preview and offers final payload omission; value-validation or conditional-use errors do not qualify and no `models.json` field is written |
+| `/cache-optimizer fix prompt-cache-key` without prior evidence | Shows the same explicit preview and requires confirmation; it does not silently disable other models |
+| `/cache-optimizer fix prompt-cache-key` for a configured model | Is idempotent and reports that the exact model is already configured |
+| Prompt cache key opt-out rollback | Restores the config backup atomically, verifies the receipt-owned exact model key and whether it existed before, preserves `footerMode`, refuses if the config changed after the fix, and leaves the `models.json` receipt untouched |
+| Concurrent footer/config write | A shared transaction lease serializes the write; expected regular-file identity, hash, and mode are checked before replacement |
 | `/cache-optimizer compat` with fully-configured model where `sendSessionAffinityHeaders` is enabled | Shows `✅ Compat fully configured.` plus an advisory line about potential CDN/WAF 403 blocking of custom session-affinity headers |
 | Generic proxy model with explicit `sendSessionAffinityHeaders: false` after a 403/CDN block | No `⚠️ compat`; `/cache-optimizer fix` must NOT suggest changing it back to `true` |
 | Generic proxy returns HTTP 403 after `sendSessionAffinityHeaders` is already false/absent | Extension records a one-time `openAISdkHeader403Models` diagnostic and doctor/compat provide read-only guidance about OpenAI JS SDK `User-Agent` / `X-Stainless-*` WAF blocking; `/cache-optimizer fix` does NOT auto-write `headers.User-Agent` |

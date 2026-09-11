@@ -35,11 +35,15 @@ assistant error only for the narrow direction “`thinking` is rejected; use
 must never store, print, or log the complete error or any surrounding payload.
 The response hook never edits or rolls back configuration automatically.
 
-A successful interactive fix may write one receipt atomically. The receipt is
-allowlisted to transaction id, provider/model identity, placement, target
-existence, changed scalar compat before/after states, SHA-256 file hashes, a
-basename-only backup filename, timestamps, and rollback status. It excludes
-credentials, prompts, payloads, headers, response bodies, and raw errors.
+A successful interactive models.json fix may write one models receipt atomically.
+A prompt-cache-key opt-out writes a versioned extension-config receipt containing
+only transaction id, exact provider/model identity, the receipt-owned model key,
+whether that key existed before, SHA-256 config hashes, basename-only backup
+filename, target existence, timestamps, and rollback status.
+Neither receipt contains prompts, payloads, headers, credentials, response bodies,
+or raw errors. The config transaction preserves footerMode and refuses to overwrite
+changed user config. It excludes credentials, prompts, payloads, headers,
+response bodies, and raw errors.
 Rollback requires explicit UI confirmation. An unchanged file may be restored
 from a verified pre-fix backup; a changed file may only receive guarded
 surgical restoration of receipt-owned scalar keys whose post-fix values still
