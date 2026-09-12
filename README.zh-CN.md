@@ -136,13 +136,13 @@ Footer 默认使用 `session`，避免另一个并行 Pi 终端使用相同 prov
 
 某些 OpenAI-compatible endpoint 会因 `prompt_cache_key` 返回 HTTP 400，但同一个字段对其他 provider 可能有效。Pi 0.85.1 没有原生的 `supportsPromptCacheKey` compat 字段，**不要**把这个未知字段加入 `models.json`。`supportsLongCacheRetention` 也不是等价开关，不应借用来实现此目的。
 
-当扩展观察到精确 provider/model 明确拒绝 `prompt_cache_key` 后，普通 `/cache-optimizer fix` 会提供经过确认的模型级修复。如果你已经确定 endpoint 不支持该字段，可以主动执行：
+当扩展观察到精确 provider/model 对 `prompt_cache_key` 的明确字段级拒绝后，普通 `/cache-optimizer fix` 会提供经过确认的模型级修复。参数值校验失败，以及“设置 temperature 时不允许”这类条件限制都不构成证据。若不同模型的响应并发交错，而 Pi 又没有提供 request ID，扩展会忽略无法安全关联的 response-header 证据；只有最终 assistant message 提供精确 provider/model 身份时才恢复归因。如果你已经确定 endpoint 不支持该字段，可以主动执行：
 
 ```text
 /cache-optimizer fix prompt-cache-key
 ```
 
-预览会说明设置保存在扩展自有的 `pi-cache-optimizer-config.json` 中。确认后，`before_provider_request` 的最终阶段会移除 `prompt_cache_key` 和 `promptCacheKey`，包括 Pi core 之前已经放入的 key。这个精确模型可能因此失去 provider prompt-cache 命中，其他模型仍保持原有 fallback 行为。配置会使用原子替换写入，并生成不含敏感内容的备份/receipt；需要 `/reload` 或重启 Pi。`/cache-optimizer rollback` 可恢复之前的扩展配置，且不会重置 `footerMode`。
+预览会说明设置保存在扩展自有的 `pi-cache-optimizer-config.json` 中。确认后，`before_provider_request` 的最终阶段会移除 `prompt_cache_key` 和 `promptCacheKey`，包括 Pi core 之前已经放入的 key。这个精确模型可能因此失去 provider prompt-cache 命中，其他模型仍保持原有 fallback 行为。配置通过原子、不可覆盖并发新建文件的方式写入，并生成不含敏感内容的备份/receipt；需要 `/reload` 或重启 Pi。`/cache-optimizer rollback` 可恢复之前的扩展配置且不会重置 `footerMode`；它会绑定预览时 receipt 的文件身份和 hash，在 receipt 被替换时拒绝操作，并在 receipt 状态写入失败时补偿恢复配置。
 
 ## OpenAI-compatible 代理配置
 

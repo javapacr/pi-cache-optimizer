@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { constants as fsConstants, readFileSync, statSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -203,6 +203,12 @@ type PromptCacheKeyConfigReceipt = {
   appliedAt: number;
   status?: "rolled_back";
   rolledBackAt?: number;
+};
+type PromptCacheKeyConfigReceiptSnapshot = {
+  receipt: PromptCacheKeyConfigReceipt;
+  receiptPath: string;
+  hash: string;
+  identity: FileIdentity;
 };
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
@@ -2041,21 +2047,7 @@ async function writePersistedCacheOptimizerConfigUnlocked(
     return;
   }
 
-  const tempPath = uniqueTempPath(configPath, "config");
-  try {
-    await writeFile(tempPath, payloadText, { encoding: "utf8", mode: targetMode, flag: "wx" });
-    await chmod(tempPath, targetMode);
-    try {
-      await lstat(configPath);
-      throw new Error("optimizer config appeared during write; no changes were made");
-    } catch (error) {
-      if (getErrorCode(error) !== "ENOENT") throw error;
-    }
-    await rename(tempPath, configPath);
-  } catch (error) {
-    await unlink(tempPath).catch((cleanupError) => { if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary config`, cleanupError); });
-    throw error;
-  }
+  await atomicCreateTextFileNoReplace(configPath, payloadText, targetMode, "config");
 }
 
 async function writePersistedCacheOptimizerConfig(
@@ -2087,24 +2079,15 @@ async function writePersistedFooterModeUnlocked(
     if (targetInfo && (targetInfo.isSymbolicLink() || !targetInfo.isFile())) throw new Error("optimizer config is not a regular file; no changes were made");
     const targetText = targetInfo ? await readFile(configPath, "utf8") : undefined;
     const targetMode = targetInfo ? targetInfo.mode & 0o7777 : 0o600;
-    const tempPath = uniqueTempPath(configPath, "config-footer");
-    try {
-      await writeFile(tempPath, JSON.stringify({ version: 1, footerMode: mode }, null, 2) + "\n", { encoding: "utf8", mode: targetMode, flag: "wx" });
-      await chmod(tempPath, targetMode);
-      if (targetInfo && targetText !== undefined) {
-        await validateAtomicTarget(configPath, { identity: targetInfo, hash: hashText(targetText), mode: targetMode });
-      } else {
-        try {
-          await lstat(configPath);
-          throw new Error("optimizer config appeared during footer write; no changes were made");
-        } catch (error) {
-          if (getErrorCode(error) !== "ENOENT") throw error;
-        }
-      }
-      await rename(tempPath, configPath);
-    } catch (error) {
-      await unlink(tempPath).catch(() => {});
-      throw error;
+    const footerText = JSON.stringify({ version: 1, footerMode: mode }, null, 2) + "\n";
+    if (targetInfo && targetText !== undefined) {
+      await atomicReplaceTextFilePreservingMode(configPath, footerText, targetMode, "config-footer", {
+        identity: targetInfo,
+        hash: hashText(targetText),
+        mode: targetMode,
+      });
+    } else {
+      await atomicCreateTextFileNoReplace(configPath, footerText, targetMode, "config-footer");
     }
     return;
   }
@@ -2132,7 +2115,12 @@ function parsePromptCacheKeyConfigReceipt(value: unknown): PromptCacheKeyConfigR
   if (![record.transactionId, record.provider, record.modelId].every(isSafeReceiptText)) return undefined;
   if (!isSha256(record.beforeHash) || !isSha256(record.afterHash) || record.beforeHash === record.afterHash) return undefined;
   if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || !record.backupFile.startsWith("pi-cache-optimizer-config.backup-")) return undefined;
-  if (typeof record.targetExistedBefore !== "boolean" || !isReceiptTimestamp(record.createdAt) || !isReceiptTimestamp(record.appliedAt)) return undefined;
+  if (
+    typeof record.targetExistedBefore !== "boolean" ||
+    !isReceiptTimestamp(record.createdAt) ||
+    !isReceiptTimestamp(record.appliedAt) ||
+    record.appliedAt < record.createdAt
+  ) return undefined;
   const addedModelKey = `${record.provider}/${record.modelId}`;
   const targetHadModelKey = record.version === 1 ? false : record.targetHadModelKey;
   if (typeof targetHadModelKey !== "boolean") return undefined;
@@ -2162,25 +2150,95 @@ function isActionablePromptCacheKeyConfigReceipt(receipt: PromptCacheKeyConfigRe
   return receipt !== undefined && receipt.status === undefined;
 }
 
-async function readPromptCacheKeyConfigReceipt(receiptPath: string = CONFIG_RECEIPT_PATH): Promise<PromptCacheKeyConfigReceipt | undefined> {
+async function assertPromptCacheKeyConfigReceiptSnapshotUnchanged(
+  snapshot: PromptCacheKeyConfigReceiptSnapshot,
+): Promise<void> {
+  const info = await lstat(snapshot.receiptPath);
+  if (info.isSymbolicLink() || !info.isFile() || !sameFileIdentity(snapshot.identity, info)) {
+    throw new Error("prompt-cache-key receipt changed since the rollback preview");
+  }
+  const text = await readFile(snapshot.receiptPath, "utf8");
+  const afterRead = await lstat(snapshot.receiptPath);
+  if (
+    afterRead.isSymbolicLink() ||
+    !afterRead.isFile() ||
+    !sameFileIdentity(info, afterRead) ||
+    hashText(text) !== snapshot.hash
+  ) {
+    throw new Error("prompt-cache-key receipt changed since the rollback preview");
+  }
+}
+
+async function readPromptCacheKeyConfigReceiptSnapshot(
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): Promise<PromptCacheKeyConfigReceiptSnapshot | undefined> {
   try {
     const info = await lstat(receiptPath);
     if (info.isSymbolicLink() || !info.isFile()) return undefined;
-    const receipt = parsePromptCacheKeyConfigReceipt(JSON.parse(await readFile(receiptPath, "utf8")));
-    return receipt;
+    const text = await readFile(receiptPath, "utf8");
+    const afterRead = await lstat(receiptPath);
+    if (afterRead.isSymbolicLink() || !afterRead.isFile() || !sameFileIdentity(info, afterRead)) return undefined;
+    const receipt = parsePromptCacheKeyConfigReceipt(JSON.parse(text));
+    if (!receipt) return undefined;
+    return { receipt, receiptPath, hash: hashText(text), identity: afterRead };
   } catch {
     return undefined;
   }
 }
 
-async function writePromptCacheKeyConfigReceipt(receipt: PromptCacheKeyConfigReceipt, receiptPath: string = CONFIG_RECEIPT_PATH): Promise<void> {
+async function readPromptCacheKeyConfigReceipt(receiptPath: string = CONFIG_RECEIPT_PATH): Promise<PromptCacheKeyConfigReceipt | undefined> {
+  return (await readPromptCacheKeyConfigReceiptSnapshot(receiptPath))?.receipt;
+}
+
+async function writePromptCacheKeyConfigReceipt(
+  receipt: PromptCacheKeyConfigReceipt,
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+  expectedSnapshot?: PromptCacheKeyConfigReceiptSnapshot,
+  /** Test-only race injector; production callers leave this undefined. */
+  beforeRename?: () => Promise<void>,
+): Promise<void> {
   if (!parsePromptCacheKeyConfigReceipt(receipt)) throw new Error("invalid prompt cache key config receipt");
+  if (expectedSnapshot?.receiptPath !== undefined && expectedSnapshot.receiptPath !== receiptPath) {
+    throw new Error("prompt-cache-key receipt path changed since the rollback preview");
+  }
+  if (expectedSnapshot) await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(expectedSnapshot);
   await mkdir(dirname(receiptPath), { recursive: true });
+  let existingReceiptInfo: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    const info = await lstat(receiptPath);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error("invalid prompt-cache-key receipt path");
+    existingReceiptInfo = info;
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") throw error;
+  }
   const tempPath = uniqueTempPath(receiptPath, "config-receipt");
   try {
     await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+    const tempInfo = await lstat(tempPath);
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) throw new Error("invalid temporary prompt-cache-key receipt");
     await chmod(tempPath, 0o600);
-    await rename(tempPath, receiptPath);
+    const assertDestinationUnchanged = async (): Promise<void> => {
+      try {
+        const currentInfo = await lstat(receiptPath);
+        if (!existingReceiptInfo || !sameFileIdentity(existingReceiptInfo, currentInfo)) {
+          throw new Error("prompt-cache-key receipt changed during atomic write");
+        }
+      } catch (error) {
+        if (getErrorCode(error) !== "ENOENT" || existingReceiptInfo) throw error;
+      }
+      if (expectedSnapshot) await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(expectedSnapshot);
+    };
+    await assertDestinationUnchanged();
+    if (beforeRename) await beforeRename();
+    await assertDestinationUnchanged();
+    if (existingReceiptInfo) {
+      await rename(tempPath, receiptPath);
+    } else {
+      await link(tempPath, receiptPath);
+      await unlink(tempPath).catch((cleanupError) => {
+        console.warn(`${LOG_PREFIX}: committed prompt-cache-key receipt but failed to remove its temporary hard link`, cleanupError);
+      });
+    }
   } catch (error) {
     await unlink(tempPath).catch((cleanupError) => { if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary config receipt`, cleanupError); });
     throw error;
@@ -2211,6 +2269,7 @@ async function applyPromptCacheKeyConfigFixUnderLock(
   const key = modelKey(model);
   const existingOmit = current.promptCacheKey?.omit ?? [];
   const targetHadModelKey = existingOmit.includes(key);
+  if (targetHadModelKey) throw new Error("prompt-cache-key is already configured; no changes were made");
   const omit = [...new Set([...existingOmit, key])].sort();
   const next: PersistedCacheOptimizerConfigV2 = { ...current, version: 2, promptCacheKey: { omit } };
   const modifiedText = JSON.stringify(next, null, 2) + "\n";
@@ -2238,8 +2297,19 @@ async function applyPromptCacheKeyConfigFixUnderLock(
         if (getErrorCode(error) !== "ENOENT") throw error;
       }
     }
-    await rename(tempPath, configPath);
-    committedInfo = await lstat(configPath);
+    if (originalInfo) {
+      await rename(tempPath, configPath);
+      committedInfo = await lstat(configPath);
+    } else {
+      // Do not overwrite a config created after the absence check. Record the
+      // committed inode before cleaning up its temporary hard-link name so a
+      // cleanup failure can still compensate the config transaction.
+      await link(tempPath, configPath);
+      committedInfo = await lstat(configPath);
+      await unlink(tempPath).catch((cleanupError) => {
+        console.warn(`${LOG_PREFIX}: committed optimizer config but failed to remove its temporary hard link`, cleanupError);
+      });
+    }
     const receipt: PromptCacheKeyConfigReceipt = {
       version: 2,
       kind: "pi-cache-optimizer-config-receipt",
@@ -2259,10 +2329,17 @@ async function applyPromptCacheKeyConfigFixUnderLock(
     return { receipt, backupPath };
   } catch (error) {
     await unlink(tempPath).catch(() => {});
-    if (targetExistedBefore && committedInfo) {
-      await atomicRestoreFileFromBackup(backupPath, configPath, mode, { identity: committedInfo, hash: afterHash, mode }).catch(() => {});
-    } else if (!targetExistedBefore && committedInfo) {
-      await validateAtomicTarget(configPath, { identity: committedInfo, hash: afterHash, mode }).then(() => unlink(configPath)).catch(() => {});
+    try {
+      if (targetExistedBefore && committedInfo) {
+        await atomicRestoreFileFromBackup(backupPath, configPath, mode, { identity: committedInfo, hash: afterHash, mode });
+      } else if (!targetExistedBefore && committedInfo) {
+        await validateAtomicTarget(configPath, { identity: committedInfo, hash: afterHash, mode });
+        await unlink(configPath);
+      }
+    } catch (compensationError) {
+      const writeMessage = error instanceof Error ? error.message : String(error);
+      const compensationMessage = compensationError instanceof Error ? compensationError.message : String(compensationError);
+      throw new Error(`prompt-cache-key fix receipt update failed (${writeMessage}) and config compensation failed (${compensationMessage})`);
     }
     throw error;
   }
@@ -2276,15 +2353,26 @@ async function applyPromptCacheKeyConfigFix(
   return withModelsJsonTransactionLock(() => applyPromptCacheKeyConfigFixUnderLock(model, configPath, receiptPath));
 }
 
+type PromptCacheKeyRollbackOptions = {
+  /** Test-only race injector; production callers leave this undefined. */
+  beforeReceiptRename?: () => Promise<void>;
+};
+
 async function rollbackPromptCacheKeyConfigUnderLock(
-  receipt: PromptCacheKeyConfigReceipt,
+  snapshot: PromptCacheKeyConfigReceiptSnapshot,
   configPath: string = CONFIG_FILE_PATH,
   receiptPath: string = CONFIG_RECEIPT_PATH,
+  options: PromptCacheKeyRollbackOptions = {},
 ): Promise<void> {
+  if (snapshot.receiptPath !== receiptPath) throw new Error("prompt-cache-key receipt path changed since the rollback preview");
+  await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(snapshot);
+  const receipt = snapshot.receipt;
   const currentInfo = await lstat(configPath);
   if (currentInfo.isSymbolicLink() || !currentInfo.isFile()) throw new Error("optimizer config is not a regular file; refusing to overwrite user changes");
   const currentText = await readFile(configPath, "utf8");
-  if (hashText(currentText) !== receipt.afterHash) throw new Error("optimizer config changed after the fix; refusing to overwrite user changes");
+  const currentHash = hashText(currentText);
+  const currentMode = currentInfo.mode & 0o7777;
+  if (currentHash !== receipt.afterHash) throw new Error("optimizer config changed after the fix; refusing to overwrite user changes");
   const current = parsePersistedCacheOptimizerConfig(JSON.parse(currentText));
   if (!current) throw new Error("optimizer config is invalid; refusing to overwrite user changes");
   const key = `${receipt.provider}/${receipt.modelId}`;
@@ -2292,46 +2380,90 @@ async function rollbackPromptCacheKeyConfigUnderLock(
   if (receipt.targetHadModelKey) throw new Error("prompt-cache-key was already configured before this fix; refusing to remove user configuration");
   const omit = current.version === 2 ? current.promptCacheKey?.omit ?? [] : [];
   if (!omit.includes(receipt.addedModelKey)) throw new Error("prompt-cache-key opt-out is no longer present; refusing to change user config");
+
+  let rollbackResultText: string | undefined;
+  let rollbackResultMode: number | undefined;
+  let rollbackResultInfo: Awaited<ReturnType<typeof lstat>> | undefined;
   const backupPath = configReceiptBackupPath(receipt, receiptPath);
   if (receipt.targetExistedBefore) {
     const backupInfo = await lstat(backupPath);
     if (backupInfo.isSymbolicLink() || !backupInfo.isFile()) throw new Error("config backup is not a regular file");
     const backupText = await readFile(backupPath, "utf8");
     if (hashText(backupText) !== receipt.beforeHash) throw new Error("config backup hash does not match the fix receipt");
+    rollbackResultText = backupText;
+    rollbackResultMode = backupInfo.mode & 0o7777;
     await atomicRestoreFileFromBackup(
       backupPath,
       configPath,
-      backupInfo.mode & 0o7777,
-      { backupHash: receipt.beforeHash, identity: currentInfo, hash: hashText(currentText), mode: currentInfo.mode & 0o7777 },
+      rollbackResultMode,
+      { backupHash: receipt.beforeHash, identity: currentInfo, hash: currentHash, mode: currentMode },
     );
+    rollbackResultInfo = await lstat(configPath);
+  } else if (current.footerMode || omit.length > 1) {
+    const restored: PersistedCacheOptimizerConfigV2 = {
+      version: 2,
+      ...(current.footerMode ? { footerMode: current.footerMode } : {}),
+      ...(omit.length > 1 ? { promptCacheKey: { omit: omit.filter((item) => item !== receipt.addedModelKey) } } : {}),
+    };
+    rollbackResultText = JSON.stringify(restored, null, 2) + "\n";
+    rollbackResultMode = currentMode;
+    await atomicReplaceTextFilePreservingMode(
+      configPath,
+      rollbackResultText,
+      rollbackResultMode,
+      "config-rollback",
+      { identity: currentInfo, hash: currentHash, mode: currentMode },
+    );
+    rollbackResultInfo = await lstat(configPath);
   } else {
-    if (current.footerMode || omit.length > 1) {
-      const restored: PersistedCacheOptimizerConfigV2 = {
-        version: 2,
-        ...(current.footerMode ? { footerMode: current.footerMode } : {}),
-        ...(omit.length > 1 ? { promptCacheKey: { omit: omit.filter((item) => item !== receipt.addedModelKey) } } : {}),
-      };
-      await atomicReplaceTextFilePreservingMode(
-        configPath,
-        JSON.stringify(restored, null, 2) + "\n",
-        currentInfo.mode & 0o7777,
-        "config-rollback",
-        { identity: currentInfo, hash: hashText(currentText), mode: currentInfo.mode & 0o7777 },
-      );
-    } else {
-      await validateAtomicTarget(configPath, { identity: currentInfo, hash: hashText(currentText), mode: currentInfo.mode & 0o7777 });
-      await unlink(configPath);
-    }
+    await validateAtomicTarget(configPath, { identity: currentInfo, hash: currentHash, mode: currentMode });
+    await unlink(configPath);
   }
-  await writePromptCacheKeyConfigReceipt({ ...receipt, status: "rolled_back", rolledBackAt: Date.now() }, receiptPath);
+
+  try {
+    await writePromptCacheKeyConfigReceipt(
+      { ...receipt, status: "rolled_back", rolledBackAt: Date.now() },
+      receiptPath,
+      snapshot,
+      options.beforeReceiptRename,
+    );
+  } catch (receiptError) {
+    // Receipt marking is part of the transaction. If it fails after the config
+    // mutation, restore the exact post-fix config rather than leaving an
+    // actionable receipt paired with an already-rolled-back file.
+    try {
+      if (rollbackResultText === undefined) {
+        await atomicCreateTextFileNoReplace(configPath, currentText, currentMode, "config-rollback-compensation");
+      } else {
+        if (!rollbackResultInfo || rollbackResultMode === undefined) throw new Error("missing rollback result guard");
+        await atomicReplaceTextFilePreservingMode(
+          configPath,
+          currentText,
+          currentMode,
+          "config-rollback-compensation",
+          {
+            identity: rollbackResultInfo,
+            hash: hashText(rollbackResultText),
+            mode: rollbackResultMode,
+          },
+        );
+      }
+    } catch (compensationError) {
+      const receiptMessage = receiptError instanceof Error ? receiptError.message : String(receiptError);
+      const compensationMessage = compensationError instanceof Error ? compensationError.message : String(compensationError);
+      throw new Error(`prompt-cache-key rollback receipt update failed (${receiptMessage}) and config compensation failed (${compensationMessage})`);
+    }
+    throw receiptError;
+  }
 }
 
 async function rollbackPromptCacheKeyConfig(
-  receipt: PromptCacheKeyConfigReceipt,
+  snapshot: PromptCacheKeyConfigReceiptSnapshot,
   configPath: string = CONFIG_FILE_PATH,
   receiptPath: string = CONFIG_RECEIPT_PATH,
+  options: PromptCacheKeyRollbackOptions = {},
 ): Promise<void> {
-  return withModelsJsonTransactionLock(() => rollbackPromptCacheKeyConfigUnderLock(receipt, configPath, receiptPath));
+  return withModelsJsonTransactionLock(() => rollbackPromptCacheKeyConfigUnderLock(snapshot, configPath, receiptPath, options));
 }
 
 function resolveFooterStatsMode(
@@ -3679,22 +3811,25 @@ function hasPromptCacheRetentionUnsupportedErrorMessage(message: unknown): boole
 }
 
 function hasPromptCacheKeyUnsupportedText(value: unknown): boolean {
-  const normalized = lower(value).replace(/["'`]/g, "").replace(/[_-]+/g, "_").replace(/\s+/g, " ").trim();
-  const key = "(?:prompt ?cache ?key|prompt_cache_key)";
+  const normalized = lower(value)
+    .replace(/["'`]/g, "")
+    .replace(/[\s_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const key = String.raw`(?:prompt ?cache ?key|promptcachekey)`;
+  const field = String.raw`(?:parameter|field|input|argument)`;
+  const unsupported = String.raw`(?:unsupported|unknown|unrecognized|unexpected|not supported|not allowed|not permitted|must be omitted|should be omitted)`;
   if (!new RegExp(key).test(normalized)) return false;
 
-  // Only classify a field-level capability rejection. Value validation,
-  // conditional restrictions, and generic invalid-parameter messages are not
-  // proof that the endpoint lacks support for the field.
-  return [
-    new RegExp(`unsupported (?:parameter|field|input|argument)[: ]+.*${key}`),
-    new RegExp(`unknown (?:parameter|field|input|argument)[: ]+.*${key}`),
-    new RegExp(`unrecognized (?:parameter|field|input|argument)[: ]+.*${key}`),
-    new RegExp(`(?:parameter|field|input|argument)[: ]+${key} (?:is )?(?:unsupported|unknown|unrecognized|not supported|not allowed|not permitted)`),
-    new RegExp(`${key} (?:is )?(?:unsupported|unknown|unrecognized|not supported|not allowed|not permitted)`),
-    new RegExp(`extra inputs?(?: are)? (?:not permitted|not allowed)[: ]+.*${key}`),
-    new RegExp(`(?:not supported|not permitted|not allowed)[: ]+.*${key}`),
-  ].some((pattern) => pattern.test(normalized));
+  // Keep this deliberately grammar-bound. A rejected value or a conditional
+  // restriction (for example, "not allowed when temperature is set") is not
+  // proof that the endpoint lacks support for the field itself.
+  const terminal = String.raw`(?=$|[}\]>,.;])`;
+  return (
+    new RegExp(String.raw`(?:unsupported|unknown|unrecognized|unexpected)\s+${field}\s*[:=]?\s*${key}${terminal}`).test(normalized) ||
+    new RegExp(String.raw`(?:extra\s+inputs?|${field}\s+not\s+(?:allowed|permitted|supported))\s*[:=]\s*${key}${terminal}`).test(normalized) ||
+    new RegExp(String.raw`${key}(?:\s+${field})?\s*[:=]?\s*(?:is\s+)?${unsupported}${terminal}`).test(normalized)
+  );
 }
 
 function hasPromptCacheKeyUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
@@ -8688,6 +8823,41 @@ async function atomicReplaceTextFilePreservingMode(
   }
 }
 
+async function atomicCreateTextFileNoReplace(
+  targetPath: string,
+  content: string,
+  mode: number,
+  purpose: string,
+  /** Test-only race injector; production callers leave this undefined. */
+  beforeLink?: () => Promise<void>,
+): Promise<void> {
+  const tempPath = uniqueTempPath(targetPath, purpose);
+  try {
+    await writeFile(tempPath, content, { encoding: "utf8", mode, flag: "wx" });
+    const tempInfo = await lstat(tempPath);
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) {
+      throw new Error("temporary creation is not a regular file");
+    }
+    await chmod(tempPath, mode);
+    // A hard link gives us an atomic no-replace create. Unlike rename(), it
+    // cannot overwrite a file that appeared after the absence check.
+    if (beforeLink) await beforeLink();
+    await link(tempPath, targetPath);
+    await unlink(tempPath).catch((cleanupError) => {
+      console.warn(`${LOG_PREFIX}: committed config file but failed to remove its temporary hard link`, cleanupError);
+    });
+  } catch (error) {
+    try {
+      await unlink(tempPath);
+    } catch (cleanupError) {
+      if (getErrorCode(cleanupError) !== "ENOENT") {
+        console.warn(`${LOG_PREFIX}: failed to remove temporary config file`, cleanupError);
+      }
+    }
+    throw error;
+  }
+}
+
 async function atomicRestoreFileFromBackup(
   backupPath: string,
   targetPath: string,
@@ -9205,7 +9375,14 @@ async function writeModelsJsonFixReceipt(
     await assertReceiptDestinationUnchanged();
     if (beforeRename) await beforeRename();
     await assertReceiptDestinationUnchanged();
-    await rename(tempPath, receiptPath);
+    if (existingReceiptInfo) {
+      await rename(tempPath, receiptPath);
+    } else {
+      await link(tempPath, receiptPath);
+      await unlink(tempPath).catch((cleanupError) => {
+        console.warn(`${LOG_PREFIX}: committed fix receipt but failed to remove its temporary hard link`, cleanupError);
+      });
+    }
   } catch (error) {
     try {
       await unlink(tempPath);
@@ -9925,6 +10102,7 @@ export const __internals_for_tests = {
   parsePromptCacheKeyConfigReceipt,
   isActionablePromptCacheKeyConfigReceipt,
   readPromptCacheKeyConfigReceipt,
+  readPromptCacheKeyConfigReceiptSnapshot,
   writePromptCacheKeyConfigReceipt,
   applyPromptCacheKeyConfigFix,
   rollbackPromptCacheKeyConfig,
@@ -9998,6 +10176,7 @@ export const __internals_for_tests = {
   formatCompatKeysForInsertion,
   backupTimestamp,
   atomicReplaceTextFilePreservingMode,
+  atomicCreateTextFileNoReplace,
   atomicRestoreFileFromBackup,
   applyModelsJsonFixTransaction,
   hashText,
@@ -10071,7 +10250,11 @@ export default function (pi: ExtensionAPI) {
   // finalized assistant message consumes the oldest completed record, falling
   // back to the oldest request only when a transport emitted no response hook.
   // This preserves response A when request B/C starts before message_end(A).
-  type ProviderRequestState = { model: PiModel; responseReceived: boolean };
+  type ProviderRequestState = {
+    model: PiModel;
+    responseReceived: boolean;
+    correlationAmbiguous: boolean;
+  };
   const providerRequestStates: ProviderRequestState[] = [];
   let shardCreatedAt = Date.now();
   const PERSIST_DEBOUNCE_MS = 2000;
@@ -10772,10 +10955,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-    if (runtimeOptimizerEnabled) {
-      const snapshot = snapshotProviderRequestModel(requestModel);
-      if (snapshot) providerRequestStates.push({ model: snapshot, responseReceived: false });
-    }
+    // Request-local identity is also needed by the always-on Anthropic TTL
+    // validity repair, so retain the credential-blind snapshot even while the
+    // optional runtime optimizer features are disabled.
+    const snapshot = snapshotProviderRequestModel(requestModel);
+    if (snapshot) providerRequestStates.push({ model: snapshot, responseReceived: false, correlationAmbiguous: false });
     let requestPayload: unknown = event.payload;
     let toolOrderChanged = false;
 
@@ -10843,9 +11027,25 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
-    const responseState = providerRequestStates.find((state) => !state.responseReceived);
+    const pendingStates = providerRequestStates.filter((state) => !state.responseReceived);
+    let responseState: ProviderRequestState | undefined;
+    if (pendingStates.length === 1) {
+      responseState = pendingStates[0];
+    } else if (pendingStates.length > 1) {
+      const pendingModelKeys = new Set(pendingStates.map((state) => modelKey(state.model)));
+      if (pendingModelKeys.size === 1) {
+        // Identity is still exact when concurrent requests use the same model.
+        responseState = pendingStates[0];
+      } else {
+        // Pi supplies no request id here, so out-of-order concurrent responses
+        // cannot be assigned safely. Preserve the lifecycle records for a
+        // message-local identity, but never turn ambiguous headers into a
+        // model-scoped persistent-fix suggestion.
+        for (const state of pendingStates) state.correlationAmbiguous = true;
+      }
+    }
     if (responseState) responseState.responseReceived = true;
-    const model = responseState?.model ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+    const model = responseState?.model ?? (pendingStates.length === 0 ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model) : undefined);
     if (!runtimeOptimizerEnabled || !model) return;
 
     // Keep only the category, never the provider's complete error text. This
@@ -10938,21 +11138,39 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event, ctx) => {
     syncSessionHash(ctx);
     const msgRecord = asRecord(event.message);
-    const requestModelForMessage = msgRecord?.role === "assistant"
+    const requestCorrelationForMessage = msgRecord?.role === "assistant"
       ? (() => {
+        const explicitModel = modelFromAssistantMessage(event.message, undefined);
+        const explicitIndex = explicitModel
+          ? providerRequestStates.findIndex((state) => modelKey(state.model) === modelKey(explicitModel))
+          : -1;
         const completedIndex = providerRequestStates.findIndex((state) => state.responseReceived);
-        const index = completedIndex >= 0 ? completedIndex : 0;
-        return providerRequestStates.splice(index, 1)[0]?.model;
+        const contextModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+        const contextIndex = contextModel && !providerRequestStates.some((state) => state.correlationAmbiguous)
+          ? providerRequestStates.findIndex((state) => modelKey(state.model) === modelKey(contextModel))
+          : -1;
+        const index = explicitIndex >= 0
+          ? explicitIndex
+          : (completedIndex >= 0 ? completedIndex : (contextIndex >= 0 ? contextIndex : 0));
+        const state = providerRequestStates.splice(index, 1)[0];
+        if (!state) return { model: undefined, ambiguous: false };
+        return {
+          model: state.correlationAmbiguous && explicitIndex < 0 ? undefined : state.model,
+          ambiguous: state.correlationAmbiguous && explicitIndex < 0,
+        };
       })()
-      : undefined;
+      : { model: undefined, ambiguous: false };
+    const requestModelForMessage = requestCorrelationForMessage.model;
+    const contextualFallbackForMessage = requestCorrelationForMessage.ambiguous
+      ? undefined
+      : (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
 
     // Some providers expose an HTTP 400 error body only through the finalized
     // assistant error message; after_provider_response may contain the status
     // and no diagnostic response headers. Record only the model-scoped
     // reasoning-protocol category from that authoritative message identity.
     if (runtimeOptimizerEnabled && hasReasoningProtocolRejectionErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage
-        ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
       const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
       const errorModel = messageModel
         ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
@@ -10967,7 +11185,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (runtimeOptimizerEnabled && hasPromptCacheKeyUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
       const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
       const errorModel = messageModel
         ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
@@ -10985,8 +11203,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (runtimeOptimizerEnabled && hasPromptCacheRetentionUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage
-        ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
       const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
       const errorModel = messageModel
         ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
@@ -11010,8 +11227,7 @@ export default function (pi: ExtensionAPI) {
     // non-retryable 400 in Pi 0.82.1, so the fallback applies to the next
     // subsequent request (and to a retry only if another layer initiates one).
     if (hasAnthropicCacheTtlOrderError(event.message)) {
-      const fallbackModel = requestModelForMessage
-        ?? (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
       const errorModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
       if (errorModel && isAnthropicMessagesApi(errorModel.api)) {
         const key = modelKey(errorModel);
@@ -11240,7 +11456,8 @@ export default function (pi: ExtensionAPI) {
           cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
           return;
         }
-        const configReceipt = await readPromptCacheKeyConfigReceipt();
+        const configReceiptSnapshot = await readPromptCacheKeyConfigReceiptSnapshot();
+        const configReceipt = configReceiptSnapshot?.receipt;
         const modelsReceipt = await readModelsJsonFixReceipt();
         const useConfigReceipt = isActionablePromptCacheKeyConfigReceipt(configReceipt) &&
           configReceipt.provider === model.provider &&
@@ -11260,7 +11477,8 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           try {
-            await rollbackPromptCacheKeyConfig(configReceipt);
+            if (!configReceiptSnapshot) throw new Error("prompt-cache-key receipt changed since the rollback preview");
+            await rollbackPromptCacheKeyConfig(configReceiptSnapshot);
             setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
             cmdCtx.ui.notify(`✅ Restored prompt_cache_key behavior for ${modelKey(model)}. Run /reload or restart Pi for the change to take effect.`, "info");
           } catch (error) {

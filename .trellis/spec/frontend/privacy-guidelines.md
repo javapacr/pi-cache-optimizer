@@ -50,8 +50,12 @@ surgical restoration of receipt-owned scalar keys whose post-fix values still
 match. Otherwise it refuses without overwriting user changes. Backups,
 replacements, and receipt writes use atomic operations and preserve the existing
 `models.json` access mode. Fix and rollback transactions serialize across
-extension instances; rollback binds the exact receipt transaction/hash from
-preview through commit and refuses if another transaction replaces it.
+extension instances; rollback binds the exact receipt file identity and hash from
+preview through commit and refuses if another transaction replaces or rewrites it.
+Creating a previously absent config uses atomic no-replace semantics. Receipt
+marking is part of rollback: if it fails after the config mutation, the extension
+must restore the exact post-fix config under identity/hash/mode guards rather than
+leave an actionable receipt paired with an already-rolled-back file.
 
 ## Scenario: privacy-safe deterministic tool ordering
 

@@ -1343,7 +1343,12 @@ or the fix created a new target entry; the refusal includes manual backup guidan
 The surgical result preserves comments, credentials, unrelated fields, and later
 user changes, is validated as JSONC, uses the same backup → temp → atomic rename
 contract, and marks the receipt rolled back only after successful validation.
-After any successful rollback, notify the user to run `/reload` or restart Pi.
+Prompt-cache-key config rollback additionally binds the previewed config receipt by
+file identity and hash through commit. A replaced or in-place rewritten receipt is
+refused. If receipt marking fails after the config mutation, the exact post-fix
+config is restored under identity/hash/mode guards; a previously absent config is
+recreated with atomic no-replace semantics. After any successful rollback, notify
+the user to run `/reload` or restart Pi.
 
 ### `/cache-optimizer reset`
 
@@ -1486,10 +1491,10 @@ compat). It does NOT read or expose:
 | Third-party `openai-completions` proxy returns HTTP 403 while `sendSessionAffinityHeaders` is enabled | Extension records a one-time model-scoped warning (`sendSessionAffinityHeaders403Models`) and `/cache-optimizer doctor` surfaces the session-affinity 403 hint with `/cache-optimizer fix` offering `sendSessionAffinityHeaders: false`. Pi 0.80.7+ `openai-responses` is excluded because it uses `sessionAffinityFormat`. |
 | `/cache-optimizer doctor` with session-affinity enabled but no 403 observed | Shows advisory text that some CDNs/WAFs block custom headers (session_id, x-client-request-id, x-session-affinity) and return 403 |
 | `/cache-optimizer fix` with 403-observed OpenAI-compatible model | Offers `sendSessionAffinityHeaders: false` as the compat-key suggestion (mirror of the 400 `supportsLongCacheRetention: false` path) |
-| `/cache-optimizer fix` after explicit field-level `prompt_cache_key` unsupported evidence | Shows a precise model-scoped extension-config preview and offers final payload omission; value-validation or conditional-use errors do not qualify and no `models.json` field is written |
+| `/cache-optimizer fix` after explicit field-level `prompt_cache_key` unsupported evidence | Shows a precise model-scoped extension-config preview and offers final payload omission; value-validation or conditional-use errors do not qualify, ambiguous cross-model response headers are discarded unless finalized message identity resolves them, and no `models.json` field is written |
 | `/cache-optimizer fix prompt-cache-key` without prior evidence | Shows the same explicit preview and requires confirmation; it does not silently disable other models |
 | `/cache-optimizer fix prompt-cache-key` for a configured model | Is idempotent and reports that the exact model is already configured |
-| Prompt cache key opt-out rollback | Restores the config backup atomically, verifies the receipt-owned exact model key and whether it existed before, preserves `footerMode`, refuses if the config changed after the fix, and leaves the `models.json` receipt untouched |
+| Prompt cache key opt-out rollback | Restores the config backup atomically, verifies the receipt-owned exact model key and whether it existed before, binds receipt inode/hash from preview through commit, compensates config if receipt marking fails, preserves `footerMode`, refuses if config or receipt changed, and leaves the `models.json` receipt untouched |
 | Concurrent footer/config write | A shared transaction lease serializes the write; expected regular-file identity, hash, and mode are checked before replacement |
 | `/cache-optimizer compat` with fully-configured model where `sendSessionAffinityHeaders` is enabled | Shows `✅ Compat fully configured.` plus an advisory line about potential CDN/WAF 403 blocking of custom session-affinity headers |
 | Generic proxy model with explicit `sendSessionAffinityHeaders: false` after a 403/CDN block | No `⚠️ compat`; `/cache-optimizer fix` must NOT suggest changing it back to `true` |

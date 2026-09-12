@@ -136,13 +136,13 @@ The explicit setting is stored in `pi-cache-optimizer-config.json` under Pi's ag
 
 Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.85.1 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
 
-When the extension observes an explicit `prompt_cache_key` unsupported error for the exact provider/model, ordinary `/cache-optimizer fix` offers a confirmed model-scoped repair. If you already know that the endpoint rejects the field, use the explicit command:
+When the extension observes an explicit field-level `prompt_cache_key` unsupported error for the exact provider/model, ordinary `/cache-optimizer fix` offers a confirmed model-scoped repair. Value-validation failures and conditional restrictions such as “not allowed when temperature is set” do not qualify. If concurrent responses from different models cannot be correlated because Pi provides no request ID, header-only evidence is ignored unless the finalized assistant message supplies exact provider/model identity. If you already know that the endpoint rejects the field, use the explicit command:
 
 ```text
 /cache-optimizer fix prompt-cache-key
 ```
 
-The preview explains that the setting is stored in the extension-owned `pi-cache-optimizer-config.json`. After confirmation, the final `before_provider_request` stage removes both `prompt_cache_key` and `promptCacheKey`, including a key that Pi core supplied earlier. This can reduce provider prompt-cache hits for that exact model, while other models retain the existing fallback behavior. The file is updated atomically, a privacy-safe backup/receipt is created, and `/reload` or a Pi restart is required. `/cache-optimizer rollback` restores the previous extension configuration without resetting `footerMode`.
+The preview explains that the setting is stored in the extension-owned `pi-cache-optimizer-config.json`. After confirmation, the final `before_provider_request` stage removes both `prompt_cache_key` and `promptCacheKey`, including a key that Pi core supplied earlier. This can reduce provider prompt-cache hits for that exact model, while other models retain the existing fallback behavior. The file is updated atomically without overwriting a concurrently created config, a privacy-safe backup/receipt is created, and `/reload` or a Pi restart is required. `/cache-optimizer rollback` restores the previous extension configuration without resetting `footerMode`; it binds the previewed receipt by file identity and hash, refuses a replaced receipt, and compensates the config if receipt marking fails.
 
 ## OpenAI-compatible proxy setup
 
