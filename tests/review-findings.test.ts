@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1781,6 +1781,129 @@ describe("DeepSeek protocol-first compatibility", () => {
     }
   });
 
+  test("concurrent cross-model responses do not turn ambiguous headers into model-scoped evidence", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-response-ambiguity-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const handlers = new Map<string, (event: any, context: any) => unknown>();
+      freshModule.default({
+        on(name: string, handler: (event: any, context: any) => unknown) { handlers.set(name, handler); },
+        registerCommand() {},
+      } as any);
+      const makeModel = (provider: string, id: string) => ({
+        provider,
+        id,
+        name: id,
+        api: "openai-completions",
+        baseUrl: `https://${provider}.example/v1`,
+        compat: {},
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8192,
+      });
+      const modelA = makeModel("proxy-a", "gpt-a");
+      const modelB = makeModel("proxy-b", "gpt-b");
+      const notifications: string[] = [];
+      const context = (model: any) => ({
+        model,
+        sessionManager: { getSessionId: () => "ambiguity-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: { notify: (message: string) => notifications.push(message), setStatus() {} },
+      });
+      const requestHook = handlers.get("before_provider_request");
+      const responseHook = handlers.get("after_provider_response");
+      const messageEndHook = handlers.get("message_end");
+      assert.ok(requestHook && responseHook && messageEndHook);
+
+      requestHook({ payload: {} }, context(modelA));
+      requestHook({ payload: {} }, context(modelB));
+      await responseHook(
+        { status: 400, headers: { "x-error": "Unsupported parameter: prompt_cache_key" } },
+        context(modelB),
+      );
+      assert.equal(notifications.some((message) => message.includes("rejected prompt_cache_key")), false);
+
+      await messageEndHook({
+        message: {
+          role: "assistant",
+          provider: modelB.provider,
+          model: modelB.id,
+          api: modelB.api,
+          stopReason: "error",
+          status: 400,
+          errorMessage: "Unsupported parameter: prompt_cache_key",
+        },
+      }, context(modelA));
+      assert.equal(notifications.some((message) => message.includes("proxy-a/gpt-a rejected prompt_cache_key")), false);
+      assert.equal(notifications.some((message) => message.includes("proxy-b/gpt-b rejected prompt_cache_key")), true);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime disable retains request-local identity for always-on Anthropic TTL repair", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-ttl-disabled-correlation-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousRetention = process.env.PI_CACHE_RETENTION;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const handlers = new Map<string, (event: any, context: any) => unknown>();
+      freshModule.default({
+        on(name: string, handler: (event: any, context: any) => unknown) { handlers.set(name, handler); },
+        registerCommand() {},
+      } as any);
+      const makeModel = (provider: string, id: string) => ({
+        provider,
+        id,
+        name: id,
+        api: "anthropic-messages",
+        baseUrl: `https://${provider}.example`,
+        compat: {},
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8192,
+      });
+      const requestModel = makeModel("anthropic-proxy-a", "claude-a");
+      const activeModel = makeModel("anthropic-proxy-b", "claude-b");
+      const notifications: string[] = [];
+      const context = (model: any) => ({
+        model,
+        sessionManager: { getSessionId: () => "ttl-disabled-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: { notify: (message: string) => notifications.push(message), setStatus() {} },
+      });
+      freshModule.__internals_for_tests.setRuntimeOptimizerEnabled(false);
+      handlers.get("before_provider_request")?.({ payload: {} }, context(requestModel));
+      await handlers.get("message_end")?.({
+        message: {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "cache_control ttl='1h' must not come after ttl='5m'",
+        },
+      }, context(activeModel));
+      assert.equal(notifications.some((message) => message.includes("anthropic-proxy-a/claude-a")), true);
+      assert.equal(notifications.some((message) => message.includes("anthropic-proxy-b/claude-b")), false);
+      freshModule.__internals_for_tests.setRuntimeOptimizerEnabled(true);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = previousRetention;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
   test("ordinary fix does not configure prompt_cache_key without evidence", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-no-evidence-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -2768,8 +2891,14 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("parses v1 and v2 config without accepting malformed or private data", () => {
     assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unsupported parameter: prompt_cache_key" }), true);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unknown field promptCacheKey" }), true);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key is not supported" }), true);
     assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Invalid parameter value for prompt_cache_key" }), false);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unsupported parameter value for prompt_cache_key" }), false);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "The prompt_cache_key value is not supported" }), false);
     assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key must be omitted when temperature is set" }), false);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key is not allowed when temperature is set" }), false);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "promptCacheKey is not permitted with stream=true" }), false);
     assert.deepEqual(internals.parsePersistedCacheOptimizerConfig({ version: 1, footerMode: "total" }), { version: 1, footerMode: "total" });
     assert.deepEqual(
       internals.parsePersistedCacheOptimizerConfig({ version: 2, footerMode: "session", promptCacheKey: { omit: ["z/model", "a/model", "a/model"] } }),
@@ -2805,15 +2934,134 @@ describe("prompt_cache_key model opt-out", () => {
       assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
       assert.equal(await readFile(applied.backupPath, "utf8"), original);
       assert.equal((await stat(applied.backupPath)).mode & 0o7777, 0o640);
-      const receipt = await internals.readPromptCacheKeyConfigReceipt(receiptPath);
-      assert.ok(receipt);
-      assert.equal(receipt?.addedModelKey, "proxy/gpt-5.5");
-      assert.equal(receipt?.targetHadModelKey, false);
+      const receiptSnapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      assert.ok(receiptSnapshot);
+      const receipt = receiptSnapshot.receipt;
+      assert.equal(receipt.addedModelKey, "proxy/gpt-5.5");
+      assert.equal(receipt.targetHadModelKey, false);
       assert.equal(JSON.stringify(receipt).includes("prompt_cache_key"), false);
-      await internals.rollbackPromptCacheKeyConfig(receipt, configPath, receiptPath);
+      await internals.rollbackPromptCacheKeyConfig(receiptSnapshot, configPath, receiptPath);
       assert.equal(await readFile(configPath, "utf8"), original);
       assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath), { version: 2, footerMode: "total" });
       assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.status, "rolled_back");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fix receipt failure restores both existing and absent config targets", async () => {
+    for (const targetExists of [true, false]) {
+      const tempDir = await mkdtemp(join(tmpdir(), `pi-cache-key-config-fix-receipt-failure-${targetExists}-`));
+      const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+      const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+      const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
+      try {
+        if (targetExists) await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
+        await mkdir(receiptPath);
+        await assert.rejects(
+          internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath),
+          /invalid prompt-cache-key receipt path/,
+        );
+        if (targetExists) {
+          assert.equal(await readFile(configPath, "utf8"), original);
+          assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
+        } else {
+          await assert.rejects(readFile(configPath, "utf8"), (error: any) => error?.code === "ENOENT");
+        }
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("receipt replacement after preview aborts config rollback and restores the post-fix config", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-receipt-race-test-"));
+    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
+    try {
+      await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
+      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      const fixed = await readFile(configPath, "utf8");
+      const snapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      assert.ok(snapshot);
+      const replacement = { ...snapshot.receipt, transactionId: "replacement-transaction" };
+
+      await assert.rejects(
+        internals.rollbackPromptCacheKeyConfig(snapshot, configPath, receiptPath, {
+          beforeReceiptRename: async () => {
+            await writeFile(receiptPath, JSON.stringify(replacement, null, 2) + "\n", "utf8");
+          },
+        }),
+        /prompt-cache-key receipt changed/,
+      );
+      assert.equal(await readFile(configPath, "utf8"), fixed);
+      assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.transactionId, "replacement-transaction");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("atomic config creation never overwrites a file that appears at the final boundary", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-create-race-test-"));
+    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    try {
+      await assert.rejects(
+        internals.atomicCreateTextFileNoReplace(
+          configPath,
+          "extension-content\n",
+          0o600,
+          "config-test",
+          async () => writeFile(configPath, "user-content\n", "utf8"),
+        ),
+        (error: any) => error?.code === "EEXIST",
+      );
+      assert.equal(await readFile(configPath, "utf8"), "user-content\n");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("receipt update failure recreates a newly-created post-fix config", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-new-config-receipt-failure-test-"));
+    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    try {
+      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      const fixed = await readFile(configPath, "utf8");
+      const snapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      assert.ok(snapshot);
+      const replacement = { ...snapshot.receipt, transactionId: "replacement-new-config" };
+
+      await assert.rejects(
+        internals.rollbackPromptCacheKeyConfig(snapshot, configPath, receiptPath, {
+          beforeReceiptRename: async () => {
+            await writeFile(receiptPath, JSON.stringify(replacement, null, 2) + "\n", "utf8");
+          },
+        }),
+        /prompt-cache-key receipt changed/,
+      );
+      assert.equal(await readFile(configPath, "utf8"), fixed);
+      assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.transactionId, "replacement-new-config");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("direct repeated fixes reject without changing config or receipt", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-repeat-config-test-"));
+    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    try {
+      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      const configBefore = await readFile(configPath, "utf8");
+      const receiptBefore = await readFile(receiptPath, "utf8");
+      await assert.rejects(
+        internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath),
+        /already configured; no changes were made/,
+      );
+      assert.equal(await readFile(configPath, "utf8"), configBefore);
+      assert.equal(await readFile(receiptPath, "utf8"), receiptBefore);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -2827,9 +3075,11 @@ describe("prompt_cache_key model opt-out", () => {
     try {
       await writeFile(configPath, JSON.stringify({ version: 2, footerMode: "process", promptCacheKey: { omit: ["proxy/existing"] } }, null, 2) + "\n", { mode: 0o640 });
       await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
-      const second = await internals.applyPromptCacheKeyConfigFix(otherModel, configPath, receiptPath);
+      await internals.applyPromptCacheKeyConfigFix(otherModel, configPath, receiptPath);
       assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath).promptCacheKey?.omit, ["proxy/existing", "proxy/gpt-5.5", "proxy/gpt-5.6"]);
-      await internals.rollbackPromptCacheKeyConfig(second.receipt, configPath, receiptPath);
+      const receiptSnapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      assert.ok(receiptSnapshot);
+      await internals.rollbackPromptCacheKeyConfig(receiptSnapshot, configPath, receiptPath);
       assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath), {
         version: 2,
         footerMode: "process",

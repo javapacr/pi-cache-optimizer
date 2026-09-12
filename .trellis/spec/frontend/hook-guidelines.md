@@ -77,11 +77,12 @@ Primary hooks/events:
 - For an exact extension-configured omit model, remove both `prompt_cache_key` and `promptCacheKey` after Pi/core and other request mutations, including pre-existing keys.
 - Use Pi session id fallback for unconfigured models; do not derive keys from prompt content.
 - For virtual routing providers, resolve the upstream model via the routing registry when available.
+- Retain one credential-blind request-identity lifecycle record even when runtime optimization is disabled, because the always-on Anthropic invalid-TTL repair still requires request-local provider/model attribution.
 
 ### `after_provider_response`
 
 - Record only an explicit HTTP 400 field-capability rejection for `prompt_cache_key` / `promptCacheKey` as a process-local exact provider/model category. Value-validation, conditional-usage, and ordinary `bad request` text must not activate it. Do not persist or display the raw error.
-- Pi's provider response event has no request id. Correlate request metadata through FIFO lifecycle records in serialized event order; never overwrite an earlier completed response merely because a later request starts.
+- Pi's provider response event has no request id. Correlate request metadata through lifecycle records without overwriting an earlier completed response merely because a later request starts. When multiple outstanding requests use different exact models, a response header is ambiguous and MUST NOT create model-scoped evidence. Mark the lifecycle ambiguous; recover attribution only from exact provider/model metadata on the finalized assistant message. Concurrent requests for the same exact model remain safely attributable.
 
 - Record model-scoped 400 hints only for applicable prompt-cache-retention failures; the untouched Pi built-in `llama.cpp` compat fingerprint is excluded, while same-id overrides with explicit cache compat remain eligible.
 - Record model-scoped 403 hints only for applicable third-party OpenAI-compatible proxy failures (session-affinity headers or OpenAI SDK header/User-Agent diagnostics). The untouched built-in `llama.cpp` fingerprint and custom transports are excluded; provider id alone is not an exemption.
@@ -92,7 +93,7 @@ Primary hooks/events:
 ### `message_end`
 
 - Before the normal error/aborted stats early return, detect only Anthropic's explicit mixed-TTL ordering error and record a process-local provider/model fallback for the next subsequent request. This is a non-retryable 400 in Pi 0.82.1; do not promise built-in automatic retry. Do not classify generic 400 or prompt-too-long errors.
-- Inspect finalized assistant errors for an explicit HTTP 400 unsupported `prompt_cache_key` / `promptCacheKey` signal and record only the exact request-local provider/model category for a later confirmed fix. Status parsing is limited to known HTTP-status fields or status-shaped error prefixes; arbitrary numbers are not treated as HTTP status.
+- Inspect finalized assistant errors for an explicit HTTP 400 unsupported `prompt_cache_key` / `promptCacheKey` signal and record only the exact request-local provider/model category for a later confirmed fix. Status parsing is limited to known HTTP-status fields or status-shaped error prefixes; arbitrary numbers are not treated as HTTP status. If concurrent request correlation is ambiguous and the message has no exact provider/model identity, discard the evidence rather than falling back to the current active model.
 - Also inspect finalized assistant errors for the same narrow reasoning-protocol rejection (`thinking` rejected in favor of `reasoning_effort`) and use request-local provider/model identity. Keep only the model-scoped category in process memory; never persist or display the raw error and never auto-edit configuration.
 - Assistant message metadata is authoritative for final stats identity.
 - Use message-local provider/model/api/usage when available; do not use global route state for final stats.
