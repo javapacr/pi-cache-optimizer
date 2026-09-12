@@ -333,7 +333,6 @@ type CacheCompat = {
   sendSessionAffinityHeaders?: boolean;
   sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
   supportsLongCacheRetention?: boolean;
-  supportsPromptCacheKey?: boolean;
   thinkingFormat?: string;
   requiresReasoningContentOnAssistantMessages?: boolean;
   cacheControlFormat?: string;
@@ -1645,7 +1644,7 @@ function isValidOpenAICompletionsCompat(compat: UnknownRecord): boolean {
     "supportsUsageInStreaming", "requiresToolResultName", "requiresAssistantAfterToolResult",
     "requiresThinkingAsText", "requiresReasoningContentOnAssistantMessages",
     "supportsOpenAIGrammarTools", "supportsStrictMode", "sendSessionAffinityHeaders",
-    "supportsLongCacheRetention", "supportsPromptCacheKey",
+    "supportsLongCacheRetention",
   ];
   if (booleanKeys.some((key) => !isOptionalBoolean(compat[key]))) return false;
   if (compat.maxTokensField !== undefined && compat.maxTokensField !== "max_completion_tokens" && compat.maxTokensField !== "max_tokens") return false;
@@ -1664,7 +1663,7 @@ function isValidOpenAICompletionsCompat(compat: UnknownRecord): boolean {
 
 function isValidOpenAIResponsesCompat(compat: UnknownRecord): boolean {
   const booleanKeys = [
-    "supportsDeveloperRole", "supportsLongCacheRetention", "supportsPromptCacheKey", "supportsStrictMode",
+    "supportsDeveloperRole", "supportsLongCacheRetention", "supportsStrictMode",
     "supportsOpenAIGrammarTools", "supportsAdditionalTools", "supportsToolSearch",
   ];
   if (booleanKeys.some((key) => !isOptionalBoolean(compat[key]))) return false;
@@ -1684,7 +1683,7 @@ function isValidCompatRecord(value: unknown): boolean {
   if (value === undefined) return true;
   const compat = asRecord(value);
   return !!compat
-    && isOptionalBoolean(compat.supportsPromptCacheKey)
+    && !Object.prototype.hasOwnProperty.call(compat, "supportsPromptCacheKey")
     && (
     isValidOpenAICompletionsCompat(compat)
     || isValidOpenAIResponsesCompat(compat)
@@ -2471,8 +2470,10 @@ function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
 }
 
 function shouldInjectOpenAIPromptCacheKeyForModel(model: PiModel | undefined): boolean {
-  if (!isOpenAICompatibleApi(model?.api)) return false;
-  return getCompat(model).supportsPromptCacheKey !== false;
+  // Pi 0.85.1 has no native supportsPromptCacheKey compat field. Per-model
+  // opt-out is owned by this extension's promptCacheKey.omit configuration;
+  // this helper only exposes the transport API gate for fixture consumers.
+  return isOpenAICompatibleApi(model?.api);
 }
 
 function isPromptCacheKeyOmittedForModel(model: PiModel | undefined, config: PersistedCacheOptimizerConfigV2 = persistedCacheOptimizerConfig): boolean {

@@ -111,7 +111,7 @@ Primary hooks/events:
 ## Common Mistakes
 
 - Doing final stats attribution from live/global router state instead of assistant message metadata.
-- Injecting OpenAI cache keys or affinity headers into custom transports such as `kiro-api`, or ignoring an explicit effective `supportsPromptCacheKey: false` opt-out.
+- Injecting OpenAI cache keys or affinity headers into custom transports such as `kiro-api`, or implementing the per-model prompt-cache-key opt-out through an unsupported Pi compat field instead of the extension-owned configuration.
 - Treating `ctx.model.compat` as the only effective compat source for extension providers; `registerProvider()` model replacement can omit provider/custom-model compat even though exact `models.json` configuration remains authoritative.
 - Normalizing Anthropic TTLs by provider/model name instead of validating the effective API and final wire-order payload.
 - Treating a provider id alone (including `llama.cpp`) as proof of transport capabilities; prefer Pi's explicit model/compat fingerprint and honor overrides.

@@ -181,9 +181,8 @@ core's own cache transport.
   the model `id`/`name` no longer needs to match GPT-family tokens — remote models
   using an OpenAI-shaped API (including Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan,
   Qwen Token Plan, Pi's built-in `llama.cpp`, and any future OpenAI-compatible
-  provider) receive the session-id fallback unless their effective
-  `supportsPromptCacheKey` compat is explicitly `false`. Custom transports such
-  as `kiro-api` remain excluded by the API gate.
+  provider) receive the session-id fallback. Custom transports such as
+  `kiro-api` remain excluded by the API gate.
 * Cache-key source: use `ctx.sessionManager.getSessionId()`, clamped to
   OpenAI's 64-codepoint `prompt_cache_key` limit. Do NOT derive the key from a
   prompt/stable-prefix hash; Pi core uses session id for official OpenAI paths,
@@ -199,9 +198,11 @@ core's own cache transport.
 * Opt-out: default behavior is enabled. Users can disable fallback injection
   globally with `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` (truthy: `1`,
   `true`, `yes`, `on`) or legacy-style `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0`
-  (disabled: `0`, `false`, `no`, `off`). For a single provider/model, set
-  effective `compat.supportsPromptCacheKey: false`; this suppresses only the
-  extension fallback and never removes a pre-existing request key.
+  (disabled: `0`, `false`, `no`, `off`). A single provider/model can be
+  persistently listed in the extension-owned config as
+  `promptCacheKey.omit`; this removes both request-key spellings, including a
+  key already supplied by Pi. Do not add `supportsPromptCacheKey` to Pi's
+  `models.json`, because Pi 0.85.1 does not define that compat field.
 * All `before_agent_start` prompt mutations (session-overview churn strip,
   skill compression, stable-prefix reorder) can be disabled persistently with:
   `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` (truthy: `1`, `true`, `yes`, `on`).
@@ -843,6 +844,9 @@ const statsKey = `${responseModel.provider}/${responseModel.id}`;
 * Storing prompts, request payloads, response bodies, or HTTP headers in any
   on-disk file produced by this extension.
 * Injecting OpenAI `prompt_cache_key` into non-OpenAI-compatible custom APIs.
+* Treating an unsupported/private `supportsPromptCacheKey` field in Pi config as
+  the model-level opt-out; use the extension-owned `promptCacheKey.omit`
+  configuration instead.
 * Deriving OpenAI `prompt_cache_key` from prompt content or stable-prefix hashes; use the Pi session id fallback instead.
 * Overwriting a non-empty user/Pi-provided `prompt_cache_key` or `promptCacheKey`.
 * Adapter selection by `provider` id, API type, base URL, or compat flags. The only exception is that routing-provider identity resolution may decide which model object to inspect; adapter selection itself still uses the resolved model id/name and assistant message id/name tokens.
