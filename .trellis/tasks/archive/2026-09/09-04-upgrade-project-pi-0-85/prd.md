@@ -32,14 +32,14 @@ Upgrade this repository's local `@earendil-works/pi-coding-agent` development ba
 - `npm run typecheck` passed immediately with Pi 0.85.1 declarations.
 - Before adding the workaround, `npm test` failed in all three test files while loading the extension. The observed chain was `@earendil-works/pi-coding-agent/dist/index.js` → `dist/main.js` → `dist/experimental/client.js` → `dist/experimental/server.js`, which imports `@earendil-works/pi-server`; Pi 0.85.1's published manifest does not declare that package.
 - Adding exact `@earendil-works/pi-server@0.85.1` to `devDependencies` is therefore necessary for this repository's Jiti runtime tests. It is version-aligned, marked `dev: true` in the lockfile, absent from runtime `dependencies`, and not included in the package tarball.
-- A subsequent `npm ci` completed successfully with zero reported vulnerabilities, after which `npm run check` passed: typecheck, 88 tests, `git diff --check`, and `npm pack --dry-run`.
+- A subsequent `npm ci` completed successfully with zero reported vulnerabilities, after which the Pi 0.85.1 baseline check passed: typecheck, 89 tests, `git diff --check`, and `npm pack --dry-run`. The later 2.8.9 follow-up check includes the additional prompt-cache-key regression tests.
 - The same complete `npm run check` gate also passed under the locally installed Node `22.20.0` and npm `10.9.3`, matching CI's Node 22 major version.
 - The dry-run tarball still contains only `LICENSE`, `README.md`, `README.zh-CN.md`, `index.ts`, and `package.json`; no Pi runtime package is bundled.
 - `peerDependencies["@earendil-works/pi-coding-agent"]` remains `>=0.82.0`. No runtime source behavior changed; the only test source edit removes the obsolete hard-coded Pi-version wording from a test title.
 
 ## Definition of Done
 
-The dependency manifest and lockfile are updated minimally, clean-install reproducibility and the full project quality gate pass, task validation passes, and the task records the exact 0.85.1 dependency-resolution outcome. No delivery operation is performed.
+The dependency manifest and lockfile are updated minimally, clean-install reproducibility and the full project quality gate pass, task validation passes, and the task records the exact 0.85.1 dependency-resolution outcome. The baseline was delivered through follow-up PR #14 as part of the 2.8.9 release.
 
 ## Technical Approach
 
