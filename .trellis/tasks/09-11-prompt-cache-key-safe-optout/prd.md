@@ -7,7 +7,7 @@
 ## What I already know
 
 - PR #12（`andyxqq/fix/prompt-cache-key-compat`，提交 `dd78abd`）提出 provider/model-scoped opt-out，保留已有 key，仅抑制扩展 fallback；其方向和测试贡献有价值。
-- 系统 Pi 0.85.1 与项目 Pi 0.85.0 均没有原生 `compat.supportsPromptCacheKey`；Pi 0.85.1 的 `ModelConfig.load()` 会拒绝/忽略含该未知 compat 字段的 provider 配置。
+- 系统 Pi 0.85.1 与项目 Pi 0.85.1 均没有原生 `compat.supportsPromptCacheKey`；Pi 0.85.1 的 `ModelConfig.load()` 会拒绝/忽略含该未知 compat 字段的 provider 配置。
 - 原生 `supportsLongCacheRetention: false` 不能等价替代：它对 OpenAI Completions 与 Responses 的 `prompt_cache_key` 行为不同，并会同时改变 retention 语义。
 - 当前扩展在加载时请求 `PI_CACHE_RETENTION=long`，并在 `before_provider_request` 为 `openai-completions` / `openai-responses` 缺失 key 的 payload 注入 session-id fallback。
 - 当前全局 opt-out 为 `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` / `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0`，无法只关闭一个 provider/model。
@@ -43,16 +43,24 @@
 
 ## Acceptance Criteria (evolving)
 
-- [ ] Pi 0.85.1 能正常加载用户的 `models.json`；其中不需要也不出现 `supportsPromptCacheKey`。
-- [ ] 扩展配置可以精确表示某一 `provider/model` 的 `prompt_cache_key` omit 策略，并可无损迁移现有 v1 `footerMode`。
-- [ ] 未配置模型维持当前 fallback 和已有 key 保留行为。
-- [ ] 配置为 omit 的模型在最终 provider payload 中不包含 `prompt_cache_key` 或 `promptCacheKey`，包括 Pi core 预先提供 key 的情况；未配置模型仍保留已有 key并按原逻辑 fallback。
-- [ ] 其它 provider/model 不受影响；路由模型按最终 upstream identity 匹配。
-- [ ] `/cache-optimizer fix` 在明确 unsupported 证据或主动子命令下展示精确目标、将删除的字段含义和缓存影响，用户拒绝时不写文件，确认后原子持久化；普通无证据 `fix` 不误关闭。
-- [ ] 重复 fix 幂等；`/cache-optimizer rollback` 能安全恢复该扩展自有配置变更，或提供等价、清晰的一键重新启用流程，并保留 footer 配置。
-- [ ] 永不记录完整 provider 错误、prompt、payload、headers、session id 或输出。
-- [ ] 永久回归测试覆盖配置迁移、精确隔离、已有 Pi key 删除、fallback 抑制、确认拒绝/接受、幂等和恢复。
-- [ ] `npm run typecheck`、`npm test`、`npm run check:diff`、`npm run check:pack` 通过。
+- [x] Pi 0.85.1 能正常加载用户的 `models.json`；其中不需要也不出现 `supportsPromptCacheKey`。
+- [x] 扩展配置可以精确表示某一 `provider/model` 的 `prompt_cache_key` omit 策略，并可无损迁移现有 v1 `footerMode`。
+- [x] 未配置模型维持当前 fallback 和已有 key 保留行为。
+- [x] 配置为 omit 的模型在最终 provider payload 中不包含 `prompt_cache_key` 或 `promptCacheKey`，包括 Pi core 预先提供 key 的情况；未配置模型仍保留已有 key并按原逻辑 fallback。
+- [x] 其它 provider/model 不受影响；路由模型按最终 upstream identity 匹配。
+- [x] `/cache-optimizer fix` 在明确 unsupported 证据或主动子命令下展示精确目标、将删除的字段含义和缓存影响，用户拒绝时不写文件，确认后原子持久化；普通无证据 `fix` 不误关闭。
+- [x] 重复 fix 幂等；`/cache-optimizer rollback` 能安全恢复该扩展自有配置变更，或提供等价、清晰的一键重新启用流程，并保留 footer 配置。
+- [x] 永不记录完整 provider 错误、prompt、payload、headers、session id 或输出。
+- [x] 永久回归测试覆盖配置迁移、精确隔离、已有 Pi key 删除、fallback 抑制、确认拒绝/接受、幂等和恢复。
+- [x] `npm run typecheck`、`npm test`、`npm run check:diff`、`npm run check:pack` 通过。
+
+## Verification Notes
+
+- PR #12 merge commit `563f010` remains in history；安全实现从 `b028f1e` 移植为 `e53a88d`，随后在 `9167136` 中明确移除了不受支持的 compat gate。
+- `supportsPromptCacheKey` is no longer part of the extension compat type or fallback decision. Any occurrence in `models.json` is rejected by the extension's effective-compat validation, while the request fallback remains API-gated.
+- The extension-owned v2 config stores exact `provider/model` entries under `promptCacheKey.omit`; final payload handling removes both key spellings after other request mutations.
+- Pi development dependencies and local CLI resolve to `0.85.1`; the project peer range remains `>=0.82.0`.
+- `npm run check` passes with 95 tests, typecheck, diff validation, and a `2.8.9` dry-run package.
 
 ## Definition of Done
 
@@ -104,7 +112,7 @@
 - 按 provider 名称建立硬编码黑名单。
 - 静默自动写配置，或在首次 400 后未经确认自动重试/永久禁用。
 - 修改 cache adapters、footer stats 计数、prompt reorder、tool ordering 或其它无关行为。
-- 在本任务中升级项目开发依赖到 Pi 0.85.1，除非后续单独决定。
+- Pi 0.85.1 项目开发基线升级已作为当前修正分支的前置提交完成；本任务不再引入其它依赖升级。
 
 ## Technical Notes
 
