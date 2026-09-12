@@ -17,6 +17,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Install](#install)
 - [Commands](#commands)
 - [Persistent opt-out](#persistent-opt-out)
+- [Per-model `prompt_cache_key` opt-out](#per-model-prompt_cache_key-opt-out)
 - [Opt-in deterministic tool ordering](#opt-in-deterministic-tool-ordering)
 - [Footer cache stats mode](#footer-cache-stats-mode)
 - [OpenAI-compatible proxy setup](#openai-compatible-proxy-setup)
@@ -60,7 +61,7 @@ Run `/reload` in Pi after install/update/remove so extension hooks refresh.
 
 On Pi 0.79.7 and newer, `pi update` updates Pi itself only. To update installed Pi packages such as this extension, run `pi update --extensions` (packages only) or `pi update --all` (Pi + packages).
 
-This extension requires Pi 0.82+ and is validated against Pi 0.84.4. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
+This extension requires Pi 0.82+ and is validated against Pi 0.85.1. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
 
 ## Commands
 
@@ -76,10 +77,11 @@ This extension requires Pi 0.82+ and is validated against Pi 0.84.4. It uses the
 | `/cache-optimizer stats contributors` | Shows current/other contributing sessions for the active exact provider/model without exposing session ids. |
 | `/cache-optimizer reset` | Resets local footer stats for the active provider/model; upstream provider cache is not modified. |
 | `/cache-optimizer config footer-mode total\|session\|process` | Persist the footer stats mode. Persistent command configuration overrides the environment variable. |
-| `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. **Only modifies `models.json` after explicit user approval.** |
-| `/cache-optimizer rollback` | Reviews the latest matching confirmed fix and, after UI confirmation, restores it safely without overwriting unrelated `models.json` changes. |
+| `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. It writes `models.json` only for native compat fixes, or the extension config for an evidenced `prompt_cache_key` issue. |
+| `/cache-optimizer fix prompt-cache-key` | Explicitly configures the active OpenAI-compatible provider/model to omit `prompt_cache_key` and `promptCacheKey` from the final request body. Requires confirmation. |
+| `/cache-optimizer rollback` | Reviews the latest matching confirmed fix and, after UI confirmation, restores either the extension config or `models.json` fix safely. |
 
-`/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode`, and `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
+`/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer fix <Tab>` for `prompt-cache-key`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode`, and `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
 
 The interactive `/cache-optimizer` menu includes `Footer mode`, where you can choose `total`, `session`, or `process`. `enable` / `disable` are current-process switches. For a persistent opt-out, use environment variables below.
 
@@ -130,11 +132,23 @@ Persistent command configuration takes precedence over the environment variable:
 
 The explicit setting is stored in `pi-cache-optimizer-config.json` under Pi's agent directory. If no command override exists, `PI_CACHE_OPTIMIZER_FOOTER_MODE=total|session|process` is used; values are case-insensitive, and missing or invalid values fall back to `session`. To return an existing installation to environment-controlled behavior, manually delete `pi-cache-optimizer-config.json` and run `/reload`.
 
+## Per-model `prompt_cache_key` opt-out
+
+Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.85.1 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
+
+When the extension observes an explicit `prompt_cache_key` unsupported error for the exact provider/model, ordinary `/cache-optimizer fix` offers a confirmed model-scoped repair. If you already know that the endpoint rejects the field, use the explicit command:
+
+```text
+/cache-optimizer fix prompt-cache-key
+```
+
+The preview explains that the setting is stored in the extension-owned `pi-cache-optimizer-config.json`. After confirmation, the final `before_provider_request` stage removes both `prompt_cache_key` and `promptCacheKey`, including a key that Pi core supplied earlier. This can reduce provider prompt-cache hits for that exact model, while other models retain the existing fallback behavior. The file is updated atomically, a privacy-safe backup/receipt is created, and `/reload` or a Pi restart is required. `/cache-optimizer rollback` restores the previous extension configuration without resetting `footerMode`.
+
 ## OpenAI-compatible proxy setup
 
 Third-party `openai-completions` proxies (LiteLLM / OneAPI / NewAPI / OpenRouter-like channels) often route one session across multiple upstream backends. That splits provider-side prompt caches.
 
-Pi 0.84.1 also fixes built-in Fireworks compatibility for models that reject `prompt_cache_retention`; the extension avoids provider-name special cases and resolves exact provider/model compat from `models.json` plus the runtime model. Pi 0.81+ also has a built-in `llama.cpp` provider using an OpenAI-shaped transport. Pi 0.82+ core generates a session `prompt_cache_key` for it when cache retention is enabled, so this extension preserves that key and may add the same conservative fallback when missing. The built-in provider's explicit compat fingerprint is excluded from generic proxy routing/session-affinity advice, but a custom or overridden provider that merely reuses the id `llama.cpp` is treated like any other OpenAI-compatible channel. `prompt_cache_retention` remains subject to the normal safety rule: keep it only for official OpenAI or an explicit effective `supportsLongCacheRetention: true` opt-in in `models.json`; otherwise strip it before sending. If an endpoint rejects the optional `prompt_cache_key` fallback, set effective `supportsPromptCacheKey: false`; it suppresses only this extension's injected fallback and preserves caller/Pi-provided keys. Effective values follow Pi's precedence: `modelOverrides[modelId].compat` first, then the matching `models[].compat`, then provider-level `compat`. An explicit `false` at a higher layer overrides `true` below it.
+Pi 0.84.1 also fixes built-in Fireworks compatibility for models that reject `prompt_cache_retention`; the extension avoids provider-name special cases and resolves exact provider/model compat from `models.json` plus the runtime model. Pi 0.81+ also has a built-in `llama.cpp` provider using an OpenAI-shaped transport. Pi 0.82+ core generates a session `prompt_cache_key` for it when cache retention is enabled, so this extension preserves that key and may add the same conservative fallback when missing. The built-in provider's explicit compat fingerprint is excluded from generic proxy routing/session-affinity advice, but a custom or overridden provider that merely reuses the id `llama.cpp` is treated like any other OpenAI-compatible channel. `prompt_cache_retention` remains subject to the normal safety rule: keep it only for official OpenAI or an explicit effective `supportsLongCacheRetention: true` opt-in in `models.json`; otherwise strip it before sending. Pi 0.85.1 has no native `supportsPromptCacheKey` compat field, so the per-model key opt-out is stored in this extension's `pi-cache-optimizer-config.json` instead of `models.json`. The extension config is independent of Pi's compat precedence and only affects the exact provider/model listed there.
 
 For real proxies, start with session affinity:
 
@@ -160,7 +174,7 @@ Notes:
 
 - `sendSessionAffinityHeaders: true` is the safe default when your proxy supports sticky routing.
 - `supportsLongCacheRetention: true` is optional. Add it only when the endpoint explicitly supports OpenAI long prompt cache retention.
-- `supportsPromptCacheKey: false` disables only this extension's session-id `prompt_cache_key` fallback for the current provider/model. Use it when an otherwise OpenAI-compatible endpoint rejects that optional field with HTTP 400; it never removes a key supplied by Pi or another caller.
+- Do not add `supportsPromptCacheKey` to `models.json`: Pi 0.85.1 does not define that compat field. Use `/cache-optimizer fix prompt-cache-key` to store an exact provider/model omit rule in the extension-owned config; it removes both key spellings, including a key supplied by Pi.
 - If you see `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongCacheRetention` for that channel. Keep `sendSessionAffinityHeaders` if supported. The extension detects the explicit error from response headers or the finalized assistant error message and strips the parameter from subsequent requests in the current process.
 - Use `/cache-optimizer compat` or `/cache-optimizer doctor` to see model-specific advice.
 - DeepSeek model names select the `DS cache` adapter only; they do not prove a reasoning wire protocol. Generic cache/routing advice remains active for absent or non-DeepSeek formats. DeepSeek replay advice is shown only when effective `compat.thinkingFormat: "deepseek"` is explicitly configured; it never treats `thinkingFormat` as a missing fix key.

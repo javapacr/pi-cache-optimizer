@@ -196,6 +196,10 @@ describe("footer status separation and command completion", () => {
       internals.getCacheOptimizerArgumentCompletions("config footer-mode s"),
       [{ value: "config footer-mode session", label: "session" }],
     );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("fix p"),
+      [{ value: "fix prompt-cache-key", label: "prompt-cache-key" }],
+    );
     assert.equal(internals.getCacheOptimizerArgumentCompletions("unknown "), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions("config unknown "), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions("config footer-mode session extra"), null);
@@ -1683,6 +1687,12 @@ describe("DeepSeek protocol-first compatibility", () => {
 
       assert.ok(notifications.some((message) => message.includes("proxy-a/deepseek-a")));
       assert.equal(notifications.some((message) => message.includes("Unsupported parameter")), false);
+      // Complete request A so its response record cannot be mistaken for a
+      // later request that fails before after_provider_response.
+      await messageEndHook(
+        { message: { role: "assistant", stopReason: "error", errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead." } },
+        { ...baseContext, model: modelB },
+      );
 
       await command.handler("fix", {
         ...baseContext,
@@ -1723,11 +1733,82 @@ describe("DeepSeek protocol-first compatibility", () => {
       const newNotifications = notifications.slice(notificationCountBeforeMessage);
       assert.ok(newNotifications.some((message) => message.includes("proxy-c/deepseek-c")));
       assert.equal(newNotifications.some((message) => message.includes("proxy-b/deepseek-b")), false);
+
+      // A completed response must keep its own identity even if a later request
+      // starts before its finalized assistant message is emitted.
+      const modelD = makeModel("proxy-d", "deepseek-d", "DeepSeek D");
+      const modelE = makeModel("proxy-e", "deepseek-e", "DeepSeek E");
+      requestHook({ payload: {} }, { ...baseContext, model: modelD });
+      await responseHook(
+        { status: 400, headers: { "x-provider-error": "Unsupported parameter: thinking. Use reasoning_effort instead." } },
+        { ...baseContext, model: modelD },
+      );
+      requestHook({ payload: {} }, { ...baseContext, model: modelE });
+      const beforeInterleavedMessage = notifications.length;
+      await messageEndHook(
+        { message: { role: "assistant", stopReason: "error", errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead." } },
+        { ...baseContext, model: modelE },
+      );
+      const interleavedNotifications = notifications.slice(beforeInterleavedMessage);
+      assert.equal(interleavedNotifications.some((message) => message.includes("proxy-e/deepseek-e")), false);
+
+      const keyModel = makeModel("proxy-key", "gpt-key", "GPT Key");
+      requestHook({ payload: {} }, { ...baseContext, model: keyModel });
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            status: 400,
+            errorMessage: "Unsupported parameter: prompt_cache_key",
+          },
+        },
+        { ...baseContext, model: keyModel },
+      );
+      await command.handler("fix", {
+        ...baseContext,
+        model: keyModel,
+        hasUI: false,
+        ui: { ...baseContext.ui, notify: (message: string) => notifications.push(message) },
+      });
+      assert.match(notifications.at(-1) ?? "", /prompt(?:[_ ]?cache){1,2}[_ ]?key/i);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("ordinary fix does not configure prompt_cache_key without evidence", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-no-evidence-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      freshModule.default({ on() {}, registerCommand(name: string, command: any) { commands.set(name, command); } } as any);
+      const notifications: string[] = [];
+      let confirmations = 0;
+      await commands.get("cache-optimizer")?.handler("fix", {
+        model,
+        hasUI: true,
+        sessionManager: { getSessionId: () => "no-evidence-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: {
+          confirm: async () => { confirmations++; return true; },
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+        },
+      });
+      assert.equal(confirmations, 0);
+      assert.equal(notifications.some((message) => /prompt.?cache.?key/i.test(message)), false);
+      assert.equal((await readdir(tempAgentDir)).some((name) => name.includes("config")), false);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
@@ -1979,7 +2060,7 @@ describe("/cache-optimizer fix command", () => {
       await chmod(modelsPath, 0o644);
       confirmations.length = 0;
       notifications.length = 0;
-      menuChoice = "Fix — Auto-fix compat issues (writes models.json)";
+      menuChoice = "Fix — Auto-fix compat issues (writes models.json or extension config)";
 
       await command.handler("", commandContext);
       assert.equal(menuPrompts.length, 1);
@@ -2667,5 +2748,146 @@ describe("/cache-optimizer fix command", () => {
     const first = internals.backupTimestamp(now);
     const second = internals.backupTimestamp(now);
     assert.notEqual(first, second);
+  });
+});
+
+describe("prompt_cache_key model opt-out", () => {
+  const model = {
+    provider: "proxy",
+    id: "gpt-5.5",
+    name: "GPT-5.5",
+    api: "openai-completions",
+    baseUrl: "https://proxy.example/v1",
+    compat: {},
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8192,
+  } as any;
+
+  test("parses v1 and v2 config without accepting malformed or private data", () => {
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unsupported parameter: prompt_cache_key" }), true);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Invalid parameter value for prompt_cache_key" }), false);
+    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key must be omitted when temperature is set" }), false);
+    assert.deepEqual(internals.parsePersistedCacheOptimizerConfig({ version: 1, footerMode: "total" }), { version: 1, footerMode: "total" });
+    assert.deepEqual(
+      internals.parsePersistedCacheOptimizerConfig({ version: 2, footerMode: "session", promptCacheKey: { omit: ["z/model", "a/model", "a/model"] } }),
+      { version: 2, footerMode: "session", promptCacheKey: { omit: ["a/model", "z/model"] } },
+    );
+    assert.equal(internals.parsePersistedCacheOptimizerConfig({ version: 2, promptCacheKey: { omit: ["proxy/model", 4] } }), undefined);
+    assert.equal(internals.parsePersistedCacheOptimizerConfig({ version: 2, promptCacheKey: { omit: ["proxy/model"], prompt: "secret" } }), undefined);
+  });
+
+  test("omits both key spellings only for the exact configured model", () => {
+    internals.setRuntimeOptimizerEnabled(true);
+    const config = { version: 2 as const, footerMode: "total" as const, promptCacheKey: { omit: ["proxy/gpt-5.5"] } };
+    assert.equal(internals.isPromptCacheKeyOmittedForModel(model, config), true);
+    assert.equal(internals.isPromptCacheKeyOmittedForModel({ ...model, id: "gpt-5.6" }, config), false);
+    assert.equal(internals.isPromptCacheKeyOmittedForModel({ ...model, provider: "other" }, config), false);
+    assert.deepEqual(
+      internals.omitOpenAIPromptCacheKeys({ prompt_cache_key: "pi", promptCacheKey: "caller", keep: 1 }),
+      { keep: 1 },
+    );
+    assert.equal(internals.omitOpenAIPromptCacheKeys({ keep: 1 }), undefined);
+  });
+
+  test("migrates v1 footer config, applies exact omit, and rolls it back", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-test-"));
+    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
+    try {
+      await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
+      const applied = await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      const parsed = internals.readPersistedCacheOptimizerConfig(configPath);
+      assert.deepEqual(parsed, { version: 2, footerMode: "total", promptCacheKey: { omit: ["proxy/gpt-5.5"] } });
+      assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
+      assert.equal(await readFile(applied.backupPath, "utf8"), original);
+      assert.equal((await stat(applied.backupPath)).mode & 0o7777, 0o640);
+      const receipt = await internals.readPromptCacheKeyConfigReceipt(receiptPath);
+      assert.ok(receipt);
+      assert.equal(receipt?.addedModelKey, "proxy/gpt-5.5");
+      assert.equal(receipt?.targetHadModelKey, false);
+      assert.equal(JSON.stringify(receipt).includes("prompt_cache_key"), false);
+      await internals.rollbackPromptCacheKeyConfig(receipt, configPath, receiptPath);
+      assert.equal(await readFile(configPath, "utf8"), original);
+      assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath), { version: 2, footerMode: "total" });
+      assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.status, "rolled_back");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("multiple model fixes preserve earlier opt-outs and rollback only the latest change", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-multi-config-test-"));
+    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const otherModel = { ...model, id: "gpt-5.6", name: "GPT-5.6" };
+    try {
+      await writeFile(configPath, JSON.stringify({ version: 2, footerMode: "process", promptCacheKey: { omit: ["proxy/existing"] } }, null, 2) + "\n", { mode: 0o640 });
+      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      const second = await internals.applyPromptCacheKeyConfigFix(otherModel, configPath, receiptPath);
+      assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath).promptCacheKey?.omit, ["proxy/existing", "proxy/gpt-5.5", "proxy/gpt-5.6"]);
+      await internals.rollbackPromptCacheKeyConfig(second.receipt, configPath, receiptPath);
+      assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath), {
+        version: 2,
+        footerMode: "process",
+        promptCacheKey: { omit: ["proxy/existing", "proxy/gpt-5.5"] },
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("active fix requires confirmation and removes a Pi-provided key after reload", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-command-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousRetention = process.env.PI_CACHE_RETENTION;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      await writeFile(join(tempAgentDir, "pi-cache-optimizer-config.json"), JSON.stringify({ version: 1, footerMode: "process" }) + "\n");
+      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
+      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const handlers = new Map<string, (event: any, context: any) => unknown>();
+      const commands = new Map<string, { handler: (args: string, context: any) => unknown }>();
+      freshModule.default({
+        on(name: string, handler: (event: any, context: any) => unknown) { handlers.set(name, handler); },
+        registerCommand(name: string, command: { handler: (args: string, context: any) => unknown }) { commands.set(name, command); },
+      } as any);
+      const notifications: string[] = [];
+      let confirm = false;
+      const confirmationMessages: string[] = [];
+      const context = {
+        model,
+        hasUI: true,
+        sessionManager: { getSessionId: () => "fixture-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: {
+          confirm: async (_title: string, message: string) => { confirmationMessages.push(message); return confirm; },
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+        },
+      };
+      await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
+      assert.match(confirmationMessages.at(-1) ?? "", /prompt_cache_key.*promptCacheKey/s);
+      assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process" });
+      confirm = true;
+      await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
+      assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process", promptCacheKey: { omit: ["proxy/gpt-5.5"] } });
+      const payload = { prompt_cache_key: "pi-generated", promptCacheKey: "caller", keep: true };
+      const result = handlers.get("before_provider_request")?.({ payload }, context) as any;
+      assert.deepEqual(result, { keep: true });
+      await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
+      assert.match(notifications.at(-1) ?? "", /already omitted/);
+      await commands.get("cache-optimizer")?.handler("rollback", context);
+      assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process" });
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      else process.env.PI_CACHE_RETENTION = previousRetention;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
   });
 });

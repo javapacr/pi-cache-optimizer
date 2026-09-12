@@ -72,12 +72,16 @@ Primary hooks/events:
 - Unknown/custom transports, unsupported wrappers, malformed tools, blank/missing names, any supported tool array with a top-level `cache_control`, and Anthropic arrays containing `defer_loading` are no-ops.
 - Compose the returned sorted payload with the existing TTL-order repair, retention safety, prompt-cache-key fallback, routing, and adapter behavior. Never add Anthropic trailing breakpoints.
 - For every effective `anthropic-messages` model, validate final cache breakpoints in `tools → system → messages` order and downgrade a visible invalid 5-minute-to-1-hour transition. Preserve legal third-party 1-hour retention unless this exact provider/model previously returned Anthropic's explicit TTL-ordering error in the current process.
-- Only inject OpenAI-compatible `prompt_cache_key` fallback for `openai-completions` / `openai-responses` APIs whose effective `supportsPromptCacheKey` compat is not explicitly `false`; resolve that capability with the same provider/model/runtime/modelOverride precedence used by other compat behavior.
-- Preserve existing non-empty `prompt_cache_key` / `promptCacheKey` values; an opt-out suppresses only this extension's fallback and never removes caller/Pi-provided keys.
-- Use Pi session id fallback; do not derive keys from prompt content.
+- Only inject OpenAI-compatible `prompt_cache_key` fallback for `openai-completions` / `openai-responses` APIs.
+- Preserve existing non-empty `prompt_cache_key` / `promptCacheKey` values for unconfigured models.
+- For an exact extension-configured omit model, remove both `prompt_cache_key` and `promptCacheKey` after Pi/core and other request mutations, including pre-existing keys.
+- Use Pi session id fallback for unconfigured models; do not derive keys from prompt content.
 - For virtual routing providers, resolve the upstream model via the routing registry when available.
 
 ### `after_provider_response`
+
+- Record only an explicit HTTP 400 field-capability rejection for `prompt_cache_key` / `promptCacheKey` as a process-local exact provider/model category. Value-validation, conditional-usage, and ordinary `bad request` text must not activate it. Do not persist or display the raw error.
+- Pi's provider response event has no request id. Correlate request metadata through FIFO lifecycle records in serialized event order; never overwrite an earlier completed response merely because a later request starts.
 
 - Record model-scoped 400 hints only for applicable prompt-cache-retention failures; the untouched Pi built-in `llama.cpp` compat fingerprint is excluded, while same-id overrides with explicit cache compat remain eligible.
 - Record model-scoped 403 hints only for applicable third-party OpenAI-compatible proxy failures (session-affinity headers or OpenAI SDK header/User-Agent diagnostics). The untouched built-in `llama.cpp` fingerprint and custom transports are excluded; provider id alone is not an exemption.
@@ -88,6 +92,7 @@ Primary hooks/events:
 ### `message_end`
 
 - Before the normal error/aborted stats early return, detect only Anthropic's explicit mixed-TTL ordering error and record a process-local provider/model fallback for the next subsequent request. This is a non-retryable 400 in Pi 0.82.1; do not promise built-in automatic retry. Do not classify generic 400 or prompt-too-long errors.
+- Inspect finalized assistant errors for an explicit HTTP 400 unsupported `prompt_cache_key` / `promptCacheKey` signal and record only the exact request-local provider/model category for a later confirmed fix. Status parsing is limited to known HTTP-status fields or status-shaped error prefixes; arbitrary numbers are not treated as HTTP status.
 - Also inspect finalized assistant errors for the same narrow reasoning-protocol rejection (`thinking` rejected in favor of `reasoning_effort`) and use request-local provider/model identity. Keep only the model-scoped category in process memory; never persist or display the raw error and never auto-edit configuration.
 - Assistant message metadata is authoritative for final stats identity.
 - Use message-local provider/model/api/usage when available; do not use global route state for final stats.
@@ -106,7 +111,7 @@ Primary hooks/events:
 ## Common Mistakes
 
 - Doing final stats attribution from live/global router state instead of assistant message metadata.
-- Injecting OpenAI cache keys or affinity headers into custom transports such as `kiro-api`, or ignoring an explicit effective `supportsPromptCacheKey: false` opt-out.
+- Injecting OpenAI cache keys or affinity headers into custom transports such as `kiro-api`, or implementing the per-model prompt-cache-key opt-out through an unsupported Pi compat field instead of the extension-owned configuration.
 - Treating `ctx.model.compat` as the only effective compat source for extension providers; `registerProvider()` model replacement can omit provider/custom-model compat even though exact `models.json` configuration remains authoritative.
 - Normalizing Anthropic TTLs by provider/model name instead of validating the effective API and final wire-order payload.
 - Treating a provider id alone (including `llama.cpp`) as proof of transport capabilities; prefer Pi's explicit model/compat fingerprint and honor overrides.

@@ -17,6 +17,7 @@
 - [安装](#安装)
 - [命令](#命令)
 - [持久 Opt-out](#持久-opt-out)
+- [按模型关闭 `prompt_cache_key`](#按模型关闭-prompt_cache_key)
 - [Opt-in 确定性工具排序](#opt-in-确定性工具排序)
 - [Footer 缓存统计模式](#footer-缓存统计模式)
 - [OpenAI-compatible 代理配置](#openai-compatible-代理配置)
@@ -60,7 +61,7 @@ pi remove npm:pi-deepseek-cache-optimizer && pi install npm:pi-cache-optimizer
 
 Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安装的 Pi package（包括本扩展），请运行 `pi update --extensions`（只更新 packages）或 `pi update --all`（Pi 与 packages 一起更新）。
 
-本扩展要求 Pi 0.82+，并已使用 Pi 0.84.4 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
+本扩展要求 Pi 0.82+，并已使用 Pi 0.85.1 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
 
 ## 命令
 
@@ -76,10 +77,11 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `/cache-optimizer stats contributors` | 显示当前精确 provider/model 的当前/其他贡献 session，不暴露 session id。 |
 | `/cache-optimizer reset` | 重置当前 provider/model 的本地 footer 统计；不会修改上游 provider 缓存。 |
 | `/cache-optimizer config footer-mode total\|session\|process` | 持久设置 footer 统计模式；持久命令配置优先于环境变量。 |
-| `/cache-optimizer fix` | 为当前模型自动修复安全的 compat 问题。展示预览 + 风险提示，需要用户确认。**仅在用户明确批准后才修改 `models.json`。** |
-| `/cache-optimizer rollback` | 查看最近一次匹配的已确认修复；经 UI 确认后安全撤销，不覆盖无关的 `models.json` 用户修改。 |
+| `/cache-optimizer fix` | 为当前模型自动修复安全的 compat 问题。展示预览 + 风险提示，需要用户确认；原生 compat 修复写 `models.json`，已观测到的 `prompt_cache_key` 问题写扩展配置。 |
+| `/cache-optimizer fix prompt-cache-key` | 明确把当前 OpenAI-compatible provider/model 配置为从最终请求体移除 `prompt_cache_key` 与 `promptCacheKey`。需要确认。 |
+| `/cache-optimizer rollback` | 查看最近一次匹配的已确认修复；经 UI 确认后安全恢复扩展配置或 `models.json` 修复。 |
 
-`/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
+`/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer fix <Tab>` 补全 `prompt-cache-key`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
 
 交互式 `/cache-optimizer` 菜单包含 `Footer mode`，可以选择 `total`、`session` 或 `process`。`enable` / `disable` 是当前进程内开关。若要持久关闭某些能力，请使用下面的环境变量。
 
@@ -130,11 +132,23 @@ Footer 默认使用 `session`，避免另一个并行 Pi 终端使用相同 prov
 
 显式设置保存在 Pi agent 目录下的 `pi-cache-optimizer-config.json`。没有命令覆盖时，读取 `PI_CACHE_OPTIMIZER_FOOTER_MODE=total|session|process`；值不区分大小写，缺失或非法值均回退到 `session`。如需让已有安装重新由环境变量控制，请手动删除 `pi-cache-optimizer-config.json`，然后运行 `/reload`。
 
+## 按模型关闭 `prompt_cache_key`
+
+某些 OpenAI-compatible endpoint 会因 `prompt_cache_key` 返回 HTTP 400，但同一个字段对其他 provider 可能有效。Pi 0.85.1 没有原生的 `supportsPromptCacheKey` compat 字段，**不要**把这个未知字段加入 `models.json`。`supportsLongCacheRetention` 也不是等价开关，不应借用来实现此目的。
+
+当扩展观察到精确 provider/model 明确拒绝 `prompt_cache_key` 后，普通 `/cache-optimizer fix` 会提供经过确认的模型级修复。如果你已经确定 endpoint 不支持该字段，可以主动执行：
+
+```text
+/cache-optimizer fix prompt-cache-key
+```
+
+预览会说明设置保存在扩展自有的 `pi-cache-optimizer-config.json` 中。确认后，`before_provider_request` 的最终阶段会移除 `prompt_cache_key` 和 `promptCacheKey`，包括 Pi core 之前已经放入的 key。这个精确模型可能因此失去 provider prompt-cache 命中，其他模型仍保持原有 fallback 行为。配置会使用原子替换写入，并生成不含敏感内容的备份/receipt；需要 `/reload` 或重启 Pi。`/cache-optimizer rollback` 可恢复之前的扩展配置，且不会重置 `footerMode`。
+
 ## OpenAI-compatible 代理配置
 
 LiteLLM / OneAPI / NewAPI / 类 OpenRouter 渠道等第三方 `openai-completions` 代理，常会把同一个 session 分散到多个上游后端，导致 provider 侧 prompt cache 被拆散。
 
-Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 的模型兼容性；本扩展不按 provider 名称增加特殊分支，而是结合 `models.json` 与 runtime model，按精确 provider/model 解析有效 compat。Pi 0.81+ 也内置了使用 OpenAI-shaped transport 的 `llama.cpp` provider。Pi 0.82+ core 在启用 cache retention 时会为它生成 session `prompt_cache_key`，因此本扩展会保留该 key，并在缺失时使用同样的保守 fallback。只有符合 Pi 内置 provider 明确 compat 指纹的模型会跳过通用 proxy 路由 / session-affinity 建议；仅复用 `llama.cpp` id 的自定义或覆盖 provider 仍按普通 OpenAI-compatible 渠道处理。`prompt_cache_retention` 继续遵循统一安全规则：仅官方 OpenAI 或 `models.json` 中有效配置为 `supportsLongCacheRetention: true` 时保留，否则发送前移除。若 endpoint 拒绝可选的 `prompt_cache_key` fallback，请将有效 `supportsPromptCacheKey` 设为 `false`；它只禁止本扩展注入 fallback，并保留调用方/Pi 已提供的 key。有效值遵循 Pi 的优先级：先看 `modelOverrides[modelId].compat`，再看匹配的 `models[].compat`，最后看 provider 级 `compat`；高层显式 `false` 会覆盖低层的 `true`。
+Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 的模型兼容性；本扩展不按 provider 名称增加特殊分支，而是结合 `models.json` 与 runtime model，按精确 provider/model 解析有效 compat。Pi 0.81+ 也内置了使用 OpenAI-shaped transport 的 `llama.cpp` provider。Pi 0.82+ core 在启用 cache retention 时会为它生成 session `prompt_cache_key`，因此本扩展会保留该 key，并在缺失时使用同样的保守 fallback。只有符合 Pi 内置 provider 明确 compat 指纹的模型会跳过通用 proxy 路由 / session-affinity 建议；仅复用 `llama.cpp` id 的自定义或覆盖 provider 仍按普通 OpenAI-compatible 渠道处理。`prompt_cache_retention` 继续遵循统一安全规则：仅官方 OpenAI 或 `models.json` 中有效配置为 `supportsLongCacheRetention: true` 时保留，否则发送前移除。Pi 0.85.1 没有原生的 `supportsPromptCacheKey` compat 字段，因此按模型关闭 key 的策略保存在本扩展的 `pi-cache-optimizer-config.json` 中，而不是 `models.json`。扩展配置独立于 Pi 的 compat 优先级，只影响其中列出的精确 provider/model。
 
 对真正的代理，建议先启用 session affinity：
 
@@ -160,7 +174,7 @@ Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 
 
 - `sendSessionAffinityHeaders: true` 是安全默认项，前提是你的代理支持 sticky routing。
 - `supportsLongCacheRetention: true` 是可选项。只有 endpoint 明确支持 OpenAI long prompt cache retention 时才添加。
-- `supportsPromptCacheKey: false` 只关闭当前 provider/model 的本扩展 session-id `prompt_cache_key` fallback。若一个 OpenAI-compatible endpoint 因这个可选字段返回 HTTP 400，请使用该配置；它绝不会移除 Pi 或其他调用方已提供的 key。
+- 不要把 `supportsPromptCacheKey` 加入 `models.json`：Pi 0.85.1 没有定义这个 compat 字段。请使用 `/cache-optimizer fix prompt-cache-key` 在扩展自有配置中保存精确 provider/model 的 omit 规则；它会移除两种 key 写法，包括 Pi 提供的 key。
 - 如果出现 `400 Unsupported parameter: prompt_cache_retention`，请为该渠道移除 / 避免 `supportsLongCacheRetention`；如支持，可保留 `sendSessionAffinityHeaders`。扩展会从响应头或最终 assistant error message 中识别这条明确错误，并在当前进程的后续请求中移除该参数。
 - 使用 `/cache-optimizer compat` 或 `/cache-optimizer doctor` 查看当前模型的具体建议。
 - DeepSeek 模型名只用于选择 `DS cache` adapter，不能证明 reasoning wire protocol。缺少或使用非 DeepSeek format 时仍保留通用缓存 / 路由建议；只有 effective `compat.thinkingFormat: "deepseek"` 被明确配置时，才显示 DeepSeek replay 建议，且不会把 `thinkingFormat` 列为缺失修复项。
