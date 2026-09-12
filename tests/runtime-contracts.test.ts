@@ -478,6 +478,71 @@ describe("OpenAI-compatible request contracts", () => {
     assert.equal(internals.addOpenAIPromptCacheKey(null, "session-key"), undefined);
   });
 
+  test("scopes prompt cache key fallback to effective supportsPromptCacheKey compat", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-compat-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      const jiti = createJiti(join(process.cwd(), "tests", "cache-key-compat-test.ts"), { interopDefault: false, moduleCache: false });
+      const fresh = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const handlers = new Map<string, Handler>();
+      fresh.default({ on(name: string, handler: Handler) { handlers.set(name, handler); }, registerCommand() {} } as any);
+      const request = handlers.get("before_provider_request");
+      assert.ok(request);
+      const runtimeModel = model({ provider: "cache-key-proxy", id: "cache-key-model", compat: {} });
+      const context = {
+        model: runtimeModel,
+        sessionManager: { getSessionId: () => "cache-key-session" },
+        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        ui: { notify() {}, setStatus() {} },
+      };
+      const injects = () => request({ payload: { messages: [] } }, context);
+
+      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
+        providers: { "cache-key-proxy": { compat: { supportsPromptCacheKey: false } } },
+      }));
+      assert.equal(fresh.__internals_for_tests.shouldInjectOpenAIPromptCacheKeyForModel(runtimeModel), false);
+      assert.equal(injects(), undefined);
+      const existingPayload = { messages: [], prompt_cache_key: "pi-provided" };
+      assert.equal(request({ payload: existingPayload }, context), undefined);
+      assert.equal(existingPayload.prompt_cache_key, "pi-provided");
+      assert.deepEqual(
+        request({ payload: { messages: [] } }, { ...context, model: model({ provider: "other-proxy", id: "other-model" }) }),
+        { messages: [], prompt_cache_key: "cache-key-session" },
+      );
+
+      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
+        providers: {
+          "cache-key-proxy": {
+            compat: { supportsPromptCacheKey: false },
+            models: [{ id: "cache-key-model", compat: { supportsPromptCacheKey: true } }],
+          },
+        },
+      }));
+      assert.deepEqual(injects(), { messages: [], prompt_cache_key: "cache-key-session" });
+
+      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
+        providers: {
+          "cache-key-proxy": {
+            compat: { supportsPromptCacheKey: false },
+            models: [{ id: "cache-key-model", compat: { supportsPromptCacheKey: true } }],
+            modelOverrides: { "cache-key-model": { compat: { supportsPromptCacheKey: false } } },
+          },
+        },
+      }));
+      assert.equal(injects(), undefined);
+
+      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
+        providers: { "cache-key-proxy": { compat: { supportsPromptCacheKey: "false" } } },
+      }));
+      assert.deepEqual(injects(), { messages: [], prompt_cache_key: "cache-key-session" });
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
   test("recognizes prompt_cache_retention errors from headers and assistant messages", () => {
     assert.equal(
       internals.hasPromptCacheRetentionUnsupportedSignal({

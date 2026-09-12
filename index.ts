@@ -306,6 +306,7 @@ type CacheCompat = {
   sendSessionAffinityHeaders?: boolean;
   sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
   supportsLongCacheRetention?: boolean;
+  supportsPromptCacheKey?: boolean;
   thinkingFormat?: string;
   requiresReasoningContentOnAssistantMessages?: boolean;
   cacheControlFormat?: string;
@@ -1617,7 +1618,7 @@ function isValidOpenAICompletionsCompat(compat: UnknownRecord): boolean {
     "supportsUsageInStreaming", "requiresToolResultName", "requiresAssistantAfterToolResult",
     "requiresThinkingAsText", "requiresReasoningContentOnAssistantMessages",
     "supportsOpenAIGrammarTools", "supportsStrictMode", "sendSessionAffinityHeaders",
-    "supportsLongCacheRetention",
+    "supportsLongCacheRetention", "supportsPromptCacheKey",
   ];
   if (booleanKeys.some((key) => !isOptionalBoolean(compat[key]))) return false;
   if (compat.maxTokensField !== undefined && compat.maxTokensField !== "max_completion_tokens" && compat.maxTokensField !== "max_tokens") return false;
@@ -1636,7 +1637,7 @@ function isValidOpenAICompletionsCompat(compat: UnknownRecord): boolean {
 
 function isValidOpenAIResponsesCompat(compat: UnknownRecord): boolean {
   const booleanKeys = [
-    "supportsDeveloperRole", "supportsLongCacheRetention", "supportsStrictMode",
+    "supportsDeveloperRole", "supportsLongCacheRetention", "supportsPromptCacheKey", "supportsStrictMode",
     "supportsOpenAIGrammarTools", "supportsAdditionalTools", "supportsToolSearch",
   ];
   if (booleanKeys.some((key) => !isOptionalBoolean(compat[key]))) return false;
@@ -1655,7 +1656,9 @@ function isValidAnthropicMessagesCompat(compat: UnknownRecord): boolean {
 function isValidCompatRecord(value: unknown): boolean {
   if (value === undefined) return true;
   const compat = asRecord(value);
-  return !!compat && (
+  return !!compat
+    && isOptionalBoolean(compat.supportsPromptCacheKey)
+    && (
     isValidOpenAICompletionsCompat(compat)
     || isValidOpenAIResponsesCompat(compat)
     || isValidAnthropicMessagesCompat(compat)
@@ -2101,7 +2104,8 @@ function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
 }
 
 function shouldInjectOpenAIPromptCacheKeyForModel(model: PiModel | undefined): boolean {
-  return isOpenAICompatibleApi(model?.api);
+  if (!isOpenAICompatibleApi(model?.api)) return false;
+  return getCompat(model).supportsPromptCacheKey !== false;
 }
 
 function collectAnthropicCacheControlsInWireOrder(payload: unknown): UnknownRecord[] {

@@ -181,8 +181,9 @@ core's own cache transport.
   the model `id`/`name` no longer needs to match GPT-family tokens — remote models
   using an OpenAI-shaped API (including Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan,
   Qwen Token Plan, Pi's built-in `llama.cpp`, and any future OpenAI-compatible
-  provider) receive the session-id fallback. Custom transports such as
-  `kiro-api` remain excluded by the API gate.
+  provider) receive the session-id fallback unless their effective
+  `supportsPromptCacheKey` compat is explicitly `false`. Custom transports such
+  as `kiro-api` remain excluded by the API gate.
 * Cache-key source: use `ctx.sessionManager.getSessionId()`, clamped to
   OpenAI's 64-codepoint `prompt_cache_key` limit. Do NOT derive the key from a
   prompt/stable-prefix hash; Pi core uses session id for official OpenAI paths,
@@ -192,9 +193,11 @@ core's own cache transport.
   are `undefined`, `null`, `""`, or whitespace-only are treated as missing and
   may be replaced by the session-id fallback.
 * Opt-out: default behavior is enabled. Users can disable fallback injection
-  with `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` (truthy: `1`, `true`, `yes`,
-  `on`) or legacy-style `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` (disabled:
-  `0`, `false`, `no`, `off`).
+  globally with `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` (truthy: `1`,
+  `true`, `yes`, `on`) or legacy-style `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0`
+  (disabled: `0`, `false`, `no`, `off`). For a single provider/model, set
+  effective `compat.supportsPromptCacheKey: false`; this suppresses only the
+  extension fallback and never removes a pre-existing request key.
 * All `before_agent_start` prompt mutations (session-overview churn strip,
   skill compression, stable-prefix reorder) can be disabled persistently with:
   `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` (truthy: `1`, `true`, `yes`, `on`).
