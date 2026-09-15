@@ -80,14 +80,29 @@ test("parses v3 config with retention and optimization toggles", () => {
     parsePersistedCacheOptimizerConfig({ version: 3, retention: "none" }),
     { version: 3, retention: "none" },
   );
-  assert.deepEqual(parsePersistedCacheOptimizerConfig({ version: 3 }), { version: 3 });
+  assert.deepEqual(parsePersistedCacheOptimizerConfig({ version: 3 }), {
+    version: 3,
+  });
 
   // Invalid retention value rejects the file (existing strict-parse pattern).
-  assert.equal(parsePersistedCacheOptimizerConfig({ version: 3, retention: "forever" }), undefined);
+  assert.equal(
+    parsePersistedCacheOptimizerConfig({ version: 3, retention: "forever" }),
+    undefined,
+  );
   // Non-boolean toggle rejects the file.
-  assert.equal(parsePersistedCacheOptimizerConfig({ version: 3, promptRewrite: "yes" }), undefined);
+  assert.equal(
+    parsePersistedCacheOptimizerConfig({ version: 3, promptRewrite: "yes" }),
+    undefined,
+  );
   // Unknown top-level key rejects the file (never fatal at read: defaults apply).
-  assert.equal(parsePersistedCacheOptimizerConfig({ version: 3, retention: "short", extra: 1 }), undefined);
+  assert.equal(
+    parsePersistedCacheOptimizerConfig({
+      version: 3,
+      retention: "short",
+      extra: 1,
+    }),
+    undefined,
+  );
   assert.equal(parsePersistedCacheOptimizerConfig({ version: 4 }), undefined);
 });
 
@@ -97,8 +112,16 @@ test("v1 and v2 configs still parse unchanged (graceful degradation)", () => {
     { version: 1, footerMode: "total" },
   );
   assert.deepEqual(
-    parsePersistedCacheOptimizerConfig({ version: 2, footerMode: "session", promptCacheKey: { omit: ["z/model", "a/model"] } }),
-    { version: 2, footerMode: "session", promptCacheKey: { omit: ["a/model", "z/model"] } },
+    parsePersistedCacheOptimizerConfig({
+      version: 2,
+      footerMode: "session",
+      promptCacheKey: { omit: ["z/model", "a/model"] },
+    }),
+    {
+      version: 2,
+      footerMode: "session",
+      promptCacheKey: { omit: ["a/model", "z/model"] },
+    },
   );
 });
 
@@ -106,22 +129,48 @@ test("readPersistedCacheOptimizerConfig preserves the file's schema version", as
   const dir = await mkdtemp(join(tmpdir(), "pi-cache-config-read-"));
   try {
     const path = join(dir, "pi-cache-optimizer-config.json");
-    await writeFile(path, JSON.stringify({ version: 2, footerMode: "total" }) + "\n");
-    assert.deepEqual(readPersistedCacheOptimizerConfig(path), { version: 2, footerMode: "total" });
+    await writeFile(
+      path,
+      JSON.stringify({ version: 2, footerMode: "total" }) + "\n",
+    );
+    assert.deepEqual(readPersistedCacheOptimizerConfig(path), {
+      version: 2,
+      footerMode: "total",
+    });
 
-    await writeFile(path, JSON.stringify({ version: 3, retention: "short", footerStats: false }) + "\n");
-    assert.deepEqual(readPersistedCacheOptimizerConfig(path), { version: 3, retention: "short", footerStats: false });
+    await writeFile(
+      path,
+      JSON.stringify({ version: 3, retention: "short", footerStats: false }) +
+        "\n",
+    );
+    assert.deepEqual(readPersistedCacheOptimizerConfig(path), {
+      version: 3,
+      retention: "short",
+      footerStats: false,
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
 test("resolveCacheRetentionMode precedence: config > env > default", () => {
-  assert.deepEqual(resolveCacheRetentionMode({}), { mode: "long", source: "default" });
-  assert.deepEqual(resolveCacheRetentionMode({ [RETENTION_ENV]: "short" }), { mode: "short", source: "env" });
-  assert.deepEqual(resolveCacheRetentionMode({ [RETENTION_ENV]: "startup" }), { mode: "startup", source: "env" });
+  assert.deepEqual(resolveCacheRetentionMode({}), {
+    mode: "long",
+    source: "default",
+  });
+  assert.deepEqual(resolveCacheRetentionMode({ [RETENTION_ENV]: "short" }), {
+    mode: "short",
+    source: "env",
+  });
+  assert.deepEqual(resolveCacheRetentionMode({ [RETENTION_ENV]: "startup" }), {
+    mode: "startup",
+    source: "env",
+  });
   // Invalid env value is ignored.
-  assert.deepEqual(resolveCacheRetentionMode({ [RETENTION_ENV]: "forever" }), { mode: "long", source: "default" });
+  assert.deepEqual(resolveCacheRetentionMode({ [RETENTION_ENV]: "forever" }), {
+    mode: "long",
+    source: "default",
+  });
   // Config beats env.
   assert.deepEqual(
     resolveCacheRetentionMode({ [RETENTION_ENV]: "short" }, "none"),
@@ -137,10 +186,19 @@ test("resolveCacheRetentionMode precedence: config > env > default", () => {
 test("resolveEffectiveCacheRetentionMode layers the persisted config", () => {
   try {
     setPersistedCacheOptimizerConfig({ version: 3, retention: "short" });
-    assert.deepEqual(resolveEffectiveCacheRetentionMode({ [RETENTION_ENV]: "long" }), { mode: "short", source: "config" });
+    assert.deepEqual(
+      resolveEffectiveCacheRetentionMode({ [RETENTION_ENV]: "long" }),
+      { mode: "short", source: "config" },
+    );
     setPersistedCacheOptimizerConfig({ version: 2 });
-    assert.deepEqual(resolveEffectiveCacheRetentionMode({ [RETENTION_ENV]: "none" }), { mode: "none", source: "env" });
-    assert.deepEqual(resolveEffectiveCacheRetentionMode({}), { mode: "long", source: "default" });
+    assert.deepEqual(
+      resolveEffectiveCacheRetentionMode({ [RETENTION_ENV]: "none" }),
+      { mode: "none", source: "env" },
+    );
+    assert.deepEqual(resolveEffectiveCacheRetentionMode({}), {
+      mode: "long",
+      source: "default",
+    });
   } finally {
     setPersistedCacheOptimizerConfig({ version: 2 });
   }
@@ -196,7 +254,9 @@ test("setRuntimeOptimizerEnabled gates the enable-time stomp site", () => {
 
     // Startup passthrough: enable must not touch the env at all.
     setPersistedCacheOptimizerConfig({ version: 3, retention: "startup" });
-    const envPassthrough: MutableTestEnv = { [PI_CACHE_RETENTION_ENV]: "medium" };
+    const envPassthrough: MutableTestEnv = {
+      [PI_CACHE_RETENTION_ENV]: "medium",
+    };
     setRuntimeOptimizerEnabled(true, envPassthrough);
     assert.equal(envPassthrough[PI_CACHE_RETENTION_ENV], "medium");
 
@@ -234,17 +294,44 @@ test("optimization toggles: config key overrides env var, absent config keeps en
     assert.equal(isToolOrderEnabled({}), false);
 
     // Env opt-outs still work with no config.
-    assert.equal(isPromptRewriteEnabled({ [NO_PROMPT_REWRITE_ENV]: "1" }), false);
-    assert.equal(isSkillCompressionEnabled({ [NO_SKILL_COMPRESSION_ENV]: "1" }), false);
-    assert.equal(isPromptCacheKeyFallbackEnabled({ [NO_OPENAI_CACHE_KEY_ENV]: "1" }), false);
-    assert.equal(isCompatWarningsEnabled({ [NO_COMPAT_WARNINGS_ENV]: "1" }), false);
+    assert.equal(
+      isPromptRewriteEnabled({ [NO_PROMPT_REWRITE_ENV]: "1" }),
+      false,
+    );
+    assert.equal(
+      isSkillCompressionEnabled({ [NO_SKILL_COMPRESSION_ENV]: "1" }),
+      false,
+    );
+    assert.equal(
+      isPromptCacheKeyFallbackEnabled({ [NO_OPENAI_CACHE_KEY_ENV]: "1" }),
+      false,
+    );
+    assert.equal(
+      isCompatWarningsEnabled({ [NO_COMPAT_WARNINGS_ENV]: "1" }),
+      false,
+    );
     assert.equal(isFooterStatsEnabled({ [NO_FOOTER_STATS_ENV]: "1" }), false);
-    assert.equal(isAnthropicTtlDowngradeEnabled({ [NO_ANTHROPIC_TTL_DOWNGRADE_ENV]: "1" }), false);
-    assert.equal(isSessionAffinityToggleEnabled({ [NO_SESSION_AFFINITY_ENV]: "1" }), false);
+    assert.equal(
+      isAnthropicTtlDowngradeEnabled({ [NO_ANTHROPIC_TTL_DOWNGRADE_ENV]: "1" }),
+      false,
+    );
+    assert.equal(
+      isSessionAffinityToggleEnabled({ [NO_SESSION_AFFINITY_ENV]: "1" }),
+      false,
+    );
     assert.equal(isToolOrderEnabled({ [TOOL_ORDER_ENV]: "1" }), true);
 
     // Config false beats absent/absent env.
-    setPersistedCacheOptimizerConfig({ version: 3, promptRewrite: false, skillCompression: false, promptCacheKeyFallback: false, compatWarnings: false, footerStats: false, anthropicTtlDowngrade: false, sessionAffinity: false });
+    setPersistedCacheOptimizerConfig({
+      version: 3,
+      promptRewrite: false,
+      skillCompression: false,
+      promptCacheKeyFallback: false,
+      compatWarnings: false,
+      footerStats: false,
+      anthropicTtlDowngrade: false,
+      sessionAffinity: false,
+    });
     assert.equal(isPromptRewriteEnabled({}), false);
     assert.equal(isSkillCompressionEnabled({}), false);
     assert.equal(isPromptCacheKeyFallbackEnabled({}), false);
@@ -254,26 +341,52 @@ test("optimization toggles: config key overrides env var, absent config keeps en
     assert.equal(isSessionAffinityToggleEnabled({}), false);
 
     // Config true beats env opt-out.
-    setPersistedCacheOptimizerConfig({ version: 3, promptRewrite: true, promptCacheKeyFallback: true });
-    assert.equal(isPromptRewriteEnabled({ [NO_PROMPT_REWRITE_ENV]: "1" }), true);
-    assert.equal(isPromptCacheKeyFallbackEnabled({ [NO_OPENAI_CACHE_KEY_ENV]: "1" }), true);
+    setPersistedCacheOptimizerConfig({
+      version: 3,
+      promptRewrite: true,
+      promptCacheKeyFallback: true,
+    });
+    assert.equal(
+      isPromptRewriteEnabled({ [NO_PROMPT_REWRITE_ENV]: "1" }),
+      true,
+    );
+    assert.equal(
+      isPromptCacheKeyFallbackEnabled({ [NO_OPENAI_CACHE_KEY_ENV]: "1" }),
+      true,
+    );
 
     // Config true forces the opt-in tool ordering on without env.
-    setPersistedCacheOptimizerConfig({ version: 3, deterministicToolOrdering: true });
+    setPersistedCacheOptimizerConfig({
+      version: 3,
+      deterministicToolOrdering: true,
+    });
     assert.equal(isToolOrderEnabled({}), true);
     // Config false beats env opt-in.
-    setPersistedCacheOptimizerConfig({ version: 3, deterministicToolOrdering: false });
+    setPersistedCacheOptimizerConfig({
+      version: 3,
+      deterministicToolOrdering: false,
+    });
     assert.equal(isToolOrderEnabled({ [TOOL_ORDER_ENV]: "1" }), false);
 
     // skillCompression is layered under the prompt-rewrite master switch
     // (config absent: the master env opt-out still disables compression).
     setPersistedCacheOptimizerConfig({ version: 3 });
-    assert.equal(isSkillCompressionEnabled({ [NO_PROMPT_REWRITE_ENV]: "1" }), false);
-    assert.equal(isSkillCompressionEnabled({ [NO_SKILL_COMPRESSION_ENV]: "1" }), false);
+    assert.equal(
+      isSkillCompressionEnabled({ [NO_PROMPT_REWRITE_ENV]: "1" }),
+      false,
+    );
+    assert.equal(
+      isSkillCompressionEnabled({ [NO_SKILL_COMPRESSION_ENV]: "1" }),
+      false,
+    );
     assert.equal(isSkillCompressionEnabled({}), true);
 
     // Runtime disable turns off runtime-gated features (upstream semantics).
-    setPersistedCacheOptimizerConfig({ version: 3, promptRewrite: true, deterministicToolOrdering: true });
+    setPersistedCacheOptimizerConfig({
+      version: 3,
+      promptRewrite: true,
+      deterministicToolOrdering: true,
+    });
     setRuntimeOptimizerEnabled(false);
     assert.equal(isPromptRewriteEnabled({}), false);
     assert.equal(isToolOrderEnabled({ [TOOL_ORDER_ENV]: "1" }), false);
@@ -292,7 +405,10 @@ test("persistedConfigWriteShape keeps the oldest schema that fits", () => {
     { version: 2, footerMode: "total" },
   );
   assert.deepEqual(
-    persistedConfigWriteShape({ version: 3, promptCacheKey: { omit: ["p/m"] } }),
+    persistedConfigWriteShape({
+      version: 3,
+      promptCacheKey: { omit: ["p/m"] },
+    }),
     { version: 2, promptCacheKey: { omit: ["p/m"] } },
   );
   const v3 = { version: 3 as const, retention: "short" as const };
@@ -309,17 +425,31 @@ test("writePersistedRetention round-trips and preserves sibling keys", async () 
     const path = join(dir, "pi-cache-optimizer-config.json");
 
     // v2 file: retention write upgrades to v3, keeps footerMode + promptCacheKey.
-    await writeFile(path, JSON.stringify({ version: 2, footerMode: "total", promptCacheKey: { omit: ["p/m"] } }) + "\n");
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 2,
+        footerMode: "total",
+        promptCacheKey: { omit: ["p/m"] },
+      }) + "\n",
+    );
     await writePersistedRetention("short", path);
     const upgraded = JSON.parse(await readFile(path, "utf8"));
     assert.equal(upgraded.version, 3);
     assert.equal(upgraded.retention, "short");
     assert.equal(upgraded.footerMode, "total");
     assert.deepEqual(upgraded.promptCacheKey, { omit: ["p/m"] });
-    assert.equal(asV3CacheOptimizerConfig(readPersistedCacheOptimizerConfig(path)).retention, "short");
+    assert.equal(
+      asV3CacheOptimizerConfig(readPersistedCacheOptimizerConfig(path))
+        .retention,
+      "short",
+    );
 
     // v1 file: footerMode carried into v3.
-    await writeFile(path, JSON.stringify({ version: 1, footerMode: "session" }) + "\n");
+    await writeFile(
+      path,
+      JSON.stringify({ version: 1, footerMode: "session" }) + "\n",
+    );
     await writePersistedRetention("startup", path);
     const fromV1 = JSON.parse(await readFile(path, "utf8"));
     assert.equal(fromV1.version, 3);
@@ -334,16 +464,30 @@ test("schema-rejected readable config warns instead of silently using defaults",
   const dir = await mkdtemp(join(tmpdir(), "pi-cache-reject-warn-"));
   const originalWarn = console.warn;
   const warnings: string[] = [];
-  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
   try {
     const path = join(dir, "pi-cache-optimizer-config.json");
-    await writeFile(path, JSON.stringify({ version: 3, retention: "forever" }) + "\n");
+    await writeFile(
+      path,
+      JSON.stringify({ version: 3, retention: "forever" }) + "\n",
+    );
     assert.deepEqual(readPersistedCacheOptimizerConfig(path), { version: 2 });
-    assert.equal(warnings.some((text) => text.includes("schema rejected")), true);
+    assert.equal(
+      warnings.some((text) => text.includes("schema rejected")),
+      true,
+    );
 
     warnings.length = 0;
-    await writeFile(path, JSON.stringify({ version: 3, retention: "short" }) + "\n");
-    assert.deepEqual(readPersistedCacheOptimizerConfig(path), { version: 3, retention: "short" });
+    await writeFile(
+      path,
+      JSON.stringify({ version: 3, retention: "short" }) + "\n",
+    );
+    assert.deepEqual(readPersistedCacheOptimizerConfig(path), {
+      version: 3,
+      retention: "short",
+    });
     assert.equal(warnings.length, 0);
   } finally {
     console.warn = originalWarn;
@@ -356,8 +500,13 @@ test("prompt-cache-key rollback preserves v3-only config", async () => {
   try {
     const configPath = join(dir, "pi-cache-optimizer-config.json");
     const receiptPath = join(dir, "pi-cache-optimizer-config-receipt.json");
-    await writeFile(configPath, JSON.stringify({ version: 3, retention: "short" }) + "\n");
-    const model = { provider: "p", id: "m" } as Parameters<typeof applyPromptCacheKeyConfigFix>[0];
+    await writeFile(
+      configPath,
+      JSON.stringify({ version: 3, retention: "short" }) + "\n",
+    );
+    const model = { provider: "p", id: "m" } as Parameters<
+      typeof applyPromptCacheKeyConfigFix
+    >[0];
     await applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
     const afterFix = JSON.parse(await readFile(configPath, "utf8"));
     assert.equal(afterFix.version, 3);
@@ -382,7 +531,11 @@ test("footer-mode write preserves v3 keys", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-cache-footer-v3-"));
   try {
     const path = join(dir, "pi-cache-optimizer-config.json");
-    await writeFile(path, JSON.stringify({ version: 3, retention: "short", promptRewrite: false }) + "\n");
+    await writeFile(
+      path,
+      JSON.stringify({ version: 3, retention: "short", promptRewrite: false }) +
+        "\n",
+    );
     await writePersistedFooterMode("process", path);
     const after = JSON.parse(await readFile(path, "utf8"));
     assert.equal(after.version, 3);
