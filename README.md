@@ -17,6 +17,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Install](#install)
 - [Commands](#commands)
 - [Persistent opt-out](#persistent-opt-out)
+- [Configurable optimizations](#configurable-optimizations)
 - [Per-model `prompt_cache_key` opt-out](#per-model-prompt_cache_key-opt-out)
 - [Opt-in deterministic tool ordering](#opt-in-deterministic-tool-ordering)
 - [Footer cache stats mode](#footer-cache-stats-mode)
@@ -77,13 +78,14 @@ This extension requires Pi 0.82+ and is validated against Pi 0.85.1. It uses the
 | `/cache-optimizer stats contributors` | Shows current/other contributing sessions for the active exact provider/model without exposing session ids. |
 | `/cache-optimizer reset` | Resets local footer stats for the active provider/model; upstream provider cache is not modified. |
 | `/cache-optimizer config footer-mode total\|session\|process` | Persist the footer stats mode. Persistent command configuration overrides the environment variable. |
+| `/cache-optimizer config retention long\|short\|none\|startup` | Persist the cache retention steering mode. Applies immediately and on next start; persistent configuration overrides the environment variable. |
 | `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. It writes `models.json` only for native compat fixes, or the extension config for an evidenced `prompt_cache_key` issue. |
 | `/cache-optimizer fix prompt-cache-key` | Explicitly configures the active OpenAI-compatible provider/model to omit `prompt_cache_key` and `promptCacheKey` from the final request body. Requires confirmation. |
 | `/cache-optimizer rollback` | Reviews the latest matching confirmed fix and, after UI confirmation, restores either the extension config or `models.json` fix safely. |
 
-`/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer fix <Tab>` for `prompt-cache-key`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode`, and `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
+`/cache-optimizer` uses Pi's native Tab completion. Type `/cache-optimizer <Tab>` for the supported subcommands, `/cache-optimizer stats <Tab>` for `all` or `contributors`, `/cache-optimizer fix <Tab>` for `prompt-cache-key`, `/cache-optimizer c<Tab>` for `config`, `/cache-optimizer config <Tab>` for `footer-mode` and `retention`, `/cache-optimizer config footer-mode <Tab>` for `total`, `session`, or `process`, and `/cache-optimizer config retention <Tab>` for `long`, `short`, `none`, or `startup`. Suggestions are prefix-filtered and invalid prefixes are left to Pi's normal fallback behavior.
 
-The interactive `/cache-optimizer` menu includes `Footer mode`, where you can choose `total`, `session`, or `process`. `enable` / `disable` are current-process switches. For a persistent opt-out, use environment variables below.
+The interactive `/cache-optimizer` menu includes `Footer mode` and `Retention` entries. `enable` / `disable` are current-process switches. For a persistent opt-out, use the config file or environment variables below.
 
 ## Persistent opt-out
 
@@ -93,6 +95,95 @@ The interactive `/cache-optimizer` menu includes `Footer mode`, where you can ch
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | Keep Pi's verbose skill XML. |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | Disable the OpenAI-compatible `prompt_cache_key` fallback. Preferred explicit opt-out. |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | Disable the same fallback via the legacy inverse switch. Values `0`, `false`, `no`, or `off` disable it. |
+
+Every environment-variable opt-out below also has a persistent config-file equivalent — see [Configurable optimizations](#configurable-optimizations). The config file wins over the environment.
+
+## Configurable optimizations
+
+Every optimization in this extension is individually toggleable. Two surfaces control them, with **config file > environment variable > built-in default** precedence (the same precedence `footerMode` already uses):
+
+1. The per-profile config file `pi-cache-optimizer-config.json` in Pi's agent directory (`~/.pi/<profile>/pi-cache-optimizer-config.json`; the path follows Pi's `getAgentDir()` so custom agent dirs work too). Schema `v3`:
+
+   ```json
+   {
+     "version": 3,
+     "footerMode": "total",
+     "promptCacheKey": { "omit": ["provider/model"] },
+     "retention": "short",
+     "promptRewrite": true,
+     "skillCompression": false
+   }
+   ```
+
+2. Environment variables (all pre-existing ones keep working).
+
+| Optimization | Config key | Env var | Default | Notes |
+|---|---|---|---|---|
+| Prompt rewrite (reorder + churn strip) | `promptRewrite` | `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | on | Master switch for all prompt mutations. |
+| Skill compression | `skillCompression` | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | on | Layered under `promptRewrite`: master off also disables compression. |
+| Cache retention steering | `retention` | `PI_CACHE_OPTIMIZER_RETENTION=long\|short\|none\|startup` | `long` | See the mode table below. |
+| `prompt_cache_key` fallback | `promptCacheKeyFallback` | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` (or `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0`) | on | Per-model opt-out via `promptCacheKey.omit` is unaffected. |
+| Compat warnings | `compatWarnings` | `PI_CACHE_OPTIMIZER_NO_COMPAT_WARNINGS=1` | on | Hides warning toasts only; error evidence, `doctor`, and `fix` keep working. |
+| Footer cache stats | `footerStats` | `PI_CACHE_OPTIMIZER_NO_FOOTER_STATS=1` | on | Hides the footer display only; stats keep collecting for `stats`/`doctor`. |
+| Deterministic tool ordering | `deterministicToolOrdering` | `PI_CACHE_OPTIMIZER_TOOL_ORDER=1` | off | Opt-in; config `true` forces it on without the env var. |
+| Anthropic TTL downgrade | `anthropicTtlDowngrade` | `PI_CACHE_OPTIMIZER_NO_ANTHROPIC_TTL_DOWNGRADE=1` | on | Always-on safety repair (1h → 5m when the wire order is invalid), even while `disable`d. |
+| Session affinity headers | `sessionAffinity` | `PI_CACHE_OPTIMIZER_NO_SESSION_AFFINITY=1` | on | Header restoration for models.json-configured affinity compat. |
+
+Reference of every key and the built-in fallback it inherits from the existing system when you don't set it — these are the current upstream defaults, not suggested values. **Do not copy this block into your config file**: write only the keys you explicitly want to override, so everything you leave unset keeps following the system's defaults if they change in a future version:
+
+```json
+{
+  "version": 3,
+  "footerMode": "session",
+  "retention": "long",
+  "promptRewrite": true,
+  "skillCompression": true,
+  "promptCacheKeyFallback": true,
+  "compatWarnings": true,
+  "footerStats": true,
+  "deterministicToolOrdering": false,
+  "anthropicTtlDowngrade": true,
+  "sessionAffinity": true
+}
+```
+
+`promptCacheKey` is the one key with no default above: it is unset until `/cache-optimizer fix prompt-cache-key` (or a manual edit) adds a per-model `omit` list.
+
+Env-var names never appear verbatim in the config file — most env vars are `NO_*` opt-outs while the config keys are positive booleans, so the equivalent is the opposite polarity. Direct translation:
+
+| Env var | Config-file equivalent |
+|---|---|
+| `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | `"promptRewrite": false` |
+| `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | `"skillCompression": false` |
+| `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` or `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | `"promptCacheKeyFallback": false` |
+| `PI_CACHE_OPTIMIZER_NO_COMPAT_WARNINGS=1` | `"compatWarnings": false` |
+| `PI_CACHE_OPTIMIZER_NO_FOOTER_STATS=1` | `"footerStats": false` |
+| `PI_CACHE_OPTIMIZER_NO_SESSION_AFFINITY=1` | `"sessionAffinity": false` |
+| `PI_CACHE_OPTIMIZER_NO_ANTHROPIC_TTL_DOWNGRADE=1` | `"anthropicTtlDowngrade": false` |
+| `PI_CACHE_OPTIMIZER_TOOL_ORDER=1` | `"deterministicToolOrdering": true` (opt-in — note the same polarity) |
+| `PI_CACHE_OPTIMIZER_RETENTION=long\|short\|none\|startup` | `"retention": "long\|short\|none\|startup"` |
+| `PI_CACHE_OPTIMIZER_FOOTER_MODE=total\|session\|process` | `"footerMode": "total\|session\|process"` |
+
+Priority order: a config key that is set wins; when the config key is absent, the environment variable takes priority; only when neither is set does the built-in default apply (byte-identical to upstream v2.8.10).
+
+### Cache retention modes
+
+Upstream force-sets `PI_CACHE_RETENTION=long` at extension load and on `enable`, overwriting any pre-set value. The `retention` setting gates every write site (load, `enable`, `session_start`); `/cache-optimizer disable` and session shutdown still restore the startup value.
+
+| Mode | Behavior |
+|---|---|
+| `long` (default) | Force `PI_CACHE_RETENTION=long` — upstream behavior. |
+| `short` | Force `PI_CACHE_RETENTION=short`. Use this on Amazon Bedrock, where `long` makes Pi emit 1h-TTL cache points at a 2× cache-write premium while `short` keeps the 5-minute default — with every other feature still active. |
+| `none` | Never steer: delete any inherited `PI_CACHE_RETENTION` and let Pi core apply its own default. |
+| `startup` | Leave the pre-session environment untouched (pass-through; honor whatever the shell/env loader set). |
+
+Set it persistently with `/cache-optimizer config retention <mode>` (also in the interactive menu, the runtime-mode status lines, and `doctor` output), via `PI_CACHE_OPTIMIZER_RETENTION=<mode>`, or in the config file. A pre-set `PI_CACHE_RETENTION` value alone is **not** honored (upstream stomps it) — use one of the three knobs above.
+
+### Schema evolution and back-compat
+
+- `v1` (`footerMode`) and `v2` (`+ promptCacheKey.omit`) files parse unchanged and keep working; internal reads normalize only what the file carries.
+- Unknown top-level keys or invalid values make the file fall back to defaults (the existing strict-parse pattern; never fatal).
+- Writes keep the oldest schema that can represent the config — a v2 file is not rewritten as v3 until you actually set a v3-only key.
 
 ## Opt-in deterministic tool ordering
 
@@ -352,7 +443,7 @@ Example footer:
 · OpenAI cache 3/10·0.002M/0.005M 40.0% ⚠️ compat
 ```
 
-The leading `· ` is owned by this extension and separates its status from statuses published by other extensions in the same footer. It is present for normal, disabled, router-restored, and warning-suffixed statuses. The compact footer format is `<label> <hit requests>/<total requests>·<cached input tokens>/<total input tokens> <token hit rate>`; token hit rate keeps one decimal place and the footer omits the redundant `tok` suffix. `/cache-optimizer stats` lists detailed current-session models; `/cache-optimizer stats all` lists all local models and includes compact summaries such as `4/5·0.66M/0.84M 78.7%`. Some adapters may also append `·write <tokens>`, and runtime diagnostics may append `⚠️ compat` or `⚠️ integrity`.
+The leading `·` is owned by this extension and separates its status from statuses published by other extensions in the same footer. It is present for normal, disabled, router-restored, and warning-suffixed statuses. The compact footer format is `<label> <hit requests>/<total requests>·<cached input tokens>/<total input tokens> <token hit rate>`; token hit rate keeps one decimal place and the footer omits the redundant `tok` suffix. `/cache-optimizer stats` lists detailed current-session models; `/cache-optimizer stats all` lists all local models and includes compact summaries such as `4/5·0.66M/0.84M 78.7%`. Some adapters may also append `·write <tokens>`, and runtime diagnostics may append `⚠️ compat` or `⚠️ integrity`.
 
 Supported footer labels include: DS, Claude, OpenAI, Gemini, Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan, Mistral, Grok, Llama, Nemotron, Cohere, Yi, Doubao, ERNIE, Baichuan, StepFun, Spark, InternLM, Gemma, Phi, Jamba, Solar, Sonar, Nova, Reka, Falcon, DBRX, MPT, StableLM, Aquila, EXAONE, HyperCLOVA, Luminous, Hermes, Granite, Arctic, Pangu, SenseNova, Zhinao, MiniCPM, XVERSE, Orion, OpenChat, Vicuna, Wizard, Zephyr, Dolphin, OpenOrca, Starling, BLOOM, RWKV, and Aya.
 

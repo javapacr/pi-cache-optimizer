@@ -1,6 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, copyFile, link, lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { constants as fsConstants, readFileSync, statSync, watch } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  link,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import {
+  constants as fsConstants,
+  readFileSync,
+  statSync,
+  watch,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -20,28 +38,81 @@ type CacheRetentionEnvSnapshot = {
 
 const PI_CACHE_RETENTION_ENV = "PI_CACHE_RETENTION";
 const LONG_CACHE_RETENTION_VALUE = "long";
-const PI_CACHE_RETENTION_BASELINE_SYMBOL = Symbol.for("pi.cache.optimizer.retention-baseline.v1");
-const ROUTED_FALLBACK_MODEL_SYMBOL = Symbol("pi-cache-optimizer.routed-fallback-model");
+
+/** Configurable cache-retention steering modes (config key `retention`). */
+type CacheRetentionMode = "long" | "short" | "none" | "startup";
+type CacheRetentionSource = "config" | "env" | "default";
+
+function parseCacheRetentionMode(
+  value: unknown,
+): CacheRetentionMode | undefined {
+  return value === "long" ||
+    value === "short" ||
+    value === "none" ||
+    value === "startup"
+    ? value
+    : undefined;
+}
+
+const PI_CACHE_RETENTION_BASELINE_SYMBOL = Symbol.for(
+  "pi.cache.optimizer.retention-baseline.v1",
+);
+const ROUTED_FALLBACK_MODEL_SYMBOL = Symbol(
+  "pi-cache-optimizer.routed-fallback-model",
+);
 
 type CacheRetentionBaselineV1 = {
   version: 1;
   snapshot: CacheRetentionEnvSnapshot;
 };
 
-function captureCacheRetentionEnv(env: MutableEnv = process.env): CacheRetentionEnvSnapshot {
+function captureCacheRetentionEnv(
+  env: MutableEnv = process.env,
+): CacheRetentionEnvSnapshot {
   return {
-    wasSet: Object.prototype.hasOwnProperty.call(env, PI_CACHE_RETENTION_ENV),
+    wasSet: Object.hasOwn(env, PI_CACHE_RETENTION_ENV),
     value: env[PI_CACHE_RETENTION_ENV],
   };
 }
 
 function requestLongCacheRetention(env: MutableEnv = process.env): void {
-  if (!env[PI_CACHE_RETENTION_ENV] || env[PI_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE) {
+  if (
+    !env[PI_CACHE_RETENTION_ENV] ||
+    env[PI_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE
+  ) {
     env[PI_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
   }
 }
 
-function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, env: MutableEnv = process.env): void {
+/**
+ * Apply the configured retention steering to an env object.
+ *
+ * - "long"   → force PI_CACHE_RETENTION=long (upstream default; identical to
+ *              requestLongCacheRetention)
+ * - "short"  → force PI_CACHE_RETENTION=short (e.g. Bedrock's 5m default TTL
+ *              instead of the 1h cache points emitted for "long")
+ * - "none"   → never steer: delete any inherited PI_CACHE_RETENTION so Pi
+ *              core applies its own default
+ * - "startup"→ leave the pre-session env completely untouched (pass-through)
+ */
+function applyCacheRetentionMode(
+  mode: CacheRetentionMode,
+  env: MutableEnv = process.env,
+): void {
+  if (mode === "startup") return;
+  if (mode === "none") {
+    delete env[PI_CACHE_RETENTION_ENV];
+    return;
+  }
+  if (env[PI_CACHE_RETENTION_ENV] !== mode) {
+    env[PI_CACHE_RETENTION_ENV] = mode;
+  }
+}
+
+function restoreCacheRetentionEnv(
+  snapshot: CacheRetentionEnvSnapshot,
+  env: MutableEnv = process.env,
+): void {
   if (snapshot.wasSet) {
     env[PI_CACHE_RETENTION_ENV] = snapshot.value;
   } else {
@@ -49,13 +120,22 @@ function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, env: Muta
   }
 }
 
-function isCacheRetentionBaselineV1(value: unknown): value is CacheRetentionBaselineV1 {
+function isCacheRetentionBaselineV1(
+  value: unknown,
+): value is CacheRetentionBaselineV1 {
   if (typeof value !== "object" || value === null) return false;
   const record = value as { version?: unknown; snapshot?: unknown };
-  if (record.version !== 1 || typeof record.snapshot !== "object" || record.snapshot === null) return false;
+  if (
+    record.version !== 1 ||
+    typeof record.snapshot !== "object" ||
+    record.snapshot === null
+  )
+    return false;
   const snapshot = record.snapshot as { wasSet?: unknown; value?: unknown };
-  return typeof snapshot.wasSet === "boolean" &&
-    (snapshot.value === undefined || typeof snapshot.value === "string");
+  return (
+    typeof snapshot.wasSet === "boolean" &&
+    (snapshot.value === undefined || typeof snapshot.value === "string")
+  );
 }
 
 function getOrCaptureCacheRetentionBaseline(
@@ -66,7 +146,10 @@ function getOrCaptureCacheRetentionBaseline(
   if (isCacheRetentionBaselineV1(existing)) return { ...existing.snapshot };
 
   const snapshot = captureCacheRetentionEnv(env);
-  globals[PI_CACHE_RETENTION_BASELINE_SYMBOL] = { version: 1, snapshot: { ...snapshot } };
+  globals[PI_CACHE_RETENTION_BASELINE_SYMBOL] = {
+    version: 1,
+    snapshot: { ...snapshot },
+  };
   return snapshot;
 }
 
@@ -77,7 +160,8 @@ const STARTUP_CACHE_RETENTION_ENV = getOrCaptureCacheRetentionBaseline();
  *
  * What it does:
  * 1. Reorders Pi's system prompt so stable content is sent before dynamic context.
- * 2. Sets PI_CACHE_RETENTION=long at extension load time.
+ * 2. Steers PI_CACHE_RETENTION at extension load time (default: force "long";
+ *    individually configurable — see "Configurable optimizations" in README).
  * 3. Warns once for provider/model cache compat gaps where the signal is conservative.
  * 4. Shows lightweight persisted provider-specific cache stats in Pi's footer.
  * 5. Offers disabled-by-default deterministic built-in tool ordering when
@@ -86,12 +170,6 @@ const STARTUP_CACHE_RETENTION_ENV = getOrCaptureCacheRetentionBaseline();
  * Provider prompt/KV caches are provider-side and best-effort. This extension improves
  * the odds of cache hits; it cannot guarantee hits, especially through proxies.
  */
-
-// ============================================================
-// Automatically request long prompt-cache retention when Pi supports it.
-// /cache-optimizer disable restores the startup value for this Pi process.
-// ============================================================
-requestLongCacheRetention();
 
 type PiModel = NonNullable<ExtensionContext["model"]>;
 type ModelIdentity = Pick<PiModel, "provider" | "id">;
@@ -104,7 +182,10 @@ const STATUS_KEY = "pi-cache-stats";
 /** Use Pi core's resolver so rebranded config names and env semantics stay aligned. */
 const STATE_DIR = getAgentDir();
 const STATE_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-stats.json");
-const LEGACY_STATE_FILE_PATH = join(STATE_DIR, "deepseek-cache-optimizer-stats.json");
+const LEGACY_STATE_FILE_PATH = join(
+  STATE_DIR,
+  "deepseek-cache-optimizer-stats.json",
+);
 const SHARD_STATE_DIR = join(STATE_DIR, "pi-cache-optimizer-stats.d");
 const SHARD_FILES_DIR = join(SHARD_STATE_DIR, "shards");
 const SHARD_EPOCH_DIR = join(SHARD_STATE_DIR, "epochs");
@@ -118,14 +199,22 @@ const CONFIG_RECEIPT_FILE_NAME = "pi-cache-optimizer-config-receipt.json";
 const CONFIG_RECEIPT_PATH = join(STATE_DIR, CONFIG_RECEIPT_FILE_NAME);
 const FIX_RECEIPT_FILE_NAME = "pi-cache-optimizer-fix-receipt.json";
 const FIX_RECEIPT_PATH = join(STATE_DIR, FIX_RECEIPT_FILE_NAME);
-const MODELS_TRANSACTION_LOCK_PATH = join(STATE_DIR, "pi-cache-optimizer-models-transaction.lock");
+const MODELS_TRANSACTION_LOCK_PATH = join(
+  STATE_DIR,
+  "pi-cache-optimizer-models-transaction.lock",
+);
 const MODELS_TRANSACTION_LOCK_STALE_MS = 60_000;
 const MODELS_TRANSACTION_LOCK_WAIT_MS = 5_000;
 const SHARD_RETENTION_MS = 48 * 60 * 60 * 1000;
 const SHARD_TEMP_RETENTION_MS = 24 * 60 * 60 * 1000;
 const SHARD_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const SHARD_CLEANUP_LOCK_STALE_MS = 60 * 60 * 1000;
-const CACHE_PROVIDER_IDS: CacheProviderId[] = ["deepseek", "openai", "claude", "gemini"];
+const CACHE_PROVIDER_IDS: CacheProviderId[] = [
+  "deepseek",
+  "openai",
+  "claude",
+  "gemini",
+];
 const OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY";
 const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
@@ -133,6 +222,40 @@ const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
 const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
 const TOOL_ORDER_ENV = "PI_CACHE_OPTIMIZER_TOOL_ORDER";
 const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
+const RETENTION_ENV = "PI_CACHE_OPTIMIZER_RETENTION";
+const NO_COMPAT_WARNINGS_ENV = "PI_CACHE_OPTIMIZER_NO_COMPAT_WARNINGS";
+const NO_FOOTER_STATS_ENV = "PI_CACHE_OPTIMIZER_NO_FOOTER_STATS";
+const NO_ANTHROPIC_TTL_DOWNGRADE_ENV =
+  "PI_CACHE_OPTIMIZER_NO_ANTHROPIC_TTL_DOWNGRADE";
+const NO_SESSION_AFFINITY_ENV = "PI_CACHE_OPTIMIZER_NO_SESSION_AFFINITY";
+// Declared before the startup retention call below: parsePersistedCacheOptimizerConfig
+// reads it when a v3 config file is present (module-init TDZ safety).
+const CACHE_OPTIMIZER_CONFIG_TOGGLE_KEYS = [
+  "promptRewrite",
+  "skillCompression",
+  "promptCacheKeyFallback",
+  "compatWarnings",
+  "footerStats",
+  "deterministicToolOrdering",
+  "anthropicTtlDowngrade",
+  "sessionAffinity",
+] as const;
+
+// ============================================================
+// Cache retention steering (configurable).
+// Applies the effective retention mode at extension load: config-file
+// `retention` key > PI_CACHE_OPTIMIZER_RETENTION env > default "long".
+// "long" is byte-identical to upstream's unconditional force-set.
+// /cache-optimizer disable and session shutdown restore the startup value
+// for this Pi process.
+// ============================================================
+applyCacheRetentionMode(
+  resolveCacheRetentionMode(
+    process.env,
+    asV3CacheOptimizerConfig(readPersistedCacheOptimizerConfig()).retention,
+  ).mode,
+);
+
 type FooterStatsMode = "session" | "total" | "process";
 type FixReceiptPlacement = "provider" | "model" | "modelOverride";
 type ReceiptScalar = string | number | boolean | null;
@@ -186,7 +309,31 @@ type PersistedCacheOptimizerConfigV2 = {
     omit?: string[];
   };
 };
-type PersistedCacheOptimizerConfig = PersistedCacheOptimizerConfigV1 | PersistedCacheOptimizerConfigV2;
+type PersistedCacheOptimizerConfigV3 = {
+  version: 3;
+  footerMode?: FooterStatsMode;
+  promptCacheKey?: {
+    omit?: string[];
+  };
+  /** Cache retention steering mode (see applyCacheRetentionMode). */
+  retention?: CacheRetentionMode;
+  promptRewrite?: boolean;
+  skillCompression?: boolean;
+  promptCacheKeyFallback?: boolean;
+  compatWarnings?: boolean;
+  footerStats?: boolean;
+  deterministicToolOrdering?: boolean;
+  anthropicTtlDowngrade?: boolean;
+  sessionAffinity?: boolean;
+};
+type PersistedCacheOptimizerConfig =
+  | PersistedCacheOptimizerConfigV1
+  | PersistedCacheOptimizerConfigV2
+  | PersistedCacheOptimizerConfigV3;
+/** In-memory canonical form: v2 files normalize to v2, v3 files stay v3. */
+type RuntimeCacheOptimizerConfig =
+  | PersistedCacheOptimizerConfigV2
+  | PersistedCacheOptimizerConfigV3;
 type PromptCacheKeyConfigReceipt = {
   version: 2;
   kind: "pi-cache-optimizer-config-receipt";
@@ -212,9 +359,15 @@ type PromptCacheKeyConfigReceiptSnapshot = {
 };
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
-const PI_CACHE_HINTS_OWNER_SYMBOL = Symbol.for("pi.cache.optimizer.hints-owner.v1");
-const ANTHROPIC_TTL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.anthropic-ttl-fallback.v1");
-const REASONING_PROTOCOL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.reasoning-protocol-fallback.v1");
+const PI_CACHE_HINTS_OWNER_SYMBOL = Symbol.for(
+  "pi.cache.optimizer.hints-owner.v1",
+);
+const ANTHROPIC_TTL_FALLBACK_SYMBOL = Symbol.for(
+  "pi.cache.optimizer.anthropic-ttl-fallback.v1",
+);
+const REASONING_PROTOCOL_FALLBACK_SYMBOL = Symbol.for(
+  "pi.cache.optimizer.reasoning-protocol-fallback.v1",
+);
 
 type AnthropicTtlFallbackStateV1 = {
   version: 1;
@@ -230,7 +383,9 @@ type ReasoningProtocolFallbackStateV1 = {
 
 function getReasoningProtocolFallbackState(): ReasoningProtocolFallbackStateV1 {
   const globals = globalThis as Record<symbol, unknown>;
-  const existing = globals[REASONING_PROTOCOL_FALLBACK_SYMBOL] as Partial<ReasoningProtocolFallbackStateV1> | undefined;
+  const existing = globals[REASONING_PROTOCOL_FALLBACK_SYMBOL] as
+    | Partial<ReasoningProtocolFallbackStateV1>
+    | undefined;
   if (
     existing?.version === 1 &&
     existing.modelKeys instanceof Set &&
@@ -249,7 +404,9 @@ function getReasoningProtocolFallbackState(): ReasoningProtocolFallbackStateV1 {
 
 function getAnthropicTtlFallbackState(): AnthropicTtlFallbackStateV1 {
   const globals = globalThis as Record<symbol, unknown>;
-  const existing = globals[ANTHROPIC_TTL_FALLBACK_SYMBOL] as Partial<AnthropicTtlFallbackStateV1> | undefined;
+  const existing = globals[ANTHROPIC_TTL_FALLBACK_SYMBOL] as
+    | Partial<AnthropicTtlFallbackStateV1>
+    | undefined;
   if (
     existing?.version === 1 &&
     existing.modelKeys instanceof Set &&
@@ -325,9 +482,9 @@ const MPT_MODEL_PATTERN = /(^|[/\s:_-])mpt($|[-_.:/\s])/i;
 const ALEPH_MODEL_PATTERN = /(^|[/\s:_-])aleph($|[-_.:/\s])/i;
 
 // Safe-boundary patterns for models with short or ambiguous tokens
-const ARCTIC_MODEL_PATTERN = /(^|[\/\s:_-])arctic($|[\-_.:\/\s])/i;
-const AYA_MODEL_PATTERN = /(^|[\/\s:_-])aya($|[\-_.:\/\s])/i;
-const ORION_MODEL_PATTERN = /(^|[\/\s:_-])orion($|[\-_.:\/\s])/i;
+const ARCTIC_MODEL_PATTERN = /(^|[/\s:_-])arctic($|[-_.:/\s])/i;
+const AYA_MODEL_PATTERN = /(^|[/\s:_-])aya($|[-_.:/\s])/i;
+const ORION_MODEL_PATTERN = /(^|[/\s:_-])orion($|[-_.:/\s])/i;
 
 type CacheCompat = {
   supportsStore?: boolean;
@@ -357,11 +514,6 @@ type CacheStats = {
   cachedInputTokens: number;
   cacheWriteInputTokens: number;
   totalInputTokens: number;
-};
-
-type PersistedCacheStatsV2 = {
-  version: 2;
-  statsByProvider: Partial<Record<CacheProviderId, CacheStats>>;
 };
 
 /** Per-model-key scoped state. Used in memory and for v3 persistence. */
@@ -421,19 +573,21 @@ type PiCacheHintsOutput = {
   cacheRetention?: "long";
 };
 
-type PiCacheHintSnapshot = PiCacheHintsInput & PiCacheHintsOutput & {
-  timestamp: number;
-};
+type PiCacheHintSnapshot = PiCacheHintsInput &
+  PiCacheHintsOutput & {
+    timestamp: number;
+  };
 
 type PiCacheHintsV1 = {
   version: 1;
   getHints(input: PiCacheHintsInput): PiCacheHintsOutput | undefined;
 };
 
-type ProtocolGlobal = typeof globalThis & Record<symbol, unknown> & {
-  __piCacheOptimizerRouter?: unknown;
-  __piCacheOptimizerCacheKey__?: unknown;
-};
+type ProtocolGlobal = typeof globalThis &
+  Record<symbol, unknown> & {
+    __piCacheOptimizerRouter?: unknown;
+    __piCacheOptimizerCacheKey__?: unknown;
+  };
 
 type ModelRegistryLike = {
   find?(provider: string, modelId: string): PiModel | undefined;
@@ -441,39 +595,16 @@ type ModelRegistryLike = {
   getAll?(): PiModel[];
 };
 
-type ContextWithOptionalModelRegistry = Pick<ExtensionContext, "sessionManager"> & {
+type ContextWithOptionalModelRegistry = Pick<
+  ExtensionContext,
+  "sessionManager"
+> & {
   modelRegistry?: ModelRegistryLike;
 };
 
 type CacheStatsState = {
   statsByModel: Record<string, CacheStats>;
   totalsByModel: Record<string, CacheStats>;
-  legacyFamily: Partial<Record<CacheProviderId, CacheStats>>;
-  lastRoutedModelBySession?: Record<string, PersistedRoutedModelRef>;
-};
-
-type PersistedCacheStatsV3 = {
-  version: 3;
-  statsByModel: Record<string, CacheStats>;
-  legacyFamily: Partial<Record<CacheProviderId, CacheStats>>;
-};
-
-/**
- * V4 format: session-scoped stats buckets.
- * Each Pi process/session gets its own stats isolated by a hashed session id.
- *
- * sessions: sessionHash → modelKey (provider/id) → CacheStats
- * legacyFamily: unchanged from v3 (migration/fallback when ctx.model is unknown)
- */
-type PersistedCacheStatsV4 = {
-  version: 4;
-  sessions: Record<string, Record<string, CacheStats>>;
-  legacyFamily: Partial<Record<CacheProviderId, CacheStats>>;
-};
-
-type PersistedCacheStatsV5 = {
-  version: 5;
-  sessions: Record<string, Record<string, CacheStats>>;
   legacyFamily: Partial<Record<CacheProviderId, CacheStats>>;
   lastRoutedModelBySession?: Record<string, PersistedRoutedModelRef>;
 };
@@ -506,7 +637,6 @@ type ToolOrderApi =
   | "google-vertex"
   | "bedrock-converse-stream";
 
-
 /**
  * Per-request sample stored for trend analysis and usage-field-missing detection.
  * Contains only numeric counters and booleans — never message content, prompts,
@@ -530,14 +660,17 @@ type PersistedStatsShardV7 = {
   };
   day: string;
   globalEpoch: string;
-  models: Record<string, {
-    modelEpoch: string;
-    provider: string;
-    modelId: string;
-    modelName?: string;
-    api?: string;
-    stats: CacheStats;
-  }>;
+  models: Record<
+    string,
+    {
+      modelEpoch: string;
+      provider: string;
+      modelId: string;
+      modelName?: string;
+      api?: string;
+      stats: CacheStats;
+    }
+  >;
   lastRoutedModel?: PersistedRoutedModelRef;
 };
 
@@ -569,7 +702,10 @@ type CacheProviderAdapter = {
   label: string;
   showCacheWrite?: boolean;
   matchesModel(model: PiModel | undefined): boolean;
-  matchesAssistantMessage(message: unknown, model: PiModel | undefined): boolean;
+  matchesAssistantMessage(
+    message: unknown,
+    model: PiModel | undefined,
+  ): boolean;
   normalizeUsage(message: unknown): UsageSnapshot | undefined;
   warningText?(model: PiModel): string | undefined;
 };
@@ -579,7 +715,7 @@ function escapeXml(value: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
+    .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 }
 
@@ -598,16 +734,25 @@ function isStableContextFilePath(filePath: string): boolean {
 }
 
 function isKnownToolOrderApi(api: unknown): api is ToolOrderApi {
-  return api === "openai-completions" || api === "openai-responses" ||
-    api === "anthropic-messages" || api === "google-generative-ai" ||
-    api === "google-vertex" || api === "bedrock-converse-stream";
+  return (
+    api === "openai-completions" ||
+    api === "openai-responses" ||
+    api === "anthropic-messages" ||
+    api === "google-generative-ai" ||
+    api === "google-vertex" ||
+    api === "bedrock-converse-stream"
+  );
 }
 
 function isToolOrderingEligibleModel(model: PiModel | undefined): boolean {
   // Responses/Codex prompt bypasses remain untouched. The pure helper still
   // supports the verified Responses shape for fixture use, but the request
   // hook must preserve Pi's server-managed/safety-sensitive bypass.
-  return !!model && isKnownToolOrderApi(model.api) && !isResponsesPromptRewriteBypassApi(model.api);
+  return (
+    !!model &&
+    isKnownToolOrderApi(model.api) &&
+    !isResponsesPromptRewriteBypassApi(model.api)
+  );
 }
 
 function getToolNameForPayload(tool: unknown): string | undefined {
@@ -629,14 +774,21 @@ function compareToolOrderEntries(
 ): number {
   // Do not use localeCompare here: its result can vary with the host locale.
   // Exact UTF-16 code-unit ordering plus the original index is reproducible.
-  return left.name < right.name ? -1 : left.name > right.name ? 1 : left.index - right.index;
+  return left.name < right.name
+    ? -1
+    : left.name > right.name
+      ? 1
+      : left.index - right.index;
 }
 
 function isJsonObject(value: unknown): value is UnknownRecord {
   return asRecord(value) !== undefined;
 }
 
-function isVerifiedToolForApi(tool: unknown, api: ToolOrderApi): tool is UnknownRecord {
+function isVerifiedToolForApi(
+  tool: unknown,
+  api: ToolOrderApi,
+): tool is UnknownRecord {
   const record = asRecord(tool);
   if (!record) return false;
 
@@ -667,8 +819,11 @@ function isVerifiedToolForApi(tool: unknown, api: ToolOrderApi): tool is Unknown
   }
 
   if (api === "google-generative-ai" || api === "google-vertex") {
-    return isNonEmptyString(record.name) &&
-      (isJsonObject(record.parametersJsonSchema) || isJsonObject(record.parameters));
+    return (
+      isNonEmptyString(record.name) &&
+      (isJsonObject(record.parametersJsonSchema) ||
+        isJsonObject(record.parameters))
+    );
   }
 
   const spec = asRecord(record.toolSpec);
@@ -682,23 +837,33 @@ type ToolArrayInspection = {
 };
 
 function hasTopLevelCacheControl(tools: unknown): boolean {
-  return Array.isArray(tools) && tools.some((tool) => {
-    const record = asRecord(tool);
-    return !!record && Object.prototype.hasOwnProperty.call(record, "cache_control");
-  });
+  return (
+    Array.isArray(tools) &&
+    tools.some((tool) => {
+      const record = asRecord(tool);
+      return !!record && Object.hasOwn(record, "cache_control");
+    })
+  );
 }
 
-function inspectToolArray(tools: unknown, api: ToolOrderApi): ToolArrayInspection | undefined {
+function inspectToolArray(
+  tools: unknown,
+  api: ToolOrderApi,
+): ToolArrayInspection | undefined {
   if (!Array.isArray(tools)) return undefined;
   // Native Anthropic and OpenAI-compatible transports can attach a cache
   // breakpoint to a specific tool (normally the final one). Never move it,
   // regardless of API id. Anthropic defer_loading also encodes immediate vs
   // deferred tool groups in array order, so mixed/grouped payloads are no-ops.
   if (hasTopLevelCacheControl(tools)) return undefined;
-  if (api === "anthropic-messages" && tools.some((tool) => {
-    const record = asRecord(tool);
-    return !!record && Object.prototype.hasOwnProperty.call(record, "defer_loading");
-  })) return undefined;
+  if (
+    api === "anthropic-messages" &&
+    tools.some((tool) => {
+      const record = asRecord(tool);
+      return !!record && Object.hasOwn(record, "defer_loading");
+    })
+  )
+    return undefined;
   const entries = tools.map((tool, index) => {
     if (!isVerifiedToolForApi(tool, api)) return undefined;
     return { name: getToolNameForPayload(tool) ?? "", index };
@@ -737,15 +902,22 @@ function normalizeToolsInPayload(
   if (api === "google-generative-ai" || api === "google-vertex") {
     const config = asRecord(root.config);
     const groups = config?.tools;
-    if (!Array.isArray(groups) || groups.length === 0) return { payload, changed: false };
+    if (!Array.isArray(groups) || groups.length === 0)
+      return { payload, changed: false };
 
     const paths: ToolArrayPath[] = [];
     for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
       const group = asRecord(groups[groupIndex]);
-      if (!group || !Array.isArray(group.functionDeclarations)) return { payload, changed: false };
+      if (!group || !Array.isArray(group.functionDeclarations))
+        return { payload, changed: false };
       const inspected = inspectToolArray(group.functionDeclarations, api);
       if (!inspected) return { payload, changed: false };
-      if (inspected.changed) paths.push({ kind: "google", groupIndex, sortedIndices: inspected.sortedIndices });
+      if (inspected.changed)
+        paths.push({
+          kind: "google",
+          groupIndex,
+          sortedIndices: inspected.sortedIndices,
+        });
     }
     if (paths.length === 0) return { payload, changed: false };
 
@@ -769,7 +941,8 @@ function normalizeToolsInPayload(
     const toolConfig = asRecord(root.toolConfig);
     const tools = toolConfig?.tools;
     const inspected = inspectToolArray(tools, api);
-    if (!inspected || !inspected.changed || !Array.isArray(tools)) return { payload, changed: false };
+    if (!inspected || !inspected.changed || !Array.isArray(tools))
+      return { payload, changed: false };
     return {
       payload: {
         ...root,
@@ -784,9 +957,13 @@ function normalizeToolsInPayload(
 
   const tools = root.tools;
   const inspected = inspectToolArray(tools, api);
-  if (!inspected || !inspected.changed || !Array.isArray(tools)) return { payload, changed: false };
+  if (!inspected || !inspected.changed || !Array.isArray(tools))
+    return { payload, changed: false };
   return {
-    payload: { ...root, tools: inspected.sortedIndices.map((index) => tools[index]) },
+    payload: {
+      ...root,
+      tools: inspected.sortedIndices.map((index) => tools[index]),
+    },
     changed: true,
   };
 }
@@ -796,7 +973,9 @@ function sortToolsInPayload(payload: unknown, api: unknown): unknown {
   return normalizeToolsInPayload(payload, api).payload;
 }
 
-function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["skills"]>): string {
+function formatSkillsForPrompt(
+  skills: NonNullable<BuildSystemPromptOptions["skills"]>,
+): string {
   const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
   if (visibleSkills.length === 0) return "";
 
@@ -811,7 +990,9 @@ function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["ski
   for (const skill of visibleSkills) {
     lines.push("  <skill>");
     lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-    lines.push(`    <description>${escapeXml(skill.description)}</description>`);
+    lines.push(
+      `    <description>${escapeXml(skill.description)}</description>`,
+    );
     lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
     lines.push("  </skill>");
   }
@@ -907,7 +1088,7 @@ function formatSkillsForPromptCompressed(
  * present (compression already applied, or skill count below threshold),
  * the prompt is returned unchanged.
  *
- * Opt-out: set `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1`.
+ * Opt-out: config key "skillCompression": false, or PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1.
  *
  * Pre-conditions for compression to fire:
  *   - opts.skills present and visible-skill count >= SKILL_COMPRESSION_MIN_COUNT
@@ -920,7 +1101,7 @@ function compressSkillsInSystemPrompt(
   prompt: string,
   opts: BuildSystemPromptOptions,
 ): string {
-  if (isEnabledEnv(process.env[NO_SKILL_COMPRESSION_ENV])) return prompt;
+  if (!isSkillCompressionEnabled()) return prompt;
   if (!opts.skills || opts.skills.length === 0) return prompt;
 
   const visible = opts.skills.filter((skill) => !skill.disableModelInvocation);
@@ -1012,7 +1193,7 @@ function stripSessionOverviewChurn(prompt: string): string {
   const inner = prompt.slice(startIdx + startTag.length, endIdx);
   const after = prompt.slice(endIdx);
 
-  let cleaned = inner
+  const cleaned = inner
     // Drop the RECENT COMMITS section (from the heading through the
     // next heading or end of inner). The model sees commit history
     // via `git log`; carrying it in every system prompt is redundant.
@@ -1074,7 +1255,9 @@ function extractStructuralMarkers(prompt: string): {
   // HTML comments with NAME:START or NAME:END inside.
   // Trellis emits `<!-- TRELLIS:START -->` / `<!-- TRELLIS:END -->` in
   // the AGENTS.md managed block; other extensions follow this convention.
-  for (const match of prompt.matchAll(/<!--\s*([A-Z][A-Z0-9_-]*):(START|END)\s*-->/g)) {
+  for (const match of prompt.matchAll(
+    /<!--\s*([A-Z][A-Z0-9_-]*):(START|END)\s*-->/g,
+  )) {
     commentMarkers.add(`${match[1]}:${match[2]}`);
   }
 
@@ -1096,7 +1279,8 @@ function optimizeSystemPrompt(
   const candidates: string[] = [];
   for (const candidate of buildStableCandidates(opts)) {
     const part = candidate.trim();
-    if (!part || part.length < MIN_STABLE_CANDIDATE_LENGTH || seen.has(part)) continue;
+    if (!part || part.length < MIN_STABLE_CANDIDATE_LENGTH || seen.has(part))
+      continue;
     seen.add(part);
     candidates.push(part);
   }
@@ -1125,7 +1309,9 @@ function optimizeSystemPrompt(
     if (firstOccurrence < 0) continue;
 
     stableParts.push(part);
-    rest = rest.slice(0, firstOccurrence) + rest.slice(firstOccurrence + part.length);
+    rest =
+      rest.slice(0, firstOccurrence) +
+      rest.slice(firstOccurrence + part.length);
   }
 
   const stablePrefix = stableParts.join("\n\n");
@@ -1159,9 +1345,15 @@ function optimizeSystemPrompt(
   const resultMarkers = extractStructuralMarkers(systemPrompt);
 
   const missing =
-    [...originalMarkers.openingTags].some((tag) => !resultMarkers.openingTags.has(tag)) ||
-    [...originalMarkers.closingTags].some((tag) => !resultMarkers.closingTags.has(tag)) ||
-    [...originalMarkers.commentMarkers].some((m) => !resultMarkers.commentMarkers.has(m));
+    [...originalMarkers.openingTags].some(
+      (tag) => !resultMarkers.openingTags.has(tag),
+    ) ||
+    [...originalMarkers.closingTags].some(
+      (tag) => !resultMarkers.closingTags.has(tag),
+    ) ||
+    [...originalMarkers.commentMarkers].some(
+      (m) => !resultMarkers.commentMarkers.has(m),
+    );
 
   if (missing) {
     promptTruncationDetected = true;
@@ -1208,19 +1400,30 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
-function sessionHashFromContext(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
+function sessionHashFromContext(
+  ctx: Pick<ExtensionContext, "sessionManager">,
+): string | undefined {
   const sessionId = ctx.sessionManager.getSessionId();
   return sessionId ? hashSessionId(sessionId) : undefined;
 }
 
 function isPiRouterAdapterV1(value: unknown): value is PiRouterAdapterV1 {
   const record = asRecord(value);
-  return !!record && isNonEmptyString(record.virtualProvider) && typeof record.resolveActiveRoute === "function";
+  return (
+    !!record &&
+    isNonEmptyString(record.virtualProvider) &&
+    typeof record.resolveActiveRoute === "function"
+  );
 }
 
 function isRoutingRegistryV1(value: unknown): value is PiRoutingRegistryV1 {
   const record = asRecord(value);
-  return !!record && record.version === 1 && typeof record.registerRouter === "function" && typeof record.getRouter === "function";
+  return (
+    !!record &&
+    record.version === 1 &&
+    typeof record.registerRouter === "function" &&
+    typeof record.getRouter === "function"
+  );
 }
 
 function createRoutingRegistry(): PiRoutingRegistryV1 {
@@ -1255,8 +1458,14 @@ function ensureRoutingRegistry(): PiRoutingRegistryV1 {
   return created;
 }
 
-function parseRouteStatus(value: unknown): PiRouteSnapshot["status"] | undefined {
-  return value === "planned" || value === "trying" || value === "selected" || value === "success" || value === "failed"
+function parseRouteStatus(
+  value: unknown,
+): PiRouteSnapshot["status"] | undefined {
+  return value === "planned" ||
+    value === "trying" ||
+    value === "selected" ||
+    value === "success" ||
+    value === "failed"
     ? value
     : undefined;
 }
@@ -1269,11 +1478,28 @@ function parseRouteSnapshot(
   const record = asRecord(value);
   if (!record) return undefined;
 
-  const virtualProvider = firstNonEmptyString(record.virtualProvider, fallbackVirtualProvider);
-  const virtualModelId = firstNonEmptyString(record.virtualModelId, record.virtualModel, fallbackVirtualModelId);
-  const provider = firstNonEmptyString(record.provider, record.upstreamProvider, record.targetProvider);
-  const modelId = firstNonEmptyString(record.modelId, record.upstreamModelId, record.targetModelId, record.responseModel);
-  if (!virtualProvider || !virtualModelId || !provider || !modelId) return undefined;
+  const virtualProvider = firstNonEmptyString(
+    record.virtualProvider,
+    fallbackVirtualProvider,
+  );
+  const virtualModelId = firstNonEmptyString(
+    record.virtualModelId,
+    record.virtualModel,
+    fallbackVirtualModelId,
+  );
+  const provider = firstNonEmptyString(
+    record.provider,
+    record.upstreamProvider,
+    record.targetProvider,
+  );
+  const modelId = firstNonEmptyString(
+    record.modelId,
+    record.upstreamModelId,
+    record.targetModelId,
+    record.responseModel,
+  );
+  if (!virtualProvider || !virtualModelId || !provider || !modelId)
+    return undefined;
 
   const timestamp = getNumber(record.timestamp) ?? Date.now();
   return {
@@ -1296,7 +1522,9 @@ function resolveActiveRouteSnapshot(
   ctx?: Pick<ExtensionContext, "sessionManager">,
 ): PiRouteSnapshot | undefined {
   if (!model) return undefined;
-  const hint: PiRouteResolveHint | undefined = ctx ? { sessionIdHash: sessionHashFromContext(ctx) } : undefined;
+  const hint: PiRouteResolveHint | undefined = ctx
+    ? { sessionIdHash: sessionHashFromContext(ctx) }
+    : undefined;
 
   const adapter = getRoutingRegistry()?.getRouter(model.provider);
   if (adapter) {
@@ -1318,12 +1546,20 @@ function resolveActiveRouteSnapshot(
   if (!legacy || !lower(model.provider).includes("router")) return undefined;
   try {
     if (typeof legacy === "function") {
-      return parseRouteSnapshot(legacy(model.provider, model.id, hint), model.provider, model.id);
+      return parseRouteSnapshot(
+        legacy(model.provider, model.id, hint),
+        model.provider,
+        model.id,
+      );
     }
     const legacyRecord = asRecord(legacy);
     const resolver = legacyRecord?.resolveActiveRoute;
     if (typeof resolver === "function") {
-      return parseRouteSnapshot(resolver.call(legacy, model.id, hint), model.provider, model.id);
+      return parseRouteSnapshot(
+        resolver.call(legacy, model.id, hint),
+        model.provider,
+        model.id,
+      );
     }
     return parseRouteSnapshot(legacy, model.provider, model.id);
   } catch (error) {
@@ -1332,38 +1568,51 @@ function resolveActiveRouteSnapshot(
   }
 }
 
-function routeSnapshotToPiModel(snapshot: PiRouteSnapshot, fallback?: PiModel): PiModel {
-  const sameIdentity = fallback?.provider === snapshot.provider && fallback?.id === snapshot.modelId;
+function routeSnapshotToPiModel(
+  snapshot: PiRouteSnapshot,
+  fallback?: PiModel,
+): PiModel {
+  const sameIdentity =
+    fallback?.provider === snapshot.provider &&
+    fallback?.id === snapshot.modelId;
   return {
-    ...(sameIdentity ? fallback ?? {} : {}),
+    ...(sameIdentity ? (fallback ?? {}) : {}),
     id: snapshot.modelId,
     name: snapshot.canonicalModelId ?? snapshot.modelId,
     provider: snapshot.provider,
     api: snapshot.api ?? (sameIdentity ? fallback?.api : undefined) ?? "",
-    baseUrl: sameIdentity ? fallback?.baseUrl ?? "" : "",
-    reasoning: sameIdentity ? fallback?.reasoning ?? false : false,
-    input: sameIdentity ? fallback?.input ?? ["text"] : ["text"],
+    baseUrl: sameIdentity ? (fallback?.baseUrl ?? "") : "",
+    reasoning: sameIdentity ? (fallback?.reasoning ?? false) : false,
+    input: sameIdentity ? (fallback?.input ?? ["text"]) : ["text"],
     cost: sameIdentity
-      ? fallback?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+      ? (fallback?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
       : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: sameIdentity ? fallback?.contextWindow ?? 0 : 0,
-    maxTokens: sameIdentity ? fallback?.maxTokens ?? 0 : 0,
+    contextWindow: sameIdentity ? (fallback?.contextWindow ?? 0) : 0,
+    maxTokens: sameIdentity ? (fallback?.maxTokens ?? 0) : 0,
     compat: sameIdentity ? fallback?.compat : undefined,
     [ROUTED_FALLBACK_MODEL_SYMBOL]: true,
   } as PiModel;
 }
 
-function findModelInRegistry(registry: ModelRegistryLike | undefined, provider: string, id: string): PiModel | undefined {
+function findModelInRegistry(
+  registry: ModelRegistryLike | undefined,
+  provider: string,
+  id: string,
+): PiModel | undefined {
   try {
     const found = registry?.find?.(provider, id);
     if (found) return found;
 
     const available = registry?.getAvailable?.() ?? [];
-    const availableMatch = available.find((candidate) => candidate.provider === provider && candidate.id === id);
+    const availableMatch = available.find(
+      (candidate) => candidate.provider === provider && candidate.id === id,
+    );
     if (availableMatch) return availableMatch;
 
     const all = registry?.getAll?.() ?? [];
-    return all.find((candidate) => candidate.provider === provider && candidate.id === id);
+    return all.find(
+      (candidate) => candidate.provider === provider && candidate.id === id,
+    );
   } catch {
     // Registry extensions are optional input; a malformed/throwing registry
     // must not turn a provider error hook into a Pi session failure.
@@ -1372,10 +1621,18 @@ function findModelInRegistry(registry: ModelRegistryLike | undefined, provider: 
 }
 
 function isRoutedFallbackModel(model: PiModel | undefined): boolean {
-  return !!model && (model as PiModel & Record<symbol, unknown>)[ROUTED_FALLBACK_MODEL_SYMBOL] === true;
+  return (
+    !!model &&
+    (model as PiModel & Record<symbol, unknown>)[
+      ROUTED_FALLBACK_MODEL_SYMBOL
+    ] === true
+  );
 }
 
-function applyConfiguredTransportToModel(model: PiModel, config: unknown): PiModel {
+function applyConfiguredTransportToModel(
+  model: PiModel,
+  config: unknown,
+): PiModel {
   const providers = asRecord(asRecord(config)?.providers);
   const provider = asRecord(providers?.[model.provider]);
   const customModel = findLastExactModelDefinition(
@@ -1386,11 +1643,17 @@ function applyConfiguredTransportToModel(model: PiModel, config: unknown): PiMod
   const configuredBaseUrl = customModel?.baseUrl ?? provider?.baseUrl;
   const api = isNonEmptyString(model.api)
     ? model.api
-    : (isNonEmptyString(configuredApi) ? configuredApi : model.api);
+    : isNonEmptyString(configuredApi)
+      ? configuredApi
+      : model.api;
   const baseUrl = isNonEmptyString(model.baseUrl)
     ? model.baseUrl
-    : (isNonEmptyString(configuredBaseUrl) ? configuredBaseUrl : model.baseUrl);
-  return api === model.api && baseUrl === model.baseUrl ? model : { ...model, api, baseUrl };
+    : isNonEmptyString(configuredBaseUrl)
+      ? configuredBaseUrl
+      : model.baseUrl;
+  return api === model.api && baseUrl === model.baseUrl
+    ? model
+    : { ...model, api, baseUrl };
 }
 
 function resolveRouteModel(
@@ -1400,19 +1663,32 @@ function resolveRouteModel(
   const snapshot = resolveActiveRouteSnapshot(model, ctx);
   if (!snapshot) return undefined;
 
-  const resolved = findModelInRegistry(ctx?.modelRegistry, snapshot.provider, snapshot.modelId)
-    ?? routeSnapshotToPiModel(snapshot, model);
+  const resolved =
+    findModelInRegistry(
+      ctx?.modelRegistry,
+      snapshot.provider,
+      snapshot.modelId,
+    ) ?? routeSnapshotToPiModel(snapshot, model);
   return applyConfiguredTransportToModel(resolved, readEffectiveCompatConfig());
 }
 
-function isVirtualRoutingModel(model: PiModel | undefined, ctx?: Pick<ExtensionContext, "sessionManager">): boolean {
+function isVirtualRoutingModel(
+  model: PiModel | undefined,
+  ctx?: Pick<ExtensionContext, "sessionManager">,
+): boolean {
   if (!model) return false;
-  return isRouterModel(model) || !!getRoutingRegistry()?.getRouter(model.provider) || !!resolveActiveRouteSnapshot(model, ctx);
+  return (
+    isRouterModel(model) ||
+    !!getRoutingRegistry()?.getRouter(model.provider) ||
+    !!resolveActiveRouteSnapshot(model, ctx)
+  );
 }
 
 function isCacheHintsServiceV1(value: unknown): value is PiCacheHintsV1 {
   const record = asRecord(value);
-  return !!record && record.version === 1 && typeof record.getHints === "function";
+  return (
+    !!record && record.version === 1 && typeof record.getHints === "function"
+  );
 }
 
 function getCacheHintsService(): PiCacheHintsV1 | undefined {
@@ -1420,14 +1696,21 @@ function getCacheHintsService(): PiCacheHintsV1 | undefined {
   return isCacheHintsServiceV1(candidate) ? candidate : undefined;
 }
 
-function markOptimizerOwnedCacheHintsService(service: PiCacheHintsV1): PiCacheHintsV1 {
-  (service as PiCacheHintsV1 & Record<symbol, unknown>)[PI_CACHE_HINTS_OWNER_SYMBOL] = true;
+function markOptimizerOwnedCacheHintsService(
+  service: PiCacheHintsV1,
+): PiCacheHintsV1 {
+  (service as PiCacheHintsV1 & Record<symbol, unknown>)[
+    PI_CACHE_HINTS_OWNER_SYMBOL
+  ] = true;
   return service;
 }
 
 function isOptimizerOwnedCacheHintsService(value: unknown): boolean {
-  return typeof value === "object" && value !== null &&
-    (value as Record<symbol, unknown>)[PI_CACHE_HINTS_OWNER_SYMBOL] === true;
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<symbol, unknown>)[PI_CACHE_HINTS_OWNER_SYMBOL] === true
+  );
 }
 
 function installCacheHintsService(
@@ -1451,7 +1734,11 @@ function installCacheHintsService(
  * Build a session-scoped stats key from a session hash + provider/id.
  * Pure function (no closure dependency) for use by tests and internals.
  */
-function makeSessionModelKey(sessionHash: string, provider: string, id: string): string {
+function makeSessionModelKey(
+  sessionHash: string,
+  provider: string,
+  id: string,
+): string {
   return `${sessionHash}:${provider}/${id}`;
 }
 
@@ -1465,7 +1752,8 @@ function modelKeyFromSessionKey(sessionModelKey: string): string {
 }
 
 function asRecord(value: unknown): UnknownRecord | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return undefined;
   return value as UnknownRecord;
 }
 
@@ -1474,10 +1762,15 @@ function lower(value: unknown): string {
 }
 
 function getNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
 }
 
-function getNonNegativeNumber(record: UnknownRecord, key: string): number | undefined {
+function getNonNegativeNumber(
+  record: UnknownRecord,
+  key: string,
+): number | undefined {
   const value = getNumber(record[key]);
   return value !== undefined && value >= 0 ? value : undefined;
 }
@@ -1509,13 +1802,17 @@ function findLastExactModelDefinition(
   return undefined;
 }
 
-function mergeCacheCompat(...sources: Array<UnknownRecord | undefined>): CacheCompat {
+function mergeCacheCompat(
+  ...sources: Array<UnknownRecord | undefined>
+): CacheCompat {
   const merged: CacheCompat = {};
   for (const source of sources) {
     if (!source) continue;
     const previousNested = Object.fromEntries(
       NESTED_COMPAT_KEYS.map((key) => [key, asRecord(merged[key])]),
-    ) as Partial<Record<(typeof NESTED_COMPAT_KEYS)[number], UnknownRecord | undefined>>;
+    ) as Partial<
+      Record<(typeof NESTED_COMPAT_KEYS)[number], UnknownRecord | undefined>
+    >;
     Object.assign(merged, source);
     for (const key of NESTED_COMPAT_KEYS) {
       const baseValue = previousNested[key];
@@ -1528,7 +1825,13 @@ function mergeCacheCompat(...sources: Array<UnknownRecord | undefined>): CacheCo
   return merged;
 }
 
-function getEffectiveCompatSources(model: PiModel, config: unknown): Array<{ source: "provider" | "model" | "runtime" | "modelOverride"; compat: UnknownRecord }> {
+function getEffectiveCompatSources(
+  model: PiModel,
+  config: unknown,
+): Array<{
+  source: "provider" | "model" | "runtime" | "modelOverride";
+  compat: UnknownRecord;
+}> {
   const root = asRecord(config);
   const providers = asRecord(root?.providers);
   const provider = asRecord(providers?.[model.provider]);
@@ -1539,24 +1842,39 @@ function getEffectiveCompatSources(model: PiModel, config: unknown): Array<{ sou
   );
   const customModelCompat = asRecord(asRecord(customModel)?.compat);
   const runtimeCompat = asRecord(model.compat);
-  const modelOverride = asRecord(asRecord(provider?.modelOverrides)?.[model.id]);
+  const modelOverride = asRecord(
+    asRecord(provider?.modelOverrides)?.[model.id],
+  );
   const modelOverrideCompat = asRecord(modelOverride?.compat);
 
   return [
-    ...(providerCompat ? [{ source: "provider" as const, compat: providerCompat }] : []),
-    ...(customModelCompat ? [{ source: "model" as const, compat: customModelCompat }] : []),
-    ...(runtimeCompat ? [{ source: "runtime" as const, compat: runtimeCompat }] : []),
-    ...(modelOverrideCompat ? [{ source: "modelOverride" as const, compat: modelOverrideCompat }] : []),
+    ...(providerCompat
+      ? [{ source: "provider" as const, compat: providerCompat }]
+      : []),
+    ...(customModelCompat
+      ? [{ source: "model" as const, compat: customModelCompat }]
+      : []),
+    ...(runtimeCompat
+      ? [{ source: "runtime" as const, compat: runtimeCompat }]
+      : []),
+    ...(modelOverrideCompat
+      ? [{ source: "modelOverride" as const, compat: modelOverrideCompat }]
+      : []),
   ];
 }
 
-function resolveEffectiveCompatFromConfig(model: PiModel, config: unknown): CacheCompat {
+function resolveEffectiveCompatFromConfig(
+  model: PiModel,
+  config: unknown,
+): CacheCompat {
   // Pi's effective precedence is provider → models[] → runtime model →
   // modelOverrides. The runtime layer is intentionally included between the
   // config model and modelOverride: extension providers can replace the model
   // object after lower config layers were applied, while the override remains
   // Pi's highest-precedence user layer.
-  return mergeCacheCompat(...getEffectiveCompatSources(model, config).map(({ compat }) => compat));
+  return mergeCacheCompat(
+    ...getEffectiveCompatSources(model, config).map(({ compat }) => compat),
+  );
 }
 
 function getEffectiveCompatValueSource(
@@ -1566,7 +1884,7 @@ function getEffectiveCompatValueSource(
 ): "provider" | "model" | "runtime" | "modelOverride" | undefined {
   let source: "provider" | "model" | "runtime" | "modelOverride" | undefined;
   for (const candidate of getEffectiveCompatSources(model, config)) {
-    if (Object.prototype.hasOwnProperty.call(candidate.compat, key)) source = candidate.source;
+    if (Object.hasOwn(candidate.compat, key)) source = candidate.source;
   }
   return source;
 }
@@ -1585,82 +1903,177 @@ function isFiniteNumber(value: unknown): value is number {
 
 function isRecordOfStrings(value: unknown): boolean {
   const record = asRecord(value);
-  return !!record && Object.values(record).every((entry) => typeof entry === "string");
+  return (
+    !!record &&
+    Object.values(record).every((entry) => typeof entry === "string")
+  );
 }
 
 function isThinkingLevelMap(value: unknown): boolean {
   const map = asRecord(value);
   if (!map) return false;
-  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].every((key) =>
-    map[key] === undefined || map[key] === null || typeof map[key] === "string"
+  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].every(
+    (key) =>
+      map[key] === undefined ||
+      map[key] === null ||
+      typeof map[key] === "string",
   );
 }
 
 function isValidModelCostTier(value: unknown): boolean {
   const tier = asRecord(value);
-  return !!tier
-    && isFiniteNumber(tier.inputTokensAbove)
-    && isFiniteNumber(tier.input)
-    && isFiniteNumber(tier.output)
-    && isFiniteNumber(tier.cacheRead)
-    && isFiniteNumber(tier.cacheWrite);
+  return (
+    !!tier &&
+    isFiniteNumber(tier.inputTokensAbove) &&
+    isFiniteNumber(tier.input) &&
+    isFiniteNumber(tier.output) &&
+    isFiniteNumber(tier.cacheRead) &&
+    isFiniteNumber(tier.cacheWrite)
+  );
 }
 
 function isValidModelCost(value: unknown, partial: boolean): boolean {
   const cost = asRecord(value);
   if (!cost) return false;
   for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
-    if ((!partial || cost[key] !== undefined) && !isFiniteNumber(cost[key])) return false;
+    if ((!partial || cost[key] !== undefined) && !isFiniteNumber(cost[key]))
+      return false;
   }
-  return cost.tiers === undefined || (Array.isArray(cost.tiers) && cost.tiers.every(isValidModelCostTier));
+  return (
+    cost.tiers === undefined ||
+    (Array.isArray(cost.tiers) && cost.tiers.every(isValidModelCostTier))
+  );
 }
 
 function isValidModelDefinition(value: unknown): boolean {
   const model = asRecord(value);
   if (!model || !isNonEmptyString(model.id)) return false;
-  if (!isOptionalString(model.name) || !isOptionalString(model.api) || !isOptionalString(model.baseUrl)) return false;
-  if (!isOptionalBoolean(model.reasoning) || !isValidCompatRecord(model.compat)) return false;
-  if (model.thinkingLevelMap !== undefined && !isThinkingLevelMap(model.thinkingLevelMap)) return false;
-  if (model.input !== undefined && (!Array.isArray(model.input) || !model.input.every((entry) => entry === "text" || entry === "image"))) return false;
-  if (model.cost !== undefined && !isValidModelCost(model.cost, false)) return false;
-  if (model.contextWindow !== undefined && !isFiniteNumber(model.contextWindow)) return false;
-  if (model.maxTokens !== undefined && !isFiniteNumber(model.maxTokens)) return false;
-  if (model.samplingParams !== undefined && !asRecord(model.samplingParams)) return false;
-  if (model.headers !== undefined && !isRecordOfStrings(model.headers)) return false;
+  if (
+    !isOptionalString(model.name) ||
+    !isOptionalString(model.api) ||
+    !isOptionalString(model.baseUrl)
+  )
+    return false;
+  if (!isOptionalBoolean(model.reasoning) || !isValidCompatRecord(model.compat))
+    return false;
+  if (
+    model.thinkingLevelMap !== undefined &&
+    !isThinkingLevelMap(model.thinkingLevelMap)
+  )
+    return false;
+  if (
+    model.input !== undefined &&
+    (!Array.isArray(model.input) ||
+      !model.input.every((entry) => entry === "text" || entry === "image"))
+  )
+    return false;
+  if (model.cost !== undefined && !isValidModelCost(model.cost, false))
+    return false;
+  if (model.contextWindow !== undefined && !isFiniteNumber(model.contextWindow))
+    return false;
+  if (model.maxTokens !== undefined && !isFiniteNumber(model.maxTokens))
+    return false;
+  if (model.samplingParams !== undefined && !asRecord(model.samplingParams))
+    return false;
+  if (model.headers !== undefined && !isRecordOfStrings(model.headers))
+    return false;
   return true;
 }
 
 function isValidModelOverride(value: unknown): boolean {
   const override = asRecord(value);
   if (!override || !isValidCompatRecord(override.compat)) return false;
-  if (!isOptionalString(override.name) || !isOptionalBoolean(override.reasoning)) return false;
-  if (override.thinkingLevelMap !== undefined && !isThinkingLevelMap(override.thinkingLevelMap)) return false;
-  if (override.input !== undefined && (!Array.isArray(override.input) || !override.input.every((entry) => entry === "text" || entry === "image"))) return false;
-  if (override.cost !== undefined && !isValidModelCost(override.cost, true)) return false;
-  if (override.contextWindow !== undefined && !isFiniteNumber(override.contextWindow)) return false;
-  if (override.maxTokens !== undefined && !isFiniteNumber(override.maxTokens)) return false;
-  if (override.samplingParams !== undefined && !asRecord(override.samplingParams)) return false;
-  if (override.headers !== undefined && !isRecordOfStrings(override.headers)) return false;
+  if (
+    !isOptionalString(override.name) ||
+    !isOptionalBoolean(override.reasoning)
+  )
+    return false;
+  if (
+    override.thinkingLevelMap !== undefined &&
+    !isThinkingLevelMap(override.thinkingLevelMap)
+  )
+    return false;
+  if (
+    override.input !== undefined &&
+    (!Array.isArray(override.input) ||
+      !override.input.every((entry) => entry === "text" || entry === "image"))
+  )
+    return false;
+  if (override.cost !== undefined && !isValidModelCost(override.cost, true))
+    return false;
+  if (
+    override.contextWindow !== undefined &&
+    !isFiniteNumber(override.contextWindow)
+  )
+    return false;
+  if (override.maxTokens !== undefined && !isFiniteNumber(override.maxTokens))
+    return false;
+  if (
+    override.samplingParams !== undefined &&
+    !asRecord(override.samplingParams)
+  )
+    return false;
+  if (override.headers !== undefined && !isRecordOfStrings(override.headers))
+    return false;
   return true;
 }
 
 function isValidOpenAICompletionsCompat(compat: UnknownRecord): boolean {
   const booleanKeys = [
-    "supportsStore", "supportsDeveloperRole", "supportsReasoningEffort",
-    "supportsUsageInStreaming", "requiresToolResultName", "requiresAssistantAfterToolResult",
-    "requiresThinkingAsText", "requiresReasoningContentOnAssistantMessages",
-    "supportsOpenAIGrammarTools", "supportsStrictMode", "sendSessionAffinityHeaders",
+    "supportsStore",
+    "supportsDeveloperRole",
+    "supportsReasoningEffort",
+    "supportsUsageInStreaming",
+    "requiresToolResultName",
+    "requiresAssistantAfterToolResult",
+    "requiresThinkingAsText",
+    "requiresReasoningContentOnAssistantMessages",
+    "supportsOpenAIGrammarTools",
+    "supportsStrictMode",
+    "sendSessionAffinityHeaders",
     "supportsLongCacheRetention",
   ];
   if (booleanKeys.some((key) => !isOptionalBoolean(compat[key]))) return false;
-  if (compat.maxTokensField !== undefined && compat.maxTokensField !== "max_completion_tokens" && compat.maxTokensField !== "max_tokens") return false;
-  if (compat.thinkingFormat !== undefined && ![
-    "openai", "openrouter", "together", "baseten", "deepseek", "zai", "qwen",
-    "chat-template", "qwen-chat-template", "string-thinking", "ant-ling",
-  ].includes(String(compat.thinkingFormat))) return false;
-  if (compat.cacheControlFormat !== undefined && compat.cacheControlFormat !== "anthropic") return false;
-  if (compat.deferredToolsMode !== undefined && compat.deferredToolsMode !== "kimi") return false;
-  if (compat.sessionAffinityFormat !== undefined && !["openai", "openai-nosession", "openrouter"].includes(String(compat.sessionAffinityFormat))) return false;
+  if (
+    compat.maxTokensField !== undefined &&
+    compat.maxTokensField !== "max_completion_tokens" &&
+    compat.maxTokensField !== "max_tokens"
+  )
+    return false;
+  if (
+    compat.thinkingFormat !== undefined &&
+    ![
+      "openai",
+      "openrouter",
+      "together",
+      "baseten",
+      "deepseek",
+      "zai",
+      "qwen",
+      "chat-template",
+      "qwen-chat-template",
+      "string-thinking",
+      "ant-ling",
+    ].includes(String(compat.thinkingFormat))
+  )
+    return false;
+  if (
+    compat.cacheControlFormat !== undefined &&
+    compat.cacheControlFormat !== "anthropic"
+  )
+    return false;
+  if (
+    compat.deferredToolsMode !== undefined &&
+    compat.deferredToolsMode !== "kimi"
+  )
+    return false;
+  if (
+    compat.sessionAffinityFormat !== undefined &&
+    !["openai", "openai-nosession", "openrouter"].includes(
+      String(compat.sessionAffinityFormat),
+    )
+  )
+    return false;
   for (const key of NESTED_COMPAT_KEYS) {
     if (compat[key] !== undefined && !asRecord(compat[key])) return false;
   }
@@ -1669,31 +2082,45 @@ function isValidOpenAICompletionsCompat(compat: UnknownRecord): boolean {
 
 function isValidOpenAIResponsesCompat(compat: UnknownRecord): boolean {
   const booleanKeys = [
-    "supportsDeveloperRole", "supportsLongCacheRetention", "supportsStrictMode",
-    "supportsOpenAIGrammarTools", "supportsAdditionalTools", "supportsToolSearch",
+    "supportsDeveloperRole",
+    "supportsLongCacheRetention",
+    "supportsStrictMode",
+    "supportsOpenAIGrammarTools",
+    "supportsAdditionalTools",
+    "supportsToolSearch",
   ];
   if (booleanKeys.some((key) => !isOptionalBoolean(compat[key]))) return false;
-  return compat.sessionAffinityFormat === undefined
-    || ["openai", "openai-nosession", "openrouter"].includes(String(compat.sessionAffinityFormat));
+  return (
+    compat.sessionAffinityFormat === undefined ||
+    ["openai", "openai-nosession", "openrouter"].includes(
+      String(compat.sessionAffinityFormat),
+    )
+  );
 }
 
 function isValidAnthropicMessagesCompat(compat: UnknownRecord): boolean {
   return [
-    "supportsEagerToolInputStreaming", "supportsLongCacheRetention",
-    "sendSessionAffinityHeaders", "supportsCacheControlOnTools", "supportsTemperature",
-    "forceAdaptiveThinking", "allowEmptySignature", "supportsStrictTools", "supportsToolReferences",
+    "supportsEagerToolInputStreaming",
+    "supportsLongCacheRetention",
+    "sendSessionAffinityHeaders",
+    "supportsCacheControlOnTools",
+    "supportsTemperature",
+    "forceAdaptiveThinking",
+    "allowEmptySignature",
+    "supportsStrictTools",
+    "supportsToolReferences",
   ].every((key) => isOptionalBoolean(compat[key]));
 }
 
 function isValidCompatRecord(value: unknown): boolean {
   if (value === undefined) return true;
   const compat = asRecord(value);
-  return !!compat
-    && !Object.prototype.hasOwnProperty.call(compat, "supportsPromptCacheKey")
-    && (
-    isValidOpenAICompletionsCompat(compat)
-    || isValidOpenAIResponsesCompat(compat)
-    || isValidAnthropicMessagesCompat(compat)
+  return (
+    !!compat &&
+    !Object.hasOwn(compat, "supportsPromptCacheKey") &&
+    (isValidOpenAICompletionsCompat(compat) ||
+      isValidOpenAIResponsesCompat(compat) ||
+      isValidAnthropicMessagesCompat(compat))
   );
 }
 
@@ -1709,13 +2136,37 @@ function isValidModelsConfigForEffectiveCompat(value: unknown): boolean {
   for (const providerValue of Object.values(providers)) {
     const provider = asRecord(providerValue);
     if (!provider) return false;
-    if (!isOptionalString(provider.name) || !isOptionalString(provider.baseUrl) || !isOptionalString(provider.apiKey) || !isOptionalString(provider.api)) return false;
-    if (!isOptionalBoolean(provider.authHeader) || !isValidCompatRecord(provider.compat)) return false;
-    if (provider.oauth !== undefined && provider.oauth !== "radius") return false;
-    if (provider.headers !== undefined && !isRecordOfStrings(provider.headers)) return false;
-    if (provider.models !== undefined && (!Array.isArray(provider.models) || !provider.models.every(isValidModelDefinition))) return false;
-    const overrides = provider.modelOverrides === undefined ? undefined : asRecord(provider.modelOverrides);
-    if (provider.modelOverrides !== undefined && (!overrides || !Object.values(overrides).every(isValidModelOverride))) return false;
+    if (
+      !isOptionalString(provider.name) ||
+      !isOptionalString(provider.baseUrl) ||
+      !isOptionalString(provider.apiKey) ||
+      !isOptionalString(provider.api)
+    )
+      return false;
+    if (
+      !isOptionalBoolean(provider.authHeader) ||
+      !isValidCompatRecord(provider.compat)
+    )
+      return false;
+    if (provider.oauth !== undefined && provider.oauth !== "radius")
+      return false;
+    if (provider.headers !== undefined && !isRecordOfStrings(provider.headers))
+      return false;
+    if (
+      provider.models !== undefined &&
+      (!Array.isArray(provider.models) ||
+        !provider.models.every(isValidModelDefinition))
+    )
+      return false;
+    const overrides =
+      provider.modelOverrides === undefined
+        ? undefined
+        : asRecord(provider.modelOverrides);
+    if (
+      provider.modelOverrides !== undefined &&
+      (!overrides || !Object.values(overrides).every(isValidModelOverride))
+    )
+      return false;
   }
   return true;
 }
@@ -1742,13 +2193,16 @@ function getModelsConfigSignature(): string {
 
 function readEffectiveCompatConfig(): unknown | undefined {
   const signature = getModelsConfigSignature();
-  if (modelsConfigCache?.signature === signature) return modelsConfigCache.value;
+  if (modelsConfigCache?.signature === signature)
+    return modelsConfigCache.value;
 
   let value: unknown | undefined;
   if (signature !== "missing") {
     try {
       const parsed = parseJsonc(readFileSync(MODELS_JSON_PATH, "utf8"));
-      value = isValidModelsConfigForEffectiveCompat(parsed) ? parsed : undefined;
+      value = isValidModelsConfigForEffectiveCompat(parsed)
+        ? parsed
+        : undefined;
     } catch {
       value = undefined;
     }
@@ -1763,9 +2217,14 @@ function getCompat(model: PiModel | undefined): CacheCompat {
   return resolveEffectiveCompatFromConfig(model, readEffectiveCompatConfig());
 }
 
-function hasProviderHeader(headers: Record<string, unknown>, name: string): boolean {
+function hasProviderHeader(
+  headers: Record<string, unknown>,
+  name: string,
+): boolean {
   const normalized = name.toLowerCase();
-  return Object.keys(headers).some((headerName) => headerName.toLowerCase() === normalized);
+  return Object.keys(headers).some(
+    (headerName) => headerName.toLowerCase() === normalized,
+  );
 }
 
 function setProviderHeaderIfMissing(
@@ -1786,15 +2245,35 @@ function addEffectiveSessionAffinityHeaders(
   optimizerEnabled: boolean = runtimeOptimizerEnabled,
   effectiveSource?: "provider" | "model" | "runtime" | "modelOverride",
 ): boolean {
-  if (!optimizerEnabled || !model || !isNonEmptyString(sessionId)) return false;
-  if (!isOpenAICompatibleProxyApi(model.api) || !isNonEmptyString(model.baseUrl) || isOfficialOpenAIBaseUrl(model)) return false;
-  const config = effectiveCompat === undefined || effectiveSource === undefined
-    ? readEffectiveCompatConfig()
-    : undefined;
-  const compat = effectiveCompat ?? resolveEffectiveCompatFromConfig(model, config);
-  const source = effectiveSource
-    ?? getEffectiveCompatValueSource(model, config, "sendSessionAffinityHeaders")
-    ?? (Object.prototype.hasOwnProperty.call(asRecord(model.compat) ?? {}, "sendSessionAffinityHeaders") ? "runtime" : undefined);
+  if (
+    !optimizerEnabled ||
+    !isSessionAffinityToggleEnabled() ||
+    !model ||
+    !isNonEmptyString(sessionId)
+  )
+    return false;
+  if (
+    !isOpenAICompatibleProxyApi(model.api) ||
+    !isNonEmptyString(model.baseUrl) ||
+    isOfficialOpenAIBaseUrl(model)
+  )
+    return false;
+  const config =
+    effectiveCompat === undefined || effectiveSource === undefined
+      ? readEffectiveCompatConfig()
+      : undefined;
+  const compat =
+    effectiveCompat ?? resolveEffectiveCompatFromConfig(model, config);
+  const source =
+    effectiveSource ??
+    getEffectiveCompatValueSource(
+      model,
+      config,
+      "sendSessionAffinityHeaders",
+    ) ??
+    (Object.hasOwn(asRecord(model.compat) ?? {}, "sendSessionAffinityHeaders")
+      ? "runtime"
+      : undefined);
   if (compat.sendSessionAffinityHeaders !== true) return false;
 
   // Pi already handles an effective runtime-model true. The bridge is only for
@@ -1802,26 +2281,35 @@ function addEffectiveSessionAffinityHeaders(
   // extension provider rebuilt/replaced the runtime model object.
   if (source === "runtime") return false;
 
-  const format = compat.sessionAffinityFormat ?? (
-    lower(model.provider).includes("openrouter") || lower(model.baseUrl).includes("openrouter.ai")
+  const format =
+    compat.sessionAffinityFormat ??
+    (lower(model.provider).includes("openrouter") ||
+    lower(model.baseUrl).includes("openrouter.ai")
       ? "openrouter"
-      : "openai"
-  );
+      : "openai");
   const value = sessionId.trim();
   let changed = false;
   if (format === "openrouter") {
     return setProviderHeaderIfMissing(headers, "x-session-id", value);
   }
   if (format === "openai") {
-    changed = setProviderHeaderIfMissing(headers, "session_id", value) || changed;
+    changed =
+      setProviderHeaderIfMissing(headers, "session_id", value) || changed;
   }
-  changed = setProviderHeaderIfMissing(headers, "x-client-request-id", value) || changed;
-  changed = setProviderHeaderIfMissing(headers, "x-session-affinity", value) || changed;
+  changed =
+    setProviderHeaderIfMissing(headers, "x-client-request-id", value) ||
+    changed;
+  changed =
+    setProviderHeaderIfMissing(headers, "x-session-affinity", value) || changed;
   return changed;
 }
 
 /** Join display-only path fragments without resolving them for I/O. */
-function joinDisplayPath(base: string, child: string, platform: string = process.platform): string {
+function joinDisplayPath(
+  base: string,
+  child: string,
+  platform: string = process.platform,
+): string {
   const sep = platform.startsWith("win") ? "\\" : "/";
   return `${base.replace(/[\\/]+$/, "")}${sep}${child}`;
 }
@@ -1840,11 +2328,18 @@ function getAgentDirDisplayPath(
 ): string {
   const sep = platform.startsWith("win") ? "\\" : "/";
   const normalizedAgentDir = agentDir.replace(/[\\/]+/g, sep);
-  const normalizedHomeDir = homeDir.replace(/[\\/]+/g, sep).replace(/[\\/]+$/, "");
+  const normalizedHomeDir = homeDir
+    .replace(/[\\/]+/g, sep)
+    .replace(/[\\/]+$/, "");
   const homePrefix = `${normalizedHomeDir}${sep}`;
 
-  if (normalizedAgentDir === normalizedHomeDir || normalizedAgentDir.startsWith(homePrefix)) {
-    const relative = normalizedAgentDir.slice(normalizedHomeDir.length).replace(/^[\\/]+/, "");
+  if (
+    normalizedAgentDir === normalizedHomeDir ||
+    normalizedAgentDir.startsWith(homePrefix)
+  ) {
+    const relative = normalizedAgentDir
+      .slice(normalizedHomeDir.length)
+      .replace(/^[\\/]+/, "");
     const homeLabel = platform.startsWith("win") ? "%USERPROFILE%" : "~";
     return relative ? `${homeLabel}${sep}${relative}` : homeLabel;
   }
@@ -1863,23 +2358,41 @@ function getModelsJsonDisplayPath(
   agentDir: string = getAgentDir(),
   homeDir: string = homedir(),
 ): string {
-  return joinDisplayPath(getAgentDirDisplayPath(platform, agentDir, homeDir), "models.json", platform);
+  return joinDisplayPath(
+    getAgentDirDisplayPath(platform, agentDir, homeDir),
+    "models.json",
+    platform,
+  );
 }
 
 function isEnabledEnv(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+  return (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  );
 }
 
 function isToolOrderEnabled(env: MutableEnv = process.env): boolean {
-  return runtimeOptimizerEnabled && isEnabledEnv(env[TOOL_ORDER_ENV]);
+  if (!runtimeOptimizerEnabled) return false;
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig)
+      .deterministicToolOrdering,
+    isEnabledEnv(env[TOOL_ORDER_ENV]),
+  );
 }
 
 function parseFooterStatsMode(value: unknown): FooterStatsMode | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
-  return normalized === "session" || normalized === "total" || normalized === "process" ? normalized : undefined;
+  return normalized === "session" ||
+    normalized === "total" ||
+    normalized === "process"
+    ? normalized
+    : undefined;
 }
 
 type CommandCompletionItem = {
@@ -1899,8 +2412,14 @@ const CACHE_OPTIMIZER_COMMANDS = [
   "fix",
   "rollback",
 ] as const;
-const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode"] as const;
+const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "retention"] as const;
 const CACHE_OPTIMIZER_FOOTER_MODES = ["total", "session", "process"] as const;
+const CACHE_OPTIMIZER_RETENTION_MODES = [
+  "long",
+  "short",
+  "none",
+  "startup",
+] as const;
 const CACHE_OPTIMIZER_STATS_ARGUMENTS = ["all", "contributors"] as const;
 const CACHE_OPTIMIZER_FIX_ARGUMENTS = ["prompt-cache-key"] as const;
 
@@ -1921,7 +2440,9 @@ function filterCommandCompletionItems(
   return matches.length > 0 ? matches : null;
 }
 
-function getCacheOptimizerArgumentCompletions(argumentPrefix: string): CommandCompletionItem[] | null {
+function getCacheOptimizerArgumentCompletions(
+  argumentPrefix: string,
+): CommandCompletionItem[] | null {
   if (typeof argumentPrefix !== "string") return null;
   const trimmed = argumentPrefix.trim();
   const parts = trimmed ? trimmed.split(/\s+/) : [];
@@ -1939,23 +2460,39 @@ function getCacheOptimizerArgumentCompletions(argumentPrefix: string): CommandCo
       return [{ value: "config", label: "config" }];
     }
     if (subcommandPrefix === "config") {
-      return filterCommandCompletionItems(CACHE_OPTIMIZER_CONFIG_ARGUMENTS, "", "config");
+      return filterCommandCompletionItems(
+        CACHE_OPTIMIZER_CONFIG_ARGUMENTS,
+        "",
+        "config",
+      );
     }
     if (subcommandPrefix === "stats") {
-      return filterCommandCompletionItems(CACHE_OPTIMIZER_STATS_ARGUMENTS, "", "stats");
+      return filterCommandCompletionItems(
+        CACHE_OPTIMIZER_STATS_ARGUMENTS,
+        "",
+        "stats",
+      );
     }
     return filterCommandCompletionItems(CACHE_OPTIMIZER_COMMANDS, parts[0]);
   }
 
   if (parts[0].toLowerCase() === "stats") {
     return parts.length === 2
-      ? filterCommandCompletionItems(CACHE_OPTIMIZER_STATS_ARGUMENTS, parts[1], "stats")
+      ? filterCommandCompletionItems(
+          CACHE_OPTIMIZER_STATS_ARGUMENTS,
+          parts[1],
+          "stats",
+        )
       : null;
   }
 
   if (parts[0].toLowerCase() === "fix") {
     return parts.length === 2
-      ? filterCommandCompletionItems(CACHE_OPTIMIZER_FIX_ARGUMENTS, parts[1], "fix")
+      ? filterCommandCompletionItems(
+          CACHE_OPTIMIZER_FIX_ARGUMENTS,
+          parts[1],
+          "fix",
+        )
       : null;
   }
 
@@ -1964,74 +2501,226 @@ function getCacheOptimizerArgumentCompletions(argumentPrefix: string): CommandCo
   if (parts.length === 2) {
     const nestedPrefix = parts[1].toLowerCase();
     if (nestedPrefix === "footer-mode") {
-      return filterCommandCompletionItems(CACHE_OPTIMIZER_FOOTER_MODES, "", "config footer-mode");
+      return filterCommandCompletionItems(
+        CACHE_OPTIMIZER_FOOTER_MODES,
+        "",
+        "config footer-mode",
+      );
     }
-    return filterCommandCompletionItems(CACHE_OPTIMIZER_CONFIG_ARGUMENTS, parts[1], "config");
+    if (nestedPrefix === "retention") {
+      return filterCommandCompletionItems(
+        CACHE_OPTIMIZER_RETENTION_MODES,
+        "",
+        "config retention",
+      );
+    }
+    return filterCommandCompletionItems(
+      CACHE_OPTIMIZER_CONFIG_ARGUMENTS,
+      parts[1],
+      "config",
+    );
   }
 
   if (parts.length === 3 && parts[1].toLowerCase() === "footer-mode") {
-    return filterCommandCompletionItems(CACHE_OPTIMIZER_FOOTER_MODES, parts[2], "config footer-mode");
+    return filterCommandCompletionItems(
+      CACHE_OPTIMIZER_FOOTER_MODES,
+      parts[2],
+      "config footer-mode",
+    );
+  }
+
+  if (parts.length === 3 && parts[1].toLowerCase() === "retention") {
+    return filterCommandCompletionItems(
+      CACHE_OPTIMIZER_RETENTION_MODES,
+      parts[2],
+      "config retention",
+    );
   }
 
   return null;
 }
 
-function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCacheOptimizerConfig | undefined {
+function parsePersistedCacheOptimizerConfig(
+  value: unknown,
+): PersistedCacheOptimizerConfig | undefined {
   const record = asRecord(value);
-  if (!record || (record.version !== 1 && record.version !== 2)) return undefined;
-  const allowedTopLevel = new Set(record.version === 1 ? ["version", "footerMode"] : ["version", "footerMode", "promptCacheKey"]);
-  if (Object.keys(record).some((key) => !allowedTopLevel.has(key))) return undefined;
+  if (
+    !record ||
+    (record.version !== 1 && record.version !== 2 && record.version !== 3)
+  )
+    return undefined;
+  const allowedTopLevel = new Set(
+    record.version === 1
+      ? ["version", "footerMode"]
+      : record.version === 2
+        ? ["version", "footerMode", "promptCacheKey"]
+        : [
+            "version",
+            "footerMode",
+            "promptCacheKey",
+            "retention",
+            ...CACHE_OPTIMIZER_CONFIG_TOGGLE_KEYS,
+          ],
+  );
+  if (Object.keys(record).some((key) => !allowedTopLevel.has(key)))
+    return undefined;
   const footerMode = parseFooterStatsMode(record.footerMode);
   if (record.footerMode !== undefined && !footerMode) return undefined;
-  if (record.version === 1) return { version: 1, ...(footerMode ? { footerMode } : {}) };
+  if (record.version === 1)
+    return { version: 1, ...(footerMode ? { footerMode } : {}) };
 
   const rawPromptCacheKey = record.promptCacheKey;
-  if (rawPromptCacheKey !== undefined && !asRecord(rawPromptCacheKey)) return undefined;
+  if (rawPromptCacheKey !== undefined && !asRecord(rawPromptCacheKey))
+    return undefined;
   const promptCacheKey = asRecord(rawPromptCacheKey);
-  if (promptCacheKey && Object.keys(promptCacheKey).some((key) => key !== "omit")) return undefined;
+  if (
+    promptCacheKey &&
+    Object.keys(promptCacheKey).some((key) => key !== "omit")
+  )
+    return undefined;
   const omit = promptCacheKey?.omit;
-  if (omit !== undefined && (!Array.isArray(omit) || omit.some((value): value is string => !isNonEmptyString(value)))) return undefined;
+  if (
+    omit !== undefined &&
+    (!Array.isArray(omit) ||
+      omit.some((value): value is string => !isNonEmptyString(value)))
+  )
+    return undefined;
   const stringOmit = omit as string[] | undefined;
-  const uniqueOmit = stringOmit ? [...new Set(stringOmit.map((value) => value.trim()))].sort() : undefined;
+  const uniqueOmit = stringOmit
+    ? [...new Set(stringOmit.map((value) => value.trim()))].sort()
+    : undefined;
+  const promptCacheKeyPart =
+    uniqueOmit && uniqueOmit.length > 0
+      ? { promptCacheKey: { omit: uniqueOmit } }
+      : {};
+  if (record.version === 2) {
+    return {
+      version: 2,
+      ...(footerMode ? { footerMode } : {}),
+      ...promptCacheKeyPart,
+    };
+  }
+
+  const retention = parseCacheRetentionMode(record.retention);
+  if (record.retention !== undefined && !retention) return undefined;
+  const toggles: Partial<PersistedCacheOptimizerConfigV3> = {};
+  for (const key of CACHE_OPTIMIZER_CONFIG_TOGGLE_KEYS) {
+    const raw = record[key];
+    if (raw === undefined) continue;
+    if (typeof raw !== "boolean") return undefined;
+    toggles[key] = raw;
+  }
   return {
-    version: 2,
+    version: 3,
     ...(footerMode ? { footerMode } : {}),
-    ...(uniqueOmit && uniqueOmit.length > 0 ? { promptCacheKey: { omit: uniqueOmit } } : {}),
+    ...promptCacheKeyPart,
+    ...(retention ? { retention } : {}),
+    ...toggles,
   };
 }
 
-function normalizePersistedCacheOptimizerConfig(value: PersistedCacheOptimizerConfig | undefined): PersistedCacheOptimizerConfigV2 {
+function normalizePersistedCacheOptimizerConfig(
+  value: PersistedCacheOptimizerConfig | undefined,
+): RuntimeCacheOptimizerConfig {
   if (!value) return { version: 2 };
-  return value.version === 2
-    ? value
-    : { version: 2, ...(value.footerMode ? { footerMode: value.footerMode } : {}) };
+  if (value.version === 2 || value.version === 3) return value;
+  return {
+    version: 2,
+    ...(value.footerMode ? { footerMode: value.footerMode } : {}),
+  };
 }
 
-function readPersistedCacheOptimizerConfig(configPath: string = CONFIG_FILE_PATH): PersistedCacheOptimizerConfigV2 {
+/** Lift any runtime config (v2 or v3) to the v3 key surface for reads/writes. */
+function asV3CacheOptimizerConfig(
+  config: RuntimeCacheOptimizerConfig | undefined,
+): PersistedCacheOptimizerConfigV3 {
+  if (!config) return { version: 3 };
+  if (config.version === 3) return config;
+  return { ...config, version: 3 };
+}
+
+function cacheOptimizerConfigHasV3Keys(
+  config: PersistedCacheOptimizerConfigV3,
+): boolean {
+  return (
+    config.retention !== undefined ||
+    CACHE_OPTIMIZER_CONFIG_TOGGLE_KEYS.some((key) => config[key] !== undefined)
+  );
+}
+
+/** Serialize in the oldest schema that can represent the config: v2 unless v3 keys exist. */
+function persistedConfigWriteShape(
+  config: PersistedCacheOptimizerConfigV3,
+): RuntimeCacheOptimizerConfig {
+  if (!cacheOptimizerConfigHasV3Keys(config)) {
+    return {
+      version: 2,
+      ...(config.footerMode ? { footerMode: config.footerMode } : {}),
+      ...(config.promptCacheKey?.omit?.length
+        ? { promptCacheKey: { omit: config.promptCacheKey.omit } }
+        : {}),
+    };
+  }
+  return config;
+}
+
+function readPersistedCacheOptimizerConfig(
+  configPath: string = CONFIG_FILE_PATH,
+): RuntimeCacheOptimizerConfig {
   try {
-    return normalizePersistedCacheOptimizerConfig(parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8"))));
+    const parsed = parsePersistedCacheOptimizerConfig(
+      JSON.parse(readFileSync(configPath, "utf8")),
+    );
+    if (!parsed) {
+      // Readable + valid JSON but schema-rejected (unknown key / invalid
+      // value): surface it instead of silently steering back to defaults —
+      // a typo'd retention value must not quietly re-enable `long`.
+      console.warn(
+        `${LOG_PREFIX}: optimizer config schema rejected (unknown keys or invalid values); using defaults`,
+      );
+      return { version: 2 };
+    }
+    return normalizePersistedCacheOptimizerConfig(parsed);
   } catch (error) {
-    if (getErrorCode(error) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to read optimizer config; using defaults`, error);
+    if (getErrorCode(error) !== "ENOENT")
+      console.warn(
+        `${LOG_PREFIX}: failed to read optimizer config; using defaults`,
+        error,
+      );
     return { version: 2 };
   }
 }
 
-function readPersistedFooterMode(configPath: string = CONFIG_FILE_PATH): FooterStatsMode | undefined {
+function readPersistedFooterMode(
+  configPath: string = CONFIG_FILE_PATH,
+): FooterStatsMode | undefined {
   return readPersistedCacheOptimizerConfig(configPath).footerMode;
 }
 
 async function writePersistedCacheOptimizerConfigUnlocked(
-  config: PersistedCacheOptimizerConfigV2,
+  config: RuntimeCacheOptimizerConfig,
   configPath: string,
 ): Promise<void> {
   await mkdir(dirname(configPath), { recursive: true });
-  const payloadText = JSON.stringify(normalizePersistedCacheOptimizerConfig(config), null, 2) + "\n";
+  const payloadText =
+    JSON.stringify(
+      persistedConfigWriteShape(
+        asV3CacheOptimizerConfig(
+          normalizePersistedCacheOptimizerConfig(config),
+        ),
+      ),
+      null,
+      2,
+    ) + "\n";
   let targetInfo: Awaited<ReturnType<typeof lstat>> | undefined;
   let targetMode = 0o600;
   let targetHash: string | undefined;
   try {
     targetInfo = await lstat(configPath);
-    if (targetInfo.isSymbolicLink() || !targetInfo.isFile()) throw new Error("optimizer config is not a regular file; no changes were made");
+    if (targetInfo.isSymbolicLink() || !targetInfo.isFile())
+      throw new Error(
+        "optimizer config is not a regular file; no changes were made",
+      );
     const targetText = await readFile(configPath, "utf8");
     targetMode = targetInfo.mode & 0o7777;
     targetHash = hashText(targetText);
@@ -2039,95 +2728,236 @@ async function writePersistedCacheOptimizerConfigUnlocked(
     if (getErrorCode(error) !== "ENOENT") throw error;
   }
   if (targetInfo) {
-    await atomicReplaceTextFilePreservingMode(configPath, payloadText, targetMode, "config", {
-      identity: targetInfo,
-      hash: targetHash,
-      mode: targetMode,
-    });
+    await atomicReplaceTextFilePreservingMode(
+      configPath,
+      payloadText,
+      targetMode,
+      "config",
+      {
+        identity: targetInfo,
+        hash: targetHash,
+        mode: targetMode,
+      },
+    );
     return;
   }
 
-  await atomicCreateTextFileNoReplace(configPath, payloadText, targetMode, "config");
+  await atomicCreateTextFileNoReplace(
+    configPath,
+    payloadText,
+    targetMode,
+    "config",
+  );
 }
 
 async function writePersistedCacheOptimizerConfig(
-  config: PersistedCacheOptimizerConfigV2,
+  config: RuntimeCacheOptimizerConfig,
   configPath: string = CONFIG_FILE_PATH,
 ): Promise<void> {
-  await withModelsJsonTransactionLock(() => writePersistedCacheOptimizerConfigUnlocked(config, configPath));
+  await withModelsJsonTransactionLock(() =>
+    writePersistedCacheOptimizerConfigUnlocked(config, configPath),
+  );
 }
 
 async function writePersistedFooterModeUnlocked(
   mode: FooterStatsMode,
   configPath: string,
 ): Promise<void> {
-  let version: 1 | 2 = 1;
+  let version: 1 | 2 | 3 = 1;
   let raw: PersistedCacheOptimizerConfig | undefined;
   let targetExists = false;
   try {
-    raw = parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8")));
+    raw = parsePersistedCacheOptimizerConfig(
+      JSON.parse(readFileSync(configPath, "utf8")),
+    );
     targetExists = true;
     if (!raw) throw new Error("invalid footer config schema");
-    version = raw.version === 2 ? 2 : 1;
+    version = raw.version === 2 ? 2 : raw.version === 3 ? 3 : 1;
   } catch (error) {
-    if (getErrorCode(error) !== "ENOENT") throw new Error("invalid footer config schema");
+    if (getErrorCode(error) !== "ENOENT")
+      throw new Error("invalid footer config schema");
   }
   const current = normalizePersistedCacheOptimizerConfig(raw);
   if (version === 1 && !current.promptCacheKey) {
     await mkdir(dirname(configPath), { recursive: true });
     const targetInfo = targetExists ? await lstat(configPath) : undefined;
-    if (targetInfo && (targetInfo.isSymbolicLink() || !targetInfo.isFile())) throw new Error("optimizer config is not a regular file; no changes were made");
-    const targetText = targetInfo ? await readFile(configPath, "utf8") : undefined;
+    if (targetInfo && (targetInfo.isSymbolicLink() || !targetInfo.isFile()))
+      throw new Error(
+        "optimizer config is not a regular file; no changes were made",
+      );
+    const targetText = targetInfo
+      ? await readFile(configPath, "utf8")
+      : undefined;
     const targetMode = targetInfo ? targetInfo.mode & 0o7777 : 0o600;
-    const footerText = JSON.stringify({ version: 1, footerMode: mode }, null, 2) + "\n";
+    const footerText =
+      JSON.stringify({ version: 1, footerMode: mode }, null, 2) + "\n";
     if (targetInfo && targetText !== undefined) {
-      await atomicReplaceTextFilePreservingMode(configPath, footerText, targetMode, "config-footer", {
-        identity: targetInfo,
-        hash: hashText(targetText),
-        mode: targetMode,
-      });
+      await atomicReplaceTextFilePreservingMode(
+        configPath,
+        footerText,
+        targetMode,
+        "config-footer",
+        {
+          identity: targetInfo,
+          hash: hashText(targetText),
+          mode: targetMode,
+        },
+      );
     } else {
-      await atomicCreateTextFileNoReplace(configPath, footerText, targetMode, "config-footer");
+      await atomicCreateTextFileNoReplace(
+        configPath,
+        footerText,
+        targetMode,
+        "config-footer",
+      );
     }
     return;
   }
-  await writePersistedCacheOptimizerConfigUnlocked({ ...current, version: 2, footerMode: mode }, configPath);
+  await writePersistedCacheOptimizerConfigUnlocked(
+    { ...asV3CacheOptimizerConfig(current), footerMode: mode },
+    configPath,
+  );
+}
+
+async function writePersistedRetentionUnlocked(
+  mode: CacheRetentionMode,
+  configPath: string,
+): Promise<void> {
+  let raw: PersistedCacheOptimizerConfig | undefined;
+  try {
+    raw = parsePersistedCacheOptimizerConfig(
+      JSON.parse(readFileSync(configPath, "utf8")),
+    );
+    if (!raw) throw new Error("invalid optimizer config schema");
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT")
+      throw new Error("invalid optimizer config schema");
+  }
+  await writePersistedCacheOptimizerConfigUnlocked(
+    {
+      ...asV3CacheOptimizerConfig(normalizePersistedCacheOptimizerConfig(raw)),
+      retention: mode,
+    },
+    configPath,
+  );
+}
+
+async function writePersistedRetention(
+  mode: CacheRetentionMode,
+  configPath: string = CONFIG_FILE_PATH,
+): Promise<void> {
+  await withModelsJsonTransactionLock(() =>
+    writePersistedRetentionUnlocked(mode, configPath),
+  );
 }
 
 async function writePersistedFooterMode(
   mode: FooterStatsMode,
   configPath: string = CONFIG_FILE_PATH,
 ): Promise<void> {
-  await withModelsJsonTransactionLock(() => writePersistedFooterModeUnlocked(mode, configPath));
+  await withModelsJsonTransactionLock(() =>
+    writePersistedFooterModeUnlocked(mode, configPath),
+  );
 }
 
-function configReceiptBackupPath(receipt: PromptCacheKeyConfigReceipt, receiptPath: string = CONFIG_RECEIPT_PATH): string {
+function configReceiptBackupPath(
+  receipt: PromptCacheKeyConfigReceipt,
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): string {
   return join(dirname(receiptPath), receipt.backupFile);
 }
 
-function parsePromptCacheKeyConfigReceipt(value: unknown): PromptCacheKeyConfigReceipt | undefined {
+function parsePromptCacheKeyConfigReceipt(
+  value: unknown,
+): PromptCacheKeyConfigReceipt | undefined {
   const record = asRecord(value);
-  if (!record || (record.version !== 1 && record.version !== 2) || record.kind !== "pi-cache-optimizer-config-receipt") return undefined;
-  const allowed = new Set(record.version === 1
-    ? ["version", "kind", "transactionId", "provider", "modelId", "beforeHash", "afterHash", "backupFile", "targetExistedBefore", "createdAt", "appliedAt", "status", "rolledBackAt"]
-    : ["version", "kind", "transactionId", "provider", "modelId", "beforeHash", "afterHash", "backupFile", "targetExistedBefore", "targetHadModelKey", "addedModelKey", "createdAt", "appliedAt", "status", "rolledBackAt"]);
+  if (
+    !record ||
+    (record.version !== 1 && record.version !== 2) ||
+    record.kind !== "pi-cache-optimizer-config-receipt"
+  )
+    return undefined;
+  const allowed = new Set(
+    record.version === 1
+      ? [
+          "version",
+          "kind",
+          "transactionId",
+          "provider",
+          "modelId",
+          "beforeHash",
+          "afterHash",
+          "backupFile",
+          "targetExistedBefore",
+          "createdAt",
+          "appliedAt",
+          "status",
+          "rolledBackAt",
+        ]
+      : [
+          "version",
+          "kind",
+          "transactionId",
+          "provider",
+          "modelId",
+          "beforeHash",
+          "afterHash",
+          "backupFile",
+          "targetExistedBefore",
+          "targetHadModelKey",
+          "addedModelKey",
+          "createdAt",
+          "appliedAt",
+          "status",
+          "rolledBackAt",
+        ],
+  );
   if (Object.keys(record).some((key) => !allowed.has(key))) return undefined;
-  if (![record.transactionId, record.provider, record.modelId].every(isSafeReceiptText)) return undefined;
-  if (!isSha256(record.beforeHash) || !isSha256(record.afterHash) || record.beforeHash === record.afterHash) return undefined;
-  if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || !record.backupFile.startsWith("pi-cache-optimizer-config.backup-")) return undefined;
+  if (
+    ![record.transactionId, record.provider, record.modelId].every(
+      isSafeReceiptText,
+    )
+  )
+    return undefined;
+  if (
+    !isSha256(record.beforeHash) ||
+    !isSha256(record.afterHash) ||
+    record.beforeHash === record.afterHash
+  )
+    return undefined;
+  if (
+    !isSafeReceiptText(record.backupFile) ||
+    basename(record.backupFile) !== record.backupFile ||
+    !record.backupFile.startsWith("pi-cache-optimizer-config.backup-")
+  )
+    return undefined;
   if (
     typeof record.targetExistedBefore !== "boolean" ||
     !isReceiptTimestamp(record.createdAt) ||
     !isReceiptTimestamp(record.appliedAt) ||
     record.appliedAt < record.createdAt
-  ) return undefined;
+  )
+    return undefined;
   const addedModelKey = `${record.provider}/${record.modelId}`;
-  const targetHadModelKey = record.version === 1 ? false : record.targetHadModelKey;
+  const targetHadModelKey =
+    record.version === 1 ? false : record.targetHadModelKey;
   if (typeof targetHadModelKey !== "boolean") return undefined;
-  if (record.version === 2 && (!isSafeReceiptText(record.addedModelKey) || record.addedModelKey !== addedModelKey)) return undefined;
-  if (record.status !== undefined && record.status !== "rolled_back") return undefined;
-  if (record.status === "rolled_back" && (!isReceiptTimestamp(record.rolledBackAt) || record.rolledBackAt < record.appliedAt)) return undefined;
-  if (record.status === undefined && record.rolledBackAt !== undefined) return undefined;
+  if (
+    record.version === 2 &&
+    (!isSafeReceiptText(record.addedModelKey) ||
+      record.addedModelKey !== addedModelKey)
+  )
+    return undefined;
+  if (record.status !== undefined && record.status !== "rolled_back")
+    return undefined;
+  if (
+    record.status === "rolled_back" &&
+    (!isReceiptTimestamp(record.rolledBackAt) ||
+      record.rolledBackAt < record.appliedAt)
+  )
+    return undefined;
+  if (record.status === undefined && record.rolledBackAt !== undefined)
+    return undefined;
   return {
     version: 2,
     kind: "pi-cache-optimizer-config-receipt",
@@ -2142,11 +2972,15 @@ function parsePromptCacheKeyConfigReceipt(value: unknown): PromptCacheKeyConfigR
     addedModelKey,
     createdAt: Number(record.createdAt),
     appliedAt: Number(record.appliedAt),
-    ...(record.status === "rolled_back" ? { status: "rolled_back", rolledBackAt: Number(record.rolledBackAt) } : {}),
+    ...(record.status === "rolled_back"
+      ? { status: "rolled_back", rolledBackAt: Number(record.rolledBackAt) }
+      : {}),
   };
 }
 
-function isActionablePromptCacheKeyConfigReceipt(receipt: PromptCacheKeyConfigReceipt | undefined): receipt is PromptCacheKeyConfigReceipt {
+function isActionablePromptCacheKeyConfigReceipt(
+  receipt: PromptCacheKeyConfigReceipt | undefined,
+): receipt is PromptCacheKeyConfigReceipt {
   return receipt !== undefined && receipt.status === undefined;
 }
 
@@ -2154,8 +2988,14 @@ async function assertPromptCacheKeyConfigReceiptSnapshotUnchanged(
   snapshot: PromptCacheKeyConfigReceiptSnapshot,
 ): Promise<void> {
   const info = await lstat(snapshot.receiptPath);
-  if (info.isSymbolicLink() || !info.isFile() || !sameFileIdentity(snapshot.identity, info)) {
-    throw new Error("prompt-cache-key receipt changed since the rollback preview");
+  if (
+    info.isSymbolicLink() ||
+    !info.isFile() ||
+    !sameFileIdentity(snapshot.identity, info)
+  ) {
+    throw new Error(
+      "prompt-cache-key receipt changed since the rollback preview",
+    );
   }
   const text = await readFile(snapshot.receiptPath, "utf8");
   const afterRead = await lstat(snapshot.receiptPath);
@@ -2165,7 +3005,9 @@ async function assertPromptCacheKeyConfigReceiptSnapshotUnchanged(
     !sameFileIdentity(info, afterRead) ||
     hashText(text) !== snapshot.hash
   ) {
-    throw new Error("prompt-cache-key receipt changed since the rollback preview");
+    throw new Error(
+      "prompt-cache-key receipt changed since the rollback preview",
+    );
   }
 }
 
@@ -2177,7 +3019,12 @@ async function readPromptCacheKeyConfigReceiptSnapshot(
     if (info.isSymbolicLink() || !info.isFile()) return undefined;
     const text = await readFile(receiptPath, "utf8");
     const afterRead = await lstat(receiptPath);
-    if (afterRead.isSymbolicLink() || !afterRead.isFile() || !sameFileIdentity(info, afterRead)) return undefined;
+    if (
+      afterRead.isSymbolicLink() ||
+      !afterRead.isFile() ||
+      !sameFileIdentity(info, afterRead)
+    )
+      return undefined;
     const receipt = parsePromptCacheKeyConfigReceipt(JSON.parse(text));
     if (!receipt) return undefined;
     return { receipt, receiptPath, hash: hashText(text), identity: afterRead };
@@ -2186,7 +3033,9 @@ async function readPromptCacheKeyConfigReceiptSnapshot(
   }
 }
 
-async function readPromptCacheKeyConfigReceipt(receiptPath: string = CONFIG_RECEIPT_PATH): Promise<PromptCacheKeyConfigReceipt | undefined> {
+async function readPromptCacheKeyConfigReceipt(
+  receiptPath: string = CONFIG_RECEIPT_PATH,
+): Promise<PromptCacheKeyConfigReceipt | undefined> {
   return (await readPromptCacheKeyConfigReceiptSnapshot(receiptPath))?.receipt;
 }
 
@@ -2197,36 +3046,58 @@ async function writePromptCacheKeyConfigReceipt(
   /** Test-only race injector; production callers leave this undefined. */
   beforeRename?: () => Promise<void>,
 ): Promise<void> {
-  if (!parsePromptCacheKeyConfigReceipt(receipt)) throw new Error("invalid prompt cache key config receipt");
-  if (expectedSnapshot?.receiptPath !== undefined && expectedSnapshot.receiptPath !== receiptPath) {
-    throw new Error("prompt-cache-key receipt path changed since the rollback preview");
+  if (!parsePromptCacheKeyConfigReceipt(receipt))
+    throw new Error("invalid prompt cache key config receipt");
+  if (
+    expectedSnapshot?.receiptPath !== undefined &&
+    expectedSnapshot.receiptPath !== receiptPath
+  ) {
+    throw new Error(
+      "prompt-cache-key receipt path changed since the rollback preview",
+    );
   }
-  if (expectedSnapshot) await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(expectedSnapshot);
+  if (expectedSnapshot)
+    await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(expectedSnapshot);
   await mkdir(dirname(receiptPath), { recursive: true });
   let existingReceiptInfo: Awaited<ReturnType<typeof lstat>> | undefined;
   try {
     const info = await lstat(receiptPath);
-    if (info.isSymbolicLink() || !info.isFile()) throw new Error("invalid prompt-cache-key receipt path");
+    if (info.isSymbolicLink() || !info.isFile())
+      throw new Error("invalid prompt-cache-key receipt path");
     existingReceiptInfo = info;
   } catch (error) {
     if (getErrorCode(error) !== "ENOENT") throw error;
   }
   const tempPath = uniqueTempPath(receiptPath, "config-receipt");
   try {
-    await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
     const tempInfo = await lstat(tempPath);
-    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) throw new Error("invalid temporary prompt-cache-key receipt");
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile())
+      throw new Error("invalid temporary prompt-cache-key receipt");
     await chmod(tempPath, 0o600);
     const assertDestinationUnchanged = async (): Promise<void> => {
       try {
         const currentInfo = await lstat(receiptPath);
-        if (!existingReceiptInfo || !sameFileIdentity(existingReceiptInfo, currentInfo)) {
-          throw new Error("prompt-cache-key receipt changed during atomic write");
+        if (
+          !existingReceiptInfo ||
+          !sameFileIdentity(existingReceiptInfo, currentInfo)
+        ) {
+          throw new Error(
+            "prompt-cache-key receipt changed during atomic write",
+          );
         }
       } catch (error) {
-        if (getErrorCode(error) !== "ENOENT" || existingReceiptInfo) throw error;
+        if (getErrorCode(error) !== "ENOENT" || existingReceiptInfo)
+          throw error;
       }
-      if (expectedSnapshot) await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(expectedSnapshot);
+      if (expectedSnapshot)
+        await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(
+          expectedSnapshot,
+        );
     };
     await assertDestinationUnchanged();
     if (beforeRename) await beforeRename();
@@ -2236,11 +3107,20 @@ async function writePromptCacheKeyConfigReceipt(
     } else {
       await link(tempPath, receiptPath);
       await unlink(tempPath).catch((cleanupError) => {
-        console.warn(`${LOG_PREFIX}: committed prompt-cache-key receipt but failed to remove its temporary hard link`, cleanupError);
+        console.warn(
+          `${LOG_PREFIX}: committed prompt-cache-key receipt but failed to remove its temporary hard link`,
+          cleanupError,
+        );
       });
     }
   } catch (error) {
-    await unlink(tempPath).catch((cleanupError) => { if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary config receipt`, cleanupError); });
+    await unlink(tempPath).catch((cleanupError) => {
+      if (getErrorCode(cleanupError) !== "ENOENT")
+        console.warn(
+          `${LOG_PREFIX}: failed to remove temporary config receipt`,
+          cleanupError,
+        );
+    });
     throw error;
   }
 }
@@ -2256,26 +3136,40 @@ async function applyPromptCacheKeyConfigFixUnderLock(
   let mode = 0o600;
   try {
     const info = await lstat(configPath);
-    if (info.isSymbolicLink() || !info.isFile()) throw new Error("optimizer config is not a regular file; no changes were made");
+    if (info.isSymbolicLink() || !info.isFile())
+      throw new Error(
+        "optimizer config is not a regular file; no changes were made",
+      );
     originalText = await readFile(configPath, "utf8");
     targetExistedBefore = true;
     mode = info.mode & 0o7777;
   } catch (error) {
     if (getErrorCode(error) !== "ENOENT") throw error;
   }
-  const parsedCurrent = targetExistedBefore ? parsePersistedCacheOptimizerConfig(JSON.parse(originalText)) : undefined;
-  if (targetExistedBefore && !parsedCurrent) throw new Error("optimizer config is invalid; no changes were made");
+  const parsedCurrent = targetExistedBefore
+    ? parsePersistedCacheOptimizerConfig(JSON.parse(originalText))
+    : undefined;
+  if (targetExistedBefore && !parsedCurrent)
+    throw new Error("optimizer config is invalid; no changes were made");
   const current = normalizePersistedCacheOptimizerConfig(parsedCurrent);
   const key = modelKey(model);
   const existingOmit = current.promptCacheKey?.omit ?? [];
   const targetHadModelKey = existingOmit.includes(key);
-  if (targetHadModelKey) throw new Error("prompt-cache-key is already configured; no changes were made");
+  if (targetHadModelKey)
+    throw new Error(
+      "prompt-cache-key is already configured; no changes were made",
+    );
   const omit = [...new Set([...existingOmit, key])].sort();
-  const next: PersistedCacheOptimizerConfigV2 = { ...current, version: 2, promptCacheKey: { omit } };
+  const next = persistedConfigWriteShape({
+    ...asV3CacheOptimizerConfig(current),
+    promptCacheKey: { omit },
+  });
   const modifiedText = JSON.stringify(next, null, 2) + "\n";
   const beforeHash = hashText(originalText);
   const afterHash = hashText(modifiedText);
-  const originalInfo = targetExistedBefore ? await lstat(configPath) : undefined;
+  const originalInfo = targetExistedBefore
+    ? await lstat(configPath)
+    : undefined;
   const backupFile = `pi-cache-optimizer-config.backup-${backupTimestamp()}`;
   const backupPath = join(dirname(configPath), backupFile);
   if (targetExistedBefore) {
@@ -2285,14 +3179,24 @@ async function applyPromptCacheKeyConfigFixUnderLock(
   const tempPath = uniqueTempPath(configPath, "config-fix");
   let committedInfo: Awaited<ReturnType<typeof lstat>> | undefined;
   try {
-    await writeFile(tempPath, modifiedText, { encoding: "utf8", mode, flag: "wx" });
+    await writeFile(tempPath, modifiedText, {
+      encoding: "utf8",
+      mode,
+      flag: "wx",
+    });
     await chmod(tempPath, mode);
     if (originalInfo) {
-      await validateAtomicTarget(configPath, { identity: originalInfo, hash: beforeHash, mode });
+      await validateAtomicTarget(configPath, {
+        identity: originalInfo,
+        hash: beforeHash,
+        mode,
+      });
     } else {
       try {
         await lstat(configPath);
-        throw new Error("optimizer config appeared during the fix; no changes were made");
+        throw new Error(
+          "optimizer config appeared during the fix; no changes were made",
+        );
       } catch (error) {
         if (getErrorCode(error) !== "ENOENT") throw error;
       }
@@ -2307,7 +3211,10 @@ async function applyPromptCacheKeyConfigFixUnderLock(
       await link(tempPath, configPath);
       committedInfo = await lstat(configPath);
       await unlink(tempPath).catch((cleanupError) => {
-        console.warn(`${LOG_PREFIX}: committed optimizer config but failed to remove its temporary hard link`, cleanupError);
+        console.warn(
+          `${LOG_PREFIX}: committed optimizer config but failed to remove its temporary hard link`,
+          cleanupError,
+        );
       });
     }
     const receipt: PromptCacheKeyConfigReceipt = {
@@ -2331,15 +3238,29 @@ async function applyPromptCacheKeyConfigFixUnderLock(
     await unlink(tempPath).catch(() => {});
     try {
       if (targetExistedBefore && committedInfo) {
-        await atomicRestoreFileFromBackup(backupPath, configPath, mode, { identity: committedInfo, hash: afterHash, mode });
+        await atomicRestoreFileFromBackup(backupPath, configPath, mode, {
+          identity: committedInfo,
+          hash: afterHash,
+          mode,
+        });
       } else if (!targetExistedBefore && committedInfo) {
-        await validateAtomicTarget(configPath, { identity: committedInfo, hash: afterHash, mode });
+        await validateAtomicTarget(configPath, {
+          identity: committedInfo,
+          hash: afterHash,
+          mode,
+        });
         await unlink(configPath);
       }
     } catch (compensationError) {
-      const writeMessage = error instanceof Error ? error.message : String(error);
-      const compensationMessage = compensationError instanceof Error ? compensationError.message : String(compensationError);
-      throw new Error(`prompt-cache-key fix receipt update failed (${writeMessage}) and config compensation failed (${compensationMessage})`);
+      const writeMessage =
+        error instanceof Error ? error.message : String(error);
+      const compensationMessage =
+        compensationError instanceof Error
+          ? compensationError.message
+          : String(compensationError);
+      throw new Error(
+        `prompt-cache-key fix receipt update failed (${writeMessage}) and config compensation failed (${compensationMessage})`,
+      );
     }
     throw error;
   }
@@ -2350,7 +3271,9 @@ async function applyPromptCacheKeyConfigFix(
   configPath: string = CONFIG_FILE_PATH,
   receiptPath: string = CONFIG_RECEIPT_PATH,
 ): Promise<{ receipt: PromptCacheKeyConfigReceipt; backupPath: string }> {
-  return withModelsJsonTransactionLock(() => applyPromptCacheKeyConfigFixUnderLock(model, configPath, receiptPath));
+  return withModelsJsonTransactionLock(() =>
+    applyPromptCacheKeyConfigFixUnderLock(model, configPath, receiptPath),
+  );
 }
 
 type PromptCacheKeyRollbackOptions = {
@@ -2364,22 +3287,46 @@ async function rollbackPromptCacheKeyConfigUnderLock(
   receiptPath: string = CONFIG_RECEIPT_PATH,
   options: PromptCacheKeyRollbackOptions = {},
 ): Promise<void> {
-  if (snapshot.receiptPath !== receiptPath) throw new Error("prompt-cache-key receipt path changed since the rollback preview");
+  if (snapshot.receiptPath !== receiptPath)
+    throw new Error(
+      "prompt-cache-key receipt path changed since the rollback preview",
+    );
   await assertPromptCacheKeyConfigReceiptSnapshotUnchanged(snapshot);
   const receipt = snapshot.receipt;
   const currentInfo = await lstat(configPath);
-  if (currentInfo.isSymbolicLink() || !currentInfo.isFile()) throw new Error("optimizer config is not a regular file; refusing to overwrite user changes");
+  if (currentInfo.isSymbolicLink() || !currentInfo.isFile())
+    throw new Error(
+      "optimizer config is not a regular file; refusing to overwrite user changes",
+    );
   const currentText = await readFile(configPath, "utf8");
   const currentHash = hashText(currentText);
   const currentMode = currentInfo.mode & 0o7777;
-  if (currentHash !== receipt.afterHash) throw new Error("optimizer config changed after the fix; refusing to overwrite user changes");
+  if (currentHash !== receipt.afterHash)
+    throw new Error(
+      "optimizer config changed after the fix; refusing to overwrite user changes",
+    );
   const current = parsePersistedCacheOptimizerConfig(JSON.parse(currentText));
-  if (!current) throw new Error("optimizer config is invalid; refusing to overwrite user changes");
+  if (!current)
+    throw new Error(
+      "optimizer config is invalid; refusing to overwrite user changes",
+    );
   const key = `${receipt.provider}/${receipt.modelId}`;
-  if (receipt.addedModelKey !== key) throw new Error("prompt-cache-key receipt identity does not match; refusing to change user config");
-  if (receipt.targetHadModelKey) throw new Error("prompt-cache-key was already configured before this fix; refusing to remove user configuration");
-  const omit = current.version === 2 ? current.promptCacheKey?.omit ?? [] : [];
-  if (!omit.includes(receipt.addedModelKey)) throw new Error("prompt-cache-key opt-out is no longer present; refusing to change user config");
+  if (receipt.addedModelKey !== key)
+    throw new Error(
+      "prompt-cache-key receipt identity does not match; refusing to change user config",
+    );
+  if (receipt.targetHadModelKey)
+    throw new Error(
+      "prompt-cache-key was already configured before this fix; refusing to remove user configuration",
+    );
+  const omit =
+    current.version === 2 || current.version === 3
+      ? (current.promptCacheKey?.omit ?? [])
+      : [];
+  if (!omit.includes(receipt.addedModelKey))
+    throw new Error(
+      "prompt-cache-key opt-out is no longer present; refusing to change user config",
+    );
 
   let rollbackResultText: string | undefined;
   let rollbackResultMode: number | undefined;
@@ -2387,24 +3334,40 @@ async function rollbackPromptCacheKeyConfigUnderLock(
   const backupPath = configReceiptBackupPath(receipt, receiptPath);
   if (receipt.targetExistedBefore) {
     const backupInfo = await lstat(backupPath);
-    if (backupInfo.isSymbolicLink() || !backupInfo.isFile()) throw new Error("config backup is not a regular file");
+    if (backupInfo.isSymbolicLink() || !backupInfo.isFile())
+      throw new Error("config backup is not a regular file");
     const backupText = await readFile(backupPath, "utf8");
-    if (hashText(backupText) !== receipt.beforeHash) throw new Error("config backup hash does not match the fix receipt");
+    if (hashText(backupText) !== receipt.beforeHash)
+      throw new Error("config backup hash does not match the fix receipt");
     rollbackResultText = backupText;
     rollbackResultMode = backupInfo.mode & 0o7777;
     await atomicRestoreFileFromBackup(
       backupPath,
       configPath,
       rollbackResultMode,
-      { backupHash: receipt.beforeHash, identity: currentInfo, hash: currentHash, mode: currentMode },
+      {
+        backupHash: receipt.beforeHash,
+        identity: currentInfo,
+        hash: currentHash,
+        mode: currentMode,
+      },
     );
     rollbackResultInfo = await lstat(configPath);
-  } else if (current.footerMode || omit.length > 1) {
-    const restored: PersistedCacheOptimizerConfigV2 = {
-      version: 2,
-      ...(current.footerMode ? { footerMode: current.footerMode } : {}),
-      ...(omit.length > 1 ? { promptCacheKey: { omit: omit.filter((item) => item !== receipt.addedModelKey) } } : {}),
-    };
+  } else if (
+    current.footerMode ||
+    omit.length > 1 ||
+    (current.version === 3 && cacheOptimizerConfigHasV3Keys(current))
+  ) {
+    const restored = persistedConfigWriteShape({
+      ...asV3CacheOptimizerConfig(
+        normalizePersistedCacheOptimizerConfig(current),
+      ),
+      footerMode: current.footerMode,
+      promptCacheKey:
+        omit.length > 1
+          ? { omit: omit.filter((item) => item !== receipt.addedModelKey) }
+          : undefined,
+    });
     rollbackResultText = JSON.stringify(restored, null, 2) + "\n";
     rollbackResultMode = currentMode;
     await atomicReplaceTextFilePreservingMode(
@@ -2416,7 +3379,11 @@ async function rollbackPromptCacheKeyConfigUnderLock(
     );
     rollbackResultInfo = await lstat(configPath);
   } else {
-    await validateAtomicTarget(configPath, { identity: currentInfo, hash: currentHash, mode: currentMode });
+    await validateAtomicTarget(configPath, {
+      identity: currentInfo,
+      hash: currentHash,
+      mode: currentMode,
+    });
     await unlink(configPath);
   }
 
@@ -2433,9 +3400,15 @@ async function rollbackPromptCacheKeyConfigUnderLock(
     // actionable receipt paired with an already-rolled-back file.
     try {
       if (rollbackResultText === undefined) {
-        await atomicCreateTextFileNoReplace(configPath, currentText, currentMode, "config-rollback-compensation");
+        await atomicCreateTextFileNoReplace(
+          configPath,
+          currentText,
+          currentMode,
+          "config-rollback-compensation",
+        );
       } else {
-        if (!rollbackResultInfo || rollbackResultMode === undefined) throw new Error("missing rollback result guard");
+        if (!rollbackResultInfo || rollbackResultMode === undefined)
+          throw new Error("missing rollback result guard");
         await atomicReplaceTextFilePreservingMode(
           configPath,
           currentText,
@@ -2449,9 +3422,17 @@ async function rollbackPromptCacheKeyConfigUnderLock(
         );
       }
     } catch (compensationError) {
-      const receiptMessage = receiptError instanceof Error ? receiptError.message : String(receiptError);
-      const compensationMessage = compensationError instanceof Error ? compensationError.message : String(compensationError);
-      throw new Error(`prompt-cache-key rollback receipt update failed (${receiptMessage}) and config compensation failed (${compensationMessage})`);
+      const receiptMessage =
+        receiptError instanceof Error
+          ? receiptError.message
+          : String(receiptError);
+      const compensationMessage =
+        compensationError instanceof Error
+          ? compensationError.message
+          : String(compensationError);
+      throw new Error(
+        `prompt-cache-key rollback receipt update failed (${receiptMessage}) and config compensation failed (${compensationMessage})`,
+      );
     }
     throw receiptError;
   }
@@ -2463,7 +3444,14 @@ async function rollbackPromptCacheKeyConfig(
   receiptPath: string = CONFIG_RECEIPT_PATH,
   options: PromptCacheKeyRollbackOptions = {},
 ): Promise<void> {
-  return withModelsJsonTransactionLock(() => rollbackPromptCacheKeyConfigUnderLock(snapshot, configPath, receiptPath, options));
+  return withModelsJsonTransactionLock(() =>
+    rollbackPromptCacheKeyConfigUnderLock(
+      snapshot,
+      configPath,
+      receiptPath,
+      options,
+    ),
+  );
 }
 
 function resolveFooterStatsMode(
@@ -2472,7 +3460,9 @@ function resolveFooterStatsMode(
 ): { mode: FooterStatsMode; source: FooterStatsModeSource } {
   if (configuredMode) return { mode: configuredMode, source: "config" };
   const envMode = parseFooterStatsMode(env[FOOTER_MODE_ENV]);
-  return envMode ? { mode: envMode, source: "env" } : { mode: "session", source: "default" };
+  return envMode
+    ? { mode: envMode, source: "env" }
+    : { mode: "session", source: "default" };
 }
 
 function footerStatsMode(
@@ -2485,23 +3475,134 @@ function footerStatsMode(
 let persistedCacheOptimizerConfig = readPersistedCacheOptimizerConfig();
 let persistedFooterStatsMode = persistedCacheOptimizerConfig.footerMode;
 
+/** Effective retention mode: config `retention` key > PI_CACHE_OPTIMIZER_RETENTION env > default "long". Pure — no module-state reads (the module-init call site runs before the persisted config global exists). */
+function resolveCacheRetentionMode(
+  env: MutableEnv = process.env,
+  configured?: CacheRetentionMode,
+): { mode: CacheRetentionMode; source: CacheRetentionSource } {
+  if (configured) return { mode: configured, source: "config" };
+  const envMode = parseCacheRetentionMode(env[RETENTION_ENV]);
+  return envMode
+    ? { mode: envMode, source: "env" }
+    : { mode: "long", source: "default" };
+}
+
+/** Runtime resolver: layers the in-memory persisted config above env/default. */
+function resolveEffectiveCacheRetentionMode(env: MutableEnv = process.env): {
+  mode: CacheRetentionMode;
+  source: CacheRetentionSource;
+} {
+  return resolveCacheRetentionMode(
+    env,
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig).retention,
+  );
+}
+
+/**
+ * Resolve one optimization toggle. Precedence: config-file key > env var >
+ * default. `envEnabled` folds the env var together with the upstream default
+ * (opt-out optimizations pass !isEnabledEnv(optOutVar); the opt-in tool
+ * ordering passes isEnabledEnv(toolOrderVar)).
+ */
+function resolveConfigToggle(
+  configured: boolean | undefined,
+  envEnabled: boolean,
+): boolean {
+  if (configured !== undefined) return configured;
+  return envEnabled;
+}
+
+function isPromptRewriteEnabled(env: MutableEnv = process.env): boolean {
+  if (!runtimeOptimizerEnabled) return false;
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig).promptRewrite,
+    !isEnabledEnv(env[NO_PROMPT_REWRITE_ENV]),
+  );
+}
+
+function isSkillCompressionEnabled(env: MutableEnv = process.env): boolean {
+  // Layered under the prompt-rewrite master switch, matching upstream env
+  // semantics where NO_PROMPT_REWRITE disables ALL prompt mutations.
+  return (
+    isPromptRewriteEnabled(env) &&
+    resolveConfigToggle(
+      asV3CacheOptimizerConfig(persistedCacheOptimizerConfig).skillCompression,
+      !isEnabledEnv(env[NO_SKILL_COMPRESSION_ENV]),
+    )
+  );
+}
+
+function isPromptCacheKeyFallbackEnabled(
+  env: MutableEnv = process.env,
+): boolean {
+  if (!runtimeOptimizerEnabled) return false;
+  const envEnabled =
+    !isEnabledEnv(env[NO_OPENAI_CACHE_KEY_ENV]) &&
+    !isDisabledEnv(env[OPENAI_CACHE_KEY_ENV]);
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig)
+      .promptCacheKeyFallback,
+    envEnabled,
+  );
+}
+
+function isCompatWarningsEnabled(env: MutableEnv = process.env): boolean {
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig).compatWarnings,
+    !isEnabledEnv(env[NO_COMPAT_WARNINGS_ENV]),
+  );
+}
+
+function isFooterStatsEnabled(env: MutableEnv = process.env): boolean {
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig).footerStats,
+    !isEnabledEnv(env[NO_FOOTER_STATS_ENV]),
+  );
+}
+
+function isAnthropicTtlDowngradeEnabled(
+  env: MutableEnv = process.env,
+): boolean {
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig)
+      .anthropicTtlDowngrade,
+    !isEnabledEnv(env[NO_ANTHROPIC_TTL_DOWNGRADE_ENV]),
+  );
+}
+
+function isSessionAffinityToggleEnabled(
+  env: MutableEnv = process.env,
+): boolean {
+  // Runtime enablement is checked by the caller (addEffectiveSessionAffinityHeaders
+  // takes an explicit optimizerEnabled parameter for test isolation).
+  return resolveConfigToggle(
+    asV3CacheOptimizerConfig(persistedCacheOptimizerConfig).sessionAffinity,
+    !isEnabledEnv(env[NO_SESSION_AFFINITY_ENV]),
+  );
+}
+
 function isDisabledEnv(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
-  return normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off";
+  return (
+    normalized === "0" ||
+    normalized === "false" ||
+    normalized === "no" ||
+    normalized === "off"
+  );
 }
 
 function shouldInjectOpenAIPromptCacheKey(): boolean {
-  if (!runtimeOptimizerEnabled) return false;
-  if (isEnabledEnv(process.env[NO_OPENAI_CACHE_KEY_ENV])) return false;
-  if (isDisabledEnv(process.env[OPENAI_CACHE_KEY_ENV])) return false;
-  return true;
+  return isPromptCacheKeyFallbackEnabled();
 }
 
-function setRuntimeOptimizerEnabled(enabled: boolean, env: MutableEnv = process.env): void {
+function setRuntimeOptimizerEnabled(
+  enabled: boolean,
+  env: MutableEnv = process.env,
+): void {
   runtimeOptimizerEnabled = enabled;
   if (enabled) {
-    requestLongCacheRetention(env);
+    applyCacheRetentionMode(resolveEffectiveCacheRetentionMode(env).mode, env);
   } else {
     restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV, env);
   }
@@ -2514,17 +3615,32 @@ function isRuntimeOptimizerEnabled(): boolean {
 function getOptimizerRuntimeModeLines(): string[] {
   const state = runtimeOptimizerEnabled ? "enabled" : "disabled";
   const lines: string[] = [];
+  const retention = resolveEffectiveCacheRetentionMode();
   lines.push(`Runtime state: ${state}`);
-  lines.push(`• Prompt rewrite: ${runtimeOptimizerEnabled && !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) ? "on" : "off"}`);
-  lines.push(`• Deterministic tool ordering: ${isToolOrderEnabled() ? "on (verified built-in payloads, opt-in)" : "off"}`);
-  lines.push(`• OpenAI prompt_cache_key fallback: ${shouldInjectOpenAIPromptCacheKey() ? "on" : "off"}`);
-  lines.push(`• Footer cache stats: on${runtimeOptimizerEnabled ? "" : " (comparison mode)"}`);
-  lines.push(`• Compat warnings: ${runtimeOptimizerEnabled ? "on" : "off"}`);
-  lines.push(`• ${PI_CACHE_RETENTION_ENV}: ${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`);
+  lines.push(`• Prompt rewrite: ${isPromptRewriteEnabled() ? "on" : "off"}`);
+  lines.push(
+    `• Deterministic tool ordering: ${isToolOrderEnabled() ? "on (verified built-in payloads, opt-in)" : "off"}`,
+  );
+  lines.push(
+    `• OpenAI prompt_cache_key fallback: ${shouldInjectOpenAIPromptCacheKey() ? "on" : "off"}`,
+  );
+  lines.push(
+    `• Footer cache stats: ${isFooterStatsEnabled() ? `on${runtimeOptimizerEnabled ? "" : " (comparison mode)"}` : "off"}`,
+  );
+  lines.push(
+    `• Compat warnings: ${runtimeOptimizerEnabled && isCompatWarningsEnabled() ? "on" : "off"}`,
+  );
+  lines.push(
+    `• Cache retention: ${retention.mode} (${retention.source}) · ${PI_CACHE_RETENTION_ENV}=${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`,
+  );
   if (!runtimeOptimizerEnabled) {
-    lines.push("This is a current-process switch. Run /reload or restart Pi to return to startup behavior.");
-  } else if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) || !shouldInjectOpenAIPromptCacheKey()) {
-    lines.push("Some features are still disabled by environment variables.");
+    lines.push(
+      "This is a current-process switch. Run /reload or restart Pi to return to startup behavior.",
+    );
+  } else if (!isPromptRewriteEnabled() || !shouldInjectOpenAIPromptCacheKey()) {
+    lines.push(
+      "Some features are still disabled by environment variables or the extension config file.",
+    );
   }
   return lines;
 }
@@ -2551,22 +3667,39 @@ function getAssistantMessageModelTokenValues(message: unknown): string[] {
   const record = asRecord(message);
   if (!record) return [];
 
-  return ASSISTANT_MESSAGE_MODEL_TOKEN_KEYS.map((key) => lower(record[key])).filter(Boolean);
+  return ASSISTANT_MESSAGE_MODEL_TOKEN_KEYS.map((key) =>
+    lower(record[key]),
+  ).filter(Boolean);
 }
 
 function hasAnyTokenContaining(tokens: string[], needles: string[]): boolean {
-  return tokens.some((token) => needles.some((needle) => token.includes(needle)));
+  return tokens.some((token) =>
+    needles.some((needle) => token.includes(needle)),
+  );
 }
 
-function modelOrAssistantMessageHas(message: unknown, model: PiModel | undefined, needles: string[]): boolean {
-  return hasAnyTokenContaining([...getModelIdNameTokenValues(model), ...getAssistantMessageModelTokenValues(message)], needles);
+function modelOrAssistantMessageHas(
+  message: unknown,
+  model: PiModel | undefined,
+  needles: string[],
+): boolean {
+  return hasAnyTokenContaining(
+    [
+      ...getModelIdNameTokenValues(model),
+      ...getAssistantMessageModelTokenValues(message),
+    ],
+    needles,
+  );
 }
 
 function isDeepSeekLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["deepseek"]);
 }
 
-function isDeepSeekLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isDeepSeekLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["deepseek"]);
 }
 
@@ -2584,50 +3717,71 @@ function isOpenAICompatibleProxyApi(api: unknown): boolean {
 }
 
 function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
-  if (lower(model?.provider) !== "llama.cpp" || !isOpenAICompatibleProxyApi(model?.api)) return false;
+  if (
+    lower(model?.provider) !== "llama.cpp" ||
+    !isOpenAICompatibleProxyApi(model?.api)
+  )
+    return false;
 
   // Pi's built-in llama.cpp provider supplies this exact explicit compat
   // fingerprint. Provider ids are extension-overridable and models.json can add
   // cache/routing overrides, so provider id alone must never imply exemption.
   const compat = getCompat(model);
-  return compat.supportsStore === false
-    && compat.supportsDeveloperRole === false
-    && compat.supportsReasoningEffort === false
-    && compat.supportsUsageInStreaming === false
-    && compat.supportsStrictMode === false
-    && compat.maxTokensField === "max_tokens"
-    && compat.sendSessionAffinityHeaders === undefined
-    && compat.sessionAffinityFormat === undefined
-    && compat.supportsLongCacheRetention === undefined;
+  return (
+    compat.supportsStore === false &&
+    compat.supportsDeveloperRole === false &&
+    compat.supportsReasoningEffort === false &&
+    compat.supportsUsageInStreaming === false &&
+    compat.supportsStrictMode === false &&
+    compat.maxTokensField === "max_tokens" &&
+    compat.sendSessionAffinityHeaders === undefined &&
+    compat.sessionAffinityFormat === undefined &&
+    compat.supportsLongCacheRetention === undefined
+  );
 }
 
-function shouldInjectOpenAIPromptCacheKeyForModel(model: PiModel | undefined): boolean {
+function shouldInjectOpenAIPromptCacheKeyForModel(
+  model: PiModel | undefined,
+): boolean {
   // Pi 0.85.1 has no native supportsPromptCacheKey compat field. Per-model
   // opt-out is owned by this extension's promptCacheKey.omit configuration;
   // this helper only exposes the transport API gate for fixture consumers.
   return isOpenAICompatibleApi(model?.api);
 }
 
-function isPromptCacheKeyOmittedForModel(model: PiModel | undefined, config: PersistedCacheOptimizerConfigV2 = persistedCacheOptimizerConfig): boolean {
+function isPromptCacheKeyOmittedForModel(
+  model: PiModel | undefined,
+  config: RuntimeCacheOptimizerConfig = persistedCacheOptimizerConfig,
+): boolean {
   if (!model || !isOpenAICompatibleApi(model.api)) return false;
   return config.promptCacheKey?.omit?.includes(modelKey(model)) === true;
 }
 
-function setPersistedCacheOptimizerConfig(config: PersistedCacheOptimizerConfigV2): void {
-  persistedCacheOptimizerConfig = normalizePersistedCacheOptimizerConfig(config);
+function setPersistedCacheOptimizerConfig(
+  config: RuntimeCacheOptimizerConfig,
+): void {
+  persistedCacheOptimizerConfig =
+    normalizePersistedCacheOptimizerConfig(config);
   persistedFooterStatsMode = persistedCacheOptimizerConfig.footerMode;
 }
 
 function omitOpenAIPromptCacheKeys(payload: unknown): unknown | undefined {
   const record = asRecord(payload);
-  if (!record || (!Object.prototype.hasOwnProperty.call(record, "prompt_cache_key") && !Object.prototype.hasOwnProperty.call(record, "promptCacheKey"))) return undefined;
+  if (
+    !record ||
+    (!Object.hasOwn(record, "prompt_cache_key") &&
+      !Object.hasOwn(record, "promptCacheKey"))
+  )
+    return undefined;
   const copy = { ...record };
   delete copy.prompt_cache_key;
   delete copy.promptCacheKey;
   return copy;
 }
 
-function collectAnthropicCacheControlsInWireOrder(payload: unknown): UnknownRecord[] {
+function collectAnthropicCacheControlsInWireOrder(
+  payload: unknown,
+): UnknownRecord[] {
   const record = asRecord(payload);
   if (!record) return [];
 
@@ -2674,13 +3828,16 @@ function downgradeAnthropicLongCacheControls(payload: unknown): boolean {
 
 function hasAnthropicCacheTtlOrderError(message: unknown): boolean {
   const record = getAssistantRecord(message);
-  if (record?.stopReason !== "error" || typeof record.errorMessage !== "string") return false;
+  if (record?.stopReason !== "error" || typeof record.errorMessage !== "string")
+    return false;
 
   const error = lower(record.errorMessage);
-  return error.includes("cache_control") &&
+  return (
+    error.includes("cache_control") &&
     error.includes("ttl='1h'") &&
     error.includes("ttl='5m'") &&
-    error.includes("must not come after");
+    error.includes("must not come after")
+  );
 }
 
 function normalizeAnthropicCacheControlTtlOrder(payload: unknown): boolean {
@@ -2704,7 +3861,11 @@ function normalizeAnthropicCacheControlTtlOrder(payload: unknown): boolean {
 
 function isResponsesPromptRewriteBypassApi(api: unknown): boolean {
   const value = lower(api);
-  return value === "openai-codex-responses" || value === "openai-responses" || value === "azure-openai-responses";
+  return (
+    value === "openai-codex-responses" ||
+    value === "openai-responses" ||
+    value === "azure-openai-responses"
+  );
 }
 
 function isMistralConversationsApi(api: unknown): boolean {
@@ -2712,30 +3873,52 @@ function isMistralConversationsApi(api: unknown): boolean {
 }
 
 function isOpenAIFamilyToken(token: string): boolean {
-  return token.includes("gpt-") || token.includes("chatgpt") || OPENAI_REASONING_MODEL_PATTERN.test(token);
+  return (
+    token.includes("gpt-") ||
+    token.includes("chatgpt") ||
+    OPENAI_REASONING_MODEL_PATTERN.test(token)
+  );
 }
 
 function isOpenAIFamilyModel(model: PiModel | undefined): boolean {
   return getModelIdNameTokenValues(model).some(isOpenAIFamilyToken);
 }
 
-function isOpenAIFamilyAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return [...getModelIdNameTokenValues(model), ...getAssistantMessageModelTokenValues(message)].some(isOpenAIFamilyToken);
+function isOpenAIFamilyAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return [
+    ...getModelIdNameTokenValues(model),
+    ...getAssistantMessageModelTokenValues(message),
+  ].some(isOpenAIFamilyToken);
 }
 
 function isClaudeLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["anthropic", "claude"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "anthropic",
+    "claude",
+  ]);
 }
 
-function isClaudeLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isClaudeLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["anthropic", "claude"]);
 }
 
 function isGeminiLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["gemini", "vertex"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "gemini",
+    "vertex",
+  ]);
 }
 
-function isGeminiLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isGeminiLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["gemini", "vertex"]);
 }
 
@@ -2753,42 +3936,53 @@ function isGeminiLikeAssistantMessage(message: unknown, model: PiModel | undefin
  * We match broadly: opus >= 4-6, sonnet >= 4-6, fable >= 5.
  * Ids may carry date-stamp or size suffixes like "[1M]".
  */
-const ADAPTIVE_OPUS_PATTERN = /(^|[\/\s:_-])(opus-4[.-][6-9]|opus-4-[1-9][0-9]|opus-([5-9]|[1-9][0-9]))($|[-_.:\/\s\[])/i;
-const ADAPTIVE_SONNET_PATTERN = /(^|[\/\s:_-])(sonnet-4[.-][6-9]|sonnet-4-[1-9][0-9]|sonnet-([5-9]|[1-9][0-9]))($|[-_.:\/\s\[])/i;
-const ADAPTIVE_FABLE_PATTERN = /(^|[\/\s:_-])fable-([5-9]|[1-9][0-9])($|[-_.:\/\s\[])/i;
+const ADAPTIVE_OPUS_PATTERN =
+  /(^|[/\s:_-])(opus-4[.-][6-9]|opus-4-[1-9][0-9]|opus-([5-9]|[1-9][0-9]))($|[-_.:/\s[])/i;
+const ADAPTIVE_SONNET_PATTERN =
+  /(^|[/\s:_-])(sonnet-4[.-][6-9]|sonnet-4-[1-9][0-9]|sonnet-([5-9]|[1-9][0-9]))($|[-_.:/\s[])/i;
+const ADAPTIVE_FABLE_PATTERN =
+  /(^|[/\s:_-])fable-([5-9]|[1-9][0-9])($|[-_.:/\s[])/i;
 
 function isAdaptiveGenerationModel(model: PiModel | undefined): boolean {
   if (!model) return false;
   const tokens = getModelIdNameTokenValues(model);
-  return tokens.some((t) => ADAPTIVE_OPUS_PATTERN.test(t) || ADAPTIVE_SONNET_PATTERN.test(t) || ADAPTIVE_FABLE_PATTERN.test(t));
+  return tokens.some(
+    (t) =>
+      ADAPTIVE_OPUS_PATTERN.test(t) ||
+      ADAPTIVE_SONNET_PATTERN.test(t) ||
+      ADAPTIVE_FABLE_PATTERN.test(t),
+  );
 }
 
 function isKimiCodingAdaptiveModel(model: PiModel | undefined): boolean {
   if (!model) return false;
   const provider = lower(model.provider);
   const baseUrl = lower(model.baseUrl);
-  const isKimiCodingChannel = provider.includes("kimi-coding") || baseUrl.includes("api.kimi.com/coding");
+  const isKimiCodingChannel =
+    provider.includes("kimi-coding") || baseUrl.includes("api.kimi.com/coding");
   if (!isKimiCodingChannel) return false;
 
   const tokens = getModelIdNameTokenValues(model);
-  return tokens.some((token) =>
-    token === "k3"
-    || token.includes("kimi-k3")
-    || token.includes("kimi k3")
-    || token.includes("kimi-for-coding")
-    || token.includes("kimi for coding")
+  return tokens.some(
+    (token) =>
+      token === "k3" ||
+      token.includes("kimi-k3") ||
+      token.includes("kimi k3") ||
+      token.includes("kimi-for-coding") ||
+      token.includes("kimi for coding"),
   );
 }
 
 function isKimiCodingEmptySignatureModel(model: PiModel | undefined): boolean {
   if (!isKimiCodingAdaptiveModel(model)) return false;
-  return getModelIdNameTokenValues(model).some((token) =>
-    token === "k3"
-    || token === "kimi-k3"
-    || token.startsWith("kimi-k3-")
-    || token === "kimi k3"
-    || token === "kimi-for-coding"
-    || token === "kimi for coding"
+  return getModelIdNameTokenValues(model).some(
+    (token) =>
+      token === "k3" ||
+      token === "kimi-k3" ||
+      token.startsWith("kimi-k3-") ||
+      token === "kimi k3" ||
+      token === "kimi-for-coding" ||
+      token === "kimi for coding",
   );
 }
 
@@ -2801,8 +3995,10 @@ function isAdaptiveThinkingCompatApplicable(model: PiModel): boolean {
     return false;
   }
 
-  return lower(model.api) === "anthropic-messages"
-    && (isAdaptiveGenerationModel(model) || isKimiCodingAdaptiveModel(model));
+  return (
+    lower(model.api) === "anthropic-messages" &&
+    (isAdaptiveGenerationModel(model) || isKimiCodingAdaptiveModel(model))
+  );
 }
 
 function describeMissingAdaptiveThinkingCompat(model: PiModel): string[] {
@@ -2811,13 +4007,18 @@ function describeMissingAdaptiveThinkingCompat(model: PiModel): string[] {
   if (compat.forceAdaptiveThinking !== true) {
     missing.push("forceAdaptiveThinking");
   }
-  if (isKimiCodingEmptySignatureModel(model) && compat.allowEmptySignature !== true) {
+  if (
+    isKimiCodingEmptySignatureModel(model) &&
+    compat.allowEmptySignature !== true
+  ) {
     missing.push("allowEmptySignature");
   }
   return missing;
 }
 
-function buildAdaptiveThinkingCompatSuggestion(missing: string[]): Record<string, unknown> {
+function buildAdaptiveThinkingCompatSuggestion(
+  missing: string[],
+): Record<string, unknown> {
   const suggestion: Record<string, unknown> = {};
   if (missing.includes("forceAdaptiveThinking")) {
     suggestion.forceAdaptiveThinking = true;
@@ -2828,22 +4029,37 @@ function buildAdaptiveThinkingCompatSuggestion(missing: string[]): Record<string
   return suggestion;
 }
 
-function appendAdaptiveThinkingCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
+function appendAdaptiveThinkingCompatAdviceLines(
+  lines: string[],
+  missing: string[],
+  placement: CompatAdvicePlacement = {},
+): void {
   const suggestion = buildAdaptiveThinkingCompatSuggestion(missing);
   if (Object.keys(suggestion).length > 0) {
     lines.push("Suggested fix:");
     lines.push(JSON.stringify(suggestion, null, 2));
   }
-  lines.push("- forceAdaptiveThinking: true tells Pi to use adaptive thinking format");
-  lines.push("  (thinking: {type: 'adaptive'}) instead of legacy budget tokens format.");
-  lines.push("  Without this flag, Pi sends legacy thinking which adaptive-only upstreams reject.");
+  lines.push(
+    "- forceAdaptiveThinking: true tells Pi to use adaptive thinking format",
+  );
+  lines.push(
+    "  (thinking: {type: 'adaptive'}) instead of legacy budget tokens format.",
+  );
+  lines.push(
+    "  Without this flag, Pi sends legacy thinking which adaptive-only upstreams reject.",
+  );
   if (missing.includes("allowEmptySignature")) {
-    lines.push("- allowEmptySignature: true preserves Kimi Coding K3 thinking blocks whose replay signature is empty.");
+    lines.push(
+      "- allowEmptySignature: true preserves Kimi Coding K3 thinking blocks whose replay signature is empty.",
+    );
   }
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
 }
 
-function buildAdaptiveThinkingCompatWarningText(key: string, missing: string[]): string {
+function buildAdaptiveThinkingCompatWarningText(
+  key: string,
+  missing: string[],
+): string {
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
@@ -2854,7 +4070,10 @@ function buildAdaptiveThinkingCompatWarningText(key: string, missing: string[]):
     `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
     "",
   ];
-  appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId });
+  appendAdaptiveThinkingCompatAdviceLines(lines, missing, {
+    providerLabel,
+    modelId,
+  });
   return lines.join("\n");
 }
 
@@ -2863,191 +4082,352 @@ function buildAdaptiveThinkingCompatWarningText(key: string, missing: string[]):
 function isKimiLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["kimi"]);
 }
-function isKimiLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isKimiLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["kimi"]);
 }
 
 function isQwenLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["qwen"]);
 }
-function isQwenLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isQwenLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["qwen"]);
 }
 
 function isGLMLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["glm"]);
 }
-function isGLMLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isGLMLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["glm"]);
 }
 
 function isMiniMaxLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["minimax"]);
 }
-function isMiniMaxLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isMiniMaxLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["minimax"]);
 }
 
 function isMimoLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["xiaomimimo"]) || tokens.some((t) => MIMO_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["xiaomimimo"]) ||
+    tokens.some((t) => MIMO_MODEL_PATTERN.test(t))
+  );
 }
-function isMimoLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isMimoLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["xiaomimimo"]) || allTokens.some((t) => MIMO_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["xiaomimimo"]) ||
+    allTokens.some((t) => MIMO_MODEL_PATTERN.test(t))
+  );
 }
 
 function isHunyuanLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["hunyuan"]);
 }
-function isHunyuanLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isHunyuanLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["hunyuan"]);
 }
 
 // ── Additional OpenAI-compatible model detection ──────────────────
 
 function isMistralLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["mistral", "mixtral", "codestral"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "mistral",
+    "mixtral",
+    "codestral",
+  ]);
 }
-function isMistralLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["mistral", "mixtral", "codestral"]);
+function isMistralLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "mistral",
+    "mixtral",
+    "codestral",
+  ]);
 }
 
 function isGrokLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["grok"]) || tokens.some((t) => XAI_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["grok"]) ||
+    tokens.some((t) => XAI_MODEL_PATTERN.test(t))
+  );
 }
-function isGrokLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isGrokLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["grok"]) || allTokens.some((t) => XAI_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["grok"]) ||
+    allTokens.some((t) => XAI_MODEL_PATTERN.test(t))
+  );
 }
 
 function isLlamaLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["llama"]);
 }
-function isLlamaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isLlamaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["llama"]);
 }
 
 function isNemotronLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["nemotron"]);
 }
-function isNemotronLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isNemotronLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["nemotron"]);
 }
 
 function isCohereLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["cohere", "command-r"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "cohere",
+    "command-r",
+  ]);
 }
-function isCohereLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isCohereLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["cohere", "command-r"]);
 }
 
-const YI_MODEL_PATTERN = /(^|[\/\s:_-])yi($|[\-_.:\/\s])/;
+const YI_MODEL_PATTERN = /(^|[/\s:_-])yi($|[-_.:/\s])/;
 
 function isYiLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["yi-", "01-ai", "zero-one"]) || tokens.some((t) => YI_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["yi-", "01-ai", "zero-one"]) ||
+    tokens.some((t) => YI_MODEL_PATTERN.test(t))
+  );
 }
-function isYiLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isYiLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["yi-", "01-ai", "zero-one"]) || allTokens.some((t) => YI_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["yi-", "01-ai", "zero-one"]) ||
+    allTokens.some((t) => YI_MODEL_PATTERN.test(t))
+  );
 }
 
 // ── More OpenAI-compatible model detection (batch 2) ───────────────
 
-const DOUBAO_SEED_PATTERN = /(^|[\/\s:_-])seed($|[\-_.:\/\s])/i;
+const DOUBAO_SEED_PATTERN = /(^|[/\s:_-])seed($|[-_.:/\s])/i;
 
 function isDoubaoLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["doubao", "豆包", "volcengine", "bytedance", "byte-dance"]) ||
-    tokens.some((t) => DOUBAO_SEED_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, [
+      "doubao",
+      "豆包",
+      "volcengine",
+      "bytedance",
+      "byte-dance",
+    ]) || tokens.some((t) => DOUBAO_SEED_PATTERN.test(t))
+  );
 }
-function isDoubaoLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isDoubaoLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["doubao", "豆包", "volcengine", "bytedance", "byte-dance"]) ||
-    allTokens.some((t) => DOUBAO_SEED_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, [
+      "doubao",
+      "豆包",
+      "volcengine",
+      "bytedance",
+      "byte-dance",
+    ]) || allTokens.some((t) => DOUBAO_SEED_PATTERN.test(t))
+  );
 }
 
 function isErnieLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["ernie", "wenxin", "文心", "yiyan", "一言", "baidu"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "ernie",
+    "wenxin",
+    "文心",
+    "yiyan",
+    "一言",
+    "baidu",
+  ]);
 }
-function isErnieLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["ernie", "wenxin", "文心", "yiyan", "一言", "baidu"]);
+function isErnieLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "ernie",
+    "wenxin",
+    "文心",
+    "yiyan",
+    "一言",
+    "baidu",
+  ]);
 }
 
 function isBaichuanLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["baichuan", "百川"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "baichuan",
+    "百川",
+  ]);
 }
-function isBaichuanLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isBaichuanLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["baichuan", "百川"]);
 }
 
 function isStepFunLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["stepfun", "step-"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "stepfun",
+    "step-",
+  ]);
 }
-function isStepFunLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isStepFunLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["stepfun", "step-"]);
 }
 
 function isSparkLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["spark", "xinghuo", "星火", "iflytek", "讯飞"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "spark",
+    "xinghuo",
+    "星火",
+    "iflytek",
+    "讯飞",
+  ]);
 }
-function isSparkLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["spark", "xinghuo", "星火", "iflytek", "讯飞"]);
+function isSparkLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "spark",
+    "xinghuo",
+    "星火",
+    "iflytek",
+    "讯飞",
+  ]);
 }
 
 function isInternLMLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["internlm", "intern-lm", "书生"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "internlm",
+    "intern-lm",
+    "书生",
+  ]);
 }
-function isInternLMLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["internlm", "intern-lm", "书生"]);
+function isInternLMLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "internlm",
+    "intern-lm",
+    "书生",
+  ]);
 }
 
 function isGemmaLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["gemma"]);
 }
-function isGemmaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isGemmaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["gemma"]);
 }
 
-const PHI_MODEL_PATTERN = /(^|[\/\s:_-])phi($|[\-_.:\/\s])/i;
+const PHI_MODEL_PATTERN = /(^|[/\s:_-])phi($|[-_.:/\s])/i;
 
 function isPhiLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["phi-"]) || tokens.some((t) => PHI_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["phi-"]) ||
+    tokens.some((t) => PHI_MODEL_PATTERN.test(t))
+  );
 }
-function isPhiLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isPhiLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["phi-"]) || allTokens.some((t) => PHI_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["phi-"]) ||
+    allTokens.some((t) => PHI_MODEL_PATTERN.test(t))
+  );
 }
 
 function isJambaLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["jamba", "ai21"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "jamba",
+    "ai21",
+  ]);
 }
-function isJambaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isJambaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["jamba", "ai21"]);
 }
 
 function isSolarLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["solar", "upstage"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "solar",
+    "upstage",
+  ]);
 }
-function isSolarLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isSolarLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["solar", "upstage"]);
 }
 
@@ -3056,79 +4436,138 @@ function isSolarLikeAssistantMessage(message: unknown, model: PiModel | undefine
 // Perplexity / Sonar
 function isPerplexityLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["sonar", "perplexity"]) || tokens.some((t) => PPLX_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["sonar", "perplexity"]) ||
+    tokens.some((t) => PPLX_MODEL_PATTERN.test(t))
+  );
 }
-function isPerplexityLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isPerplexityLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["sonar", "perplexity"]) || allTokens.some((t) => PPLX_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["sonar", "perplexity"]) ||
+    allTokens.some((t) => PPLX_MODEL_PATTERN.test(t))
+  );
 }
 
 // Amazon Nova
 function isNovaLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["amazon-nova"]) || tokens.some((t) => NOVA_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["amazon-nova"]) ||
+    tokens.some((t) => NOVA_MODEL_PATTERN.test(t))
+  );
 }
-function isNovaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isNovaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["amazon-nova"]) || allTokens.some((t) => NOVA_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["amazon-nova"]) ||
+    allTokens.some((t) => NOVA_MODEL_PATTERN.test(t))
+  );
 }
 
 // Reka
 function isRekaLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["reka"]);
 }
-function isRekaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isRekaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["reka"]);
 }
 
 // Falcon / TII
 function isFalconLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["falcon", "tiiuae"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "falcon",
+    "tiiuae",
+  ]);
 }
-function isFalconLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isFalconLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["falcon", "tiiuae"]);
 }
 
 // Databricks DBRX
 function isDbrxLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["dbrx", "databricks"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "dbrx",
+    "databricks",
+  ]);
 }
-function isDbrxLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isDbrxLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["dbrx", "databricks"]);
 }
 
 // MosaicML MPT
 function isMptLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["mosaicml", "mpt-"]) || tokens.some((t) => MPT_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["mosaicml", "mpt-"]) ||
+    tokens.some((t) => MPT_MODEL_PATTERN.test(t))
+  );
 }
-function isMptLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isMptLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["mosaicml", "mpt-"]) || allTokens.some((t) => MPT_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["mosaicml", "mpt-"]) ||
+    allTokens.some((t) => MPT_MODEL_PATTERN.test(t))
+  );
 }
 
 // StableLM / Stability AI
 function isStableLMLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["stablelm", "stable-lm", "stability-ai"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "stablelm",
+    "stable-lm",
+    "stability-ai",
+  ]);
 }
-function isStableLMLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["stablelm", "stable-lm", "stability-ai"]);
+function isStableLMLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "stablelm",
+    "stable-lm",
+    "stability-ai",
+  ]);
 }
 
 // BAAI / Aquila
 function isAquilaLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["aquila", "baai"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "aquila",
+    "baai",
+  ]);
 }
-function isAquilaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isAquilaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["aquila", "baai"]);
 }
 
@@ -3136,120 +4575,229 @@ function isAquilaLikeAssistantMessage(message: unknown, model: PiModel | undefin
 function isExaoneLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["exaone"]);
 }
-function isExaoneLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isExaoneLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["exaone"]);
 }
 
 // Naver HyperCLOVA X (conservative: hyperclova, clova-x only)
 function isHyperCLOVALikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["hyperclova", "clova-x"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "hyperclova",
+    "clova-x",
+  ]);
 }
-function isHyperCLOVALikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isHyperCLOVALikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["hyperclova", "clova-x"]);
 }
 
 // Aleph Alpha Luminous
 function isLuminousLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["luminous", "aleph-alpha"]) || tokens.some((t) => ALEPH_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["luminous", "aleph-alpha"]) ||
+    tokens.some((t) => ALEPH_MODEL_PATTERN.test(t))
+  );
 }
-function isLuminousLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isLuminousLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["luminous", "aleph-alpha"]) || allTokens.some((t) => ALEPH_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["luminous", "aleph-alpha"]) ||
+    allTokens.some((t) => ALEPH_MODEL_PATTERN.test(t))
+  );
 }
 
 // Nous / Hermes / OpenHermes
 function isHermesLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["nous", "hermes", "openhermes"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "nous",
+    "hermes",
+    "openhermes",
+  ]);
 }
-function isHermesLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["nous", "hermes", "openhermes"]);
+function isHermesLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "nous",
+    "hermes",
+    "openhermes",
+  ]);
 }
 
 // ── More OpenAI-compatible model detection (batch 4, 18 families) ──
 
 // IBM Granite
 function isGraniteLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["granite", "ibm-granite"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "granite",
+    "ibm-granite",
+  ]);
 }
-function isGraniteLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isGraniteLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["granite", "ibm-granite"]);
 }
 
 // Snowflake Arctic
 function isArcticLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["snowflake-arctic"]) || tokens.some((t) => ARCTIC_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["snowflake-arctic"]) ||
+    tokens.some((t) => ARCTIC_MODEL_PATTERN.test(t))
+  );
 }
-function isArcticLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isArcticLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["snowflake-arctic"]) || allTokens.some((t) => ARCTIC_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["snowflake-arctic"]) ||
+    allTokens.some((t) => ARCTIC_MODEL_PATTERN.test(t))
+  );
 }
 
 // Huawei Pangu / 盘古
 function isPanguLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["pangu", "pan-gu", "盘古", "huawei-pangu"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "pangu",
+    "pan-gu",
+    "盘古",
+    "huawei-pangu",
+  ]);
 }
-function isPanguLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["pangu", "pan-gu", "盘古", "huawei-pangu"]);
+function isPanguLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "pangu",
+    "pan-gu",
+    "盘古",
+    "huawei-pangu",
+  ]);
 }
 
 // SenseTime SenseNova / 商汤
 function isSenseNovaLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["sensenova", "sense-nova", "sensechat", "商汤"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "sensenova",
+    "sense-nova",
+    "sensechat",
+    "商汤",
+  ]);
 }
-function isSenseNovaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["sensenova", "sense-nova", "sensechat", "商汤"]);
+function isSenseNovaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "sensenova",
+    "sense-nova",
+    "sensechat",
+    "商汤",
+  ]);
 }
 
 // 360 Zhinao / 智脑
 function isZhinaoLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["360gpt", "360-gpt", "zhinao", "智脑"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "360gpt",
+    "360-gpt",
+    "zhinao",
+    "智脑",
+  ]);
 }
-function isZhinaoLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["360gpt", "360-gpt", "zhinao", "智脑"]);
+function isZhinaoLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "360gpt",
+    "360-gpt",
+    "zhinao",
+    "智脑",
+  ]);
 }
 
 // OpenBMB MiniCPM
 function isMiniCPMLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["minicpm", "mini-cpm", "openbmb"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "minicpm",
+    "mini-cpm",
+    "openbmb",
+  ]);
 }
-function isMiniCPMLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["minicpm", "mini-cpm", "openbmb"]);
+function isMiniCPMLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "minicpm",
+    "mini-cpm",
+    "openbmb",
+  ]);
 }
 
 // XVERSE
 function isXVerseLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["xverse"]);
 }
-function isXVerseLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isXVerseLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["xverse"]);
 }
 
 // OrionStar Orion
 function isOrionLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["orionstar", "orion-star"]) || tokens.some((t) => ORION_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["orionstar", "orion-star"]) ||
+    tokens.some((t) => ORION_MODEL_PATTERN.test(t))
+  );
 }
-function isOrionLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isOrionLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["orionstar", "orion-star"]) || allTokens.some((t) => ORION_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["orionstar", "orion-star"]) ||
+    allTokens.some((t) => ORION_MODEL_PATTERN.test(t))
+  );
 }
 
 // OpenChat
 function isOpenChatLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["openchat"]);
 }
-function isOpenChatLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isOpenChatLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["openchat"]);
 }
 
@@ -3257,23 +4805,42 @@ function isOpenChatLikeAssistantMessage(message: unknown, model: PiModel | undef
 function isVicunaLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["vicuna"]);
 }
-function isVicunaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isVicunaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["vicuna"]);
 }
 
 // WizardLM / WizardCoder
 function isWizardLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["wizardlm", "wizard-lm", "wizardcoder", "wizard-coder"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "wizardlm",
+    "wizard-lm",
+    "wizardcoder",
+    "wizard-coder",
+  ]);
 }
-function isWizardLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
-  return modelOrAssistantMessageHas(message, model, ["wizardlm", "wizard-lm", "wizardcoder", "wizard-coder"]);
+function isWizardLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  return modelOrAssistantMessageHas(message, model, [
+    "wizardlm",
+    "wizard-lm",
+    "wizardcoder",
+    "wizard-coder",
+  ]);
 }
 
 // Zephyr
 function isZephyrLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["zephyr"]);
 }
-function isZephyrLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isZephyrLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["zephyr"]);
 }
 
@@ -3281,15 +4848,24 @@ function isZephyrLikeAssistantMessage(message: unknown, model: PiModel | undefin
 function isDolphinLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["dolphin"]);
 }
-function isDolphinLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isDolphinLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["dolphin"]);
 }
 
 // OpenOrca
 function isOpenOrcaLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["openorca", "open-orca"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "openorca",
+    "open-orca",
+  ]);
 }
-function isOpenOrcaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isOpenOrcaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["openorca", "open-orca"]);
 }
 
@@ -3297,15 +4873,24 @@ function isOpenOrcaLikeAssistantMessage(message: unknown, model: PiModel | undef
 function isStarlingLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["starling"]);
 }
-function isStarlingLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isStarlingLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["starling"]);
 }
 
 // BLOOM / BigScience
 function isBloomLikeModel(model: PiModel | undefined): boolean {
-  return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["bloom", "bigscience"]);
+  return hasAnyTokenContaining(getModelIdNameTokenValues(model), [
+    "bloom",
+    "bigscience",
+  ]);
 }
-function isBloomLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isBloomLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["bloom", "bigscience"]);
 }
 
@@ -3313,21 +4898,33 @@ function isBloomLikeAssistantMessage(message: unknown, model: PiModel | undefine
 function isRwkvLikeModel(model: PiModel | undefined): boolean {
   return hasAnyTokenContaining(getModelIdNameTokenValues(model), ["rwkv"]);
 }
-function isRwkvLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isRwkvLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   return modelOrAssistantMessageHas(message, model, ["rwkv"]);
 }
 
 // Cohere Aya
 function isAyaLikeModel(model: PiModel | undefined): boolean {
   const tokens = getModelIdNameTokenValues(model);
-  return hasAnyTokenContaining(tokens, ["aya-expanse"]) || tokens.some((t) => AYA_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(tokens, ["aya-expanse"]) ||
+    tokens.some((t) => AYA_MODEL_PATTERN.test(t))
+  );
 }
-function isAyaLikeAssistantMessage(message: unknown, model: PiModel | undefined): boolean {
+function isAyaLikeAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
   const allTokens = [
     ...getModelIdNameTokenValues(model),
     ...getAssistantMessageModelTokenValues(message),
   ];
-  return hasAnyTokenContaining(allTokens, ["aya-expanse"]) || allTokens.some((t) => AYA_MODEL_PATTERN.test(t));
+  return (
+    hasAnyTokenContaining(allTokens, ["aya-expanse"]) ||
+    allTokens.some((t) => AYA_MODEL_PATTERN.test(t))
+  );
 }
 
 // ── Model key ──────────────────────────────────────────────────────
@@ -3340,16 +4937,25 @@ function isRouterModel(model: PiModel | undefined): boolean {
   return lower(model?.provider) === "router";
 }
 
-function modelFromAssistantMessage(message: unknown, fallback: PiModel | undefined): PiModel | undefined {
+function modelFromAssistantMessage(
+  message: unknown,
+  fallback: PiModel | undefined,
+): PiModel | undefined {
   const record = getAssistantRecord(message);
   if (!record) return fallback;
 
-  const id = firstNonEmptyString(record.responseModel, record.model, fallback?.id);
+  const id = firstNonEmptyString(
+    record.responseModel,
+    record.model,
+    fallback?.id,
+  );
   const provider = firstNonEmptyString(record.provider, fallback?.provider);
   const api = firstNonEmptyString(record.api, fallback?.api) ?? "";
   if (!id || !provider) return fallback;
 
-  const fallbackName = isNonEmptyString(fallback?.name) ? fallback.name : undefined;
+  const fallbackName = isNonEmptyString(fallback?.name)
+    ? fallback.name
+    : undefined;
   const preservesFallbackIdentity =
     !isVirtualRoutingModel(fallback) &&
     provider === fallback?.provider &&
@@ -3369,7 +4975,12 @@ function modelFromAssistantMessage(message: unknown, fallback: PiModel | undefin
     baseUrl: fallback?.baseUrl ?? "",
     reasoning: fallback?.reasoning ?? false,
     input: fallback?.input ?? ["text"],
-    cost: fallback?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: fallback?.cost ?? {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    },
     contextWindow: fallback?.contextWindow ?? 0,
     maxTokens: fallback?.maxTokens ?? 0,
   } as PiModel;
@@ -3418,11 +5029,13 @@ function snapshotBaseUrlForDiagnostics(value: unknown): string {
   } catch {
     // Invalid endpoint strings are not useful for applicability checks. Keep
     // only a conservative path-free origin-like prefix without userinfo.
-    return value.replace(new RegExp("//[^/?#\\s@]+@"), "//").split(/[?#]/, 1)[0];
+    return value.replace(/\/\/[^/?#\s@]+@/, "//").split(/[?#]/, 1)[0];
   }
 }
 
-function snapshotProviderRequestModel(model: PiModel | undefined): PiModel | undefined {
+function snapshotProviderRequestModel(
+  model: PiModel | undefined,
+): PiModel | undefined {
   if (!model) return undefined;
 
   // The provider response hooks do not receive the model that initiated the
@@ -3483,7 +5096,8 @@ function consolidateDirectProviderStatsModel(
   // object identity is the correct criterion.
   const statsAdapter = selectAdapterForModel(statsModel);
   const ctxAdapter = selectAdapterForModel(ctxModel);
-  if (!statsAdapter || !ctxAdapter || statsAdapter !== ctxAdapter) return statsModel;
+  if (!statsAdapter || !ctxAdapter || statsAdapter !== ctxAdapter)
+    return statsModel;
   // No drift — nothing to consolidate.
   if (statsModel.id === ctxModel.id) return statsModel;
   // Consolidate: pin stats to the active-model identity the footer reads.
@@ -3498,7 +5112,10 @@ function usageRecordFromAssistant(message: unknown): UnknownRecord | undefined {
   return asRecord(getAssistantRecord(message)?.usage);
 }
 
-function getNestedRecord(record: UnknownRecord | undefined, key: string): UnknownRecord | undefined {
+function getNestedRecord(
+  record: UnknownRecord | undefined,
+  key: string,
+): UnknownRecord | undefined {
   return asRecord(record?.[key]);
 }
 
@@ -3510,12 +5127,22 @@ function getFirstNonNegativeNumber(...values: unknown[]): number | undefined {
   return undefined;
 }
 
-function readCachedTokensFromDetails(details: UnknownRecord | undefined): number | undefined {
-  return getFirstNonNegativeNumber(details?.cached_tokens, details?.cachedTokens);
+function readCachedTokensFromDetails(
+  details: UnknownRecord | undefined,
+): number | undefined {
+  return getFirstNonNegativeNumber(
+    details?.cached_tokens,
+    details?.cachedTokens,
+  );
 }
 
-function readCacheWriteFromDetails(details: UnknownRecord | undefined): number | undefined {
-  return getFirstNonNegativeNumber(details?.cache_write_tokens, details?.cacheWriteTokens);
+function readCacheWriteFromDetails(
+  details: UnknownRecord | undefined,
+): number | undefined {
+  return getFirstNonNegativeNumber(
+    details?.cache_write_tokens,
+    details?.cacheWriteTokens,
+  );
 }
 
 // Pi normalizes provider-specific raw usage (prompt_cache_hit_tokens, cached_tokens,
@@ -3530,7 +5157,10 @@ function readCacheWriteFromDetails(details: UnknownRecord | undefined): number |
 //
 // Only DeepSeek sets allowInputOnly=true so that a cache miss (cacheRead=0) still
 // contributes total input tokens to the denominator.
-function getPiNormalizedUsage(message: unknown, allowInputOnly = false): UsageSnapshot | undefined {
+function getPiNormalizedUsage(
+  message: unknown,
+  allowInputOnly = false,
+): UsageSnapshot | undefined {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return undefined;
 
@@ -3539,7 +5169,8 @@ function getPiNormalizedUsage(message: unknown, allowInputOnly = false): UsageSn
   const cacheWrite = getNonNegativeNumber(usage, "cacheWrite");
   const hasCacheSignal = cacheRead !== undefined || cacheWrite !== undefined;
 
-  if (!hasCacheSignal && (input === undefined || !allowInputOnly)) return undefined;
+  if (!hasCacheSignal && (input === undefined || !allowInputOnly))
+    return undefined;
 
   // Under healthy Pi normalization input is the uncached portion, so
   // totalInput = input + cacheRead + cacheWrite gives the full prompt token count.
@@ -3579,18 +5210,28 @@ function getOpenAIRawUsage(message: unknown): UsageSnapshot | undefined {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return undefined;
 
-  const promptDetails = getNestedRecord(usage, "prompt_tokens_details") ?? getNestedRecord(usage, "promptTokensDetails");
-  const inputDetails = getNestedRecord(usage, "input_tokens_details") ?? getNestedRecord(usage, "inputTokensDetails");
-  const cacheRead = readCachedTokensFromDetails(promptDetails) ?? readCachedTokensFromDetails(inputDetails);
+  const promptDetails =
+    getNestedRecord(usage, "prompt_tokens_details") ??
+    getNestedRecord(usage, "promptTokensDetails");
+  const inputDetails =
+    getNestedRecord(usage, "input_tokens_details") ??
+    getNestedRecord(usage, "inputTokensDetails");
+  const cacheRead =
+    readCachedTokensFromDetails(promptDetails) ??
+    readCachedTokensFromDetails(inputDetails);
   if (cacheRead === undefined) return undefined;
 
-  const cacheWrite = readCacheWriteFromDetails(promptDetails) ?? readCacheWriteFromDetails(inputDetails) ?? 0;
-  const totalInput = getFirstNonNegativeNumber(
-    usage.prompt_tokens,
-    usage.promptTokens,
-    usage.input_tokens,
-    usage.inputTokens,
-  ) ?? cacheRead + cacheWrite;
+  const cacheWrite =
+    readCacheWriteFromDetails(promptDetails) ??
+    readCacheWriteFromDetails(inputDetails) ??
+    0;
+  const totalInput =
+    getFirstNonNegativeNumber(
+      usage.prompt_tokens,
+      usage.promptTokens,
+      usage.input_tokens,
+      usage.inputTokens,
+    ) ?? cacheRead + cacheWrite;
 
   return { cacheRead, cacheWrite, totalInput };
 }
@@ -3602,12 +5243,19 @@ function getAnthropicRawUsage(message: unknown): UsageSnapshot | undefined {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return undefined;
 
-  const cacheRead = getFirstNonNegativeNumber(usage.cache_read_input_tokens, usage.cacheReadInputTokens);
-  const cacheWrite = getFirstNonNegativeNumber(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens);
+  const cacheRead = getFirstNonNegativeNumber(
+    usage.cache_read_input_tokens,
+    usage.cacheReadInputTokens,
+  );
+  const cacheWrite = getFirstNonNegativeNumber(
+    usage.cache_creation_input_tokens,
+    usage.cacheCreationInputTokens,
+  );
   if (cacheRead === undefined && cacheWrite === undefined) return undefined;
 
   // Anthropic input_tokens = tokens after the last cache breakpoint (neither read nor written).
-  const input = getFirstNonNegativeNumber(usage.input_tokens, usage.inputTokens) ?? 0;
+  const input =
+    getFirstNonNegativeNumber(usage.input_tokens, usage.inputTokens) ?? 0;
   return {
     cacheRead: cacheRead ?? 0,
     cacheWrite: cacheWrite ?? 0,
@@ -3637,16 +5285,17 @@ function getGeminiRawUsage(message: unknown): UsageSnapshot | undefined {
   );
   if (cacheRead === undefined) return undefined;
 
-  const totalInput = getFirstNonNegativeNumber(
-    metadata.promptTokenCount,
-    metadata.prompt_token_count,
-    metadata.inputTokenCount,
-    metadata.input_token_count,
-    usage?.input_tokens,
-    usage?.inputTokens,
-    usage?.prompt_tokens,
-    usage?.promptTokens,
-  ) ?? cacheRead;
+  const totalInput =
+    getFirstNonNegativeNumber(
+      metadata.promptTokenCount,
+      metadata.prompt_token_count,
+      metadata.inputTokenCount,
+      metadata.input_token_count,
+      usage?.input_tokens,
+      usage?.inputTokens,
+      usage?.prompt_tokens,
+      usage?.promptTokens,
+    ) ?? cacheRead;
 
   return { cacheRead, cacheWrite: 0, totalInput };
 }
@@ -3660,10 +5309,16 @@ function normalizeWithFallback(
   rawNormalizer: (message: unknown) => UsageSnapshot | undefined,
   options: { allowInputOnlyPiUsage?: boolean } = {},
 ): UsageSnapshot | undefined {
-  return getPiNormalizedUsage(message, options.allowInputOnlyPiUsage) ?? rawNormalizer(message);
+  return (
+    getPiNormalizedUsage(message, options.allowInputOnlyPiUsage) ??
+    rawNormalizer(message)
+  );
 }
 
-function addOpenAIPromptCacheKey(payload: unknown, cacheKey: string | undefined): unknown | undefined {
+function addOpenAIPromptCacheKey(
+  payload: unknown,
+  cacheKey: string | undefined,
+): unknown | undefined {
   const record = asRecord(payload);
   const normalizedCacheKey = clampPromptCacheKey(cacheKey);
   if (!record || !normalizedCacheKey) return undefined;
@@ -3676,7 +5331,10 @@ function addOpenAIPromptCacheKey(payload: unknown, cacheKey: string | undefined)
 }
 
 function hasEffectivePromptCacheKey(record: UnknownRecord): boolean {
-  return isNonEmptyString(record.prompt_cache_key) || isNonEmptyString(record.promptCacheKey);
+  return (
+    isNonEmptyString(record.prompt_cache_key) ||
+    isNonEmptyString(record.promptCacheKey)
+  );
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -3764,7 +5422,9 @@ function describeOptionalOpenAICompatibleProxyCompat(model: PiModel): string[] {
   return optional;
 }
 
-function buildSafeOpenAIProxyCompatSuggestion(missing: string[]): Record<string, boolean> {
+function buildSafeOpenAIProxyCompatSuggestion(
+  missing: string[],
+): Record<string, boolean> {
   const suggestion: Record<string, boolean> = {};
   if (missing.includes("sendSessionAffinityHeaders")) {
     suggestion.sendSessionAffinityHeaders = true;
@@ -3795,7 +5455,9 @@ function hasPromptCacheRetentionUnsupportedText(value: unknown): boolean {
   ].some((needle) => normalized.includes(needle));
 }
 
-function hasPromptCacheRetentionUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
+function hasPromptCacheRetentionUnsupportedSignal(
+  headers: Record<string, string> | undefined,
+): boolean {
   if (!headers) return false;
   return hasPromptCacheRetentionUnsupportedText(
     Object.entries(headers)
@@ -3804,10 +5466,14 @@ function hasPromptCacheRetentionUnsupportedSignal(headers: Record<string, string
   );
 }
 
-function hasPromptCacheRetentionUnsupportedErrorMessage(message: unknown): boolean {
+function hasPromptCacheRetentionUnsupportedErrorMessage(
+  message: unknown,
+): boolean {
   const record = getAssistantRecord(message);
-  return record?.stopReason === "error" &&
-    hasPromptCacheRetentionUnsupportedText(record.errorMessage);
+  return (
+    record?.stopReason === "error" &&
+    hasPromptCacheRetentionUnsupportedText(record.errorMessage)
+  );
 }
 
 function hasPromptCacheKeyUnsupportedText(value: unknown): boolean {
@@ -3826,22 +5492,34 @@ function hasPromptCacheKeyUnsupportedText(value: unknown): boolean {
   // proof that the endpoint lacks support for the field itself.
   const terminal = String.raw`(?=$|[}\]>,.;])`;
   return (
-    new RegExp(String.raw`(?:unsupported|unknown|unrecognized|unexpected)\s+${field}\s*[:=]?\s*${key}${terminal}`).test(normalized) ||
-    new RegExp(String.raw`(?:extra\s+inputs?|${field}\s+not\s+(?:allowed|permitted|supported))\s*[:=]\s*${key}${terminal}`).test(normalized) ||
-    new RegExp(String.raw`${key}(?:\s+${field})?\s*[:=]?\s*(?:is\s+)?${unsupported}${terminal}`).test(normalized)
+    new RegExp(
+      String.raw`(?:unsupported|unknown|unrecognized|unexpected)\s+${field}\s*[:=]?\s*${key}${terminal}`,
+    ).test(normalized) ||
+    new RegExp(
+      String.raw`(?:extra\s+inputs?|${field}\s+not\s+(?:allowed|permitted|supported))\s*[:=]\s*${key}${terminal}`,
+    ).test(normalized) ||
+    new RegExp(
+      String.raw`${key}(?:\s+${field})?\s*[:=]?\s*(?:is\s+)?${unsupported}${terminal}`,
+    ).test(normalized)
   );
 }
 
-function hasPromptCacheKeyUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
+function hasPromptCacheKeyUnsupportedSignal(
+  headers: Record<string, string> | undefined,
+): boolean {
   if (!headers) return false;
-  return Object.entries(headers).some(([key, value]) => hasPromptCacheKeyUnsupportedText(`${key}: ${value}`));
+  return Object.entries(headers).some(([key, value]) =>
+    hasPromptCacheKeyUnsupportedText(`${key}: ${value}`),
+  );
 }
 
 function hasPromptCacheKeyUnsupportedErrorMessage(message: unknown): boolean {
   const record = getAssistantRecord(message);
-  return record?.stopReason === "error" &&
+  return (
+    record?.stopReason === "error" &&
     getOptionalAssistantHttpStatus(record) === 400 &&
-    hasPromptCacheKeyUnsupportedText(record.errorMessage);
+    hasPromptCacheKeyUnsupportedText(record.errorMessage)
+  );
 }
 
 function isPromptCacheKeyUnsupportedApplicable(model: PiModel): boolean {
@@ -3875,41 +5553,58 @@ function hasReasoningProtocolRejectionText(value: unknown): boolean {
   // keeps generic documentation or an unrelated earlier sentence from being
   // treated as runtime protocol evidence.
   const recommendation = normalized.slice(rejectionEnd, rejectionEnd + 260);
-  if (!/\breasoning[_\.]effort\b/.test(recommendation)) return false;
+  if (!/\breasoning[_.]effort\b/.test(recommendation)) return false;
 
   const recommendationClauses = recommendation.split(/[.;!?\n]/);
   return recommendationClauses.some((clause) => {
-    if (!/\breasoning[_\.]effort\b/.test(clause)) return false;
+    if (!/\breasoning[_.]effort\b/.test(clause)) return false;
     // A target mentioned inside a negated/disabled clause is not positive
     // protocol guidance, even if words such as `must` or `supported` occur.
     if (
-      /\b(?:do\s+not|don't|never|avoid)\s+(?:use|set|send|pass|provide)?\s*["'`]?reasoning[_\.]effort\b/.test(clause) ||
-      /\breasoning[_\.]effort\b[^.;]{0,80}\b(?:must|should|may|do)\s+(?:not|never)\b/.test(clause) ||
-      /\breasoning[_\.]effort\b[^.;]{0,80}\b(?:unsupported|disabled|unavailable|not\s+(?:supported|accepted|allowed|available|enabled|required|recommended|expected))\b/.test(clause)
-    ) return false;
+      /\b(?:do\s+not|don't|never|avoid)\s+(?:use|set|send|pass|provide)?\s*["'`]?reasoning[_.]effort\b/.test(
+        clause,
+      ) ||
+      /\breasoning[_.]effort\b[^.;]{0,80}\b(?:must|should|may|do)\s+(?:not|never)\b/.test(
+        clause,
+      ) ||
+      /\breasoning[_.]effort\b[^.;]{0,80}\b(?:unsupported|disabled|unavailable|not\s+(?:supported|accepted|allowed|available|enabled|required|recommended|expected))\b/.test(
+        clause,
+      )
+    )
+      return false;
 
     return [
-      /(?:use|try|set|send|pass|provide)\s+(?:the\s+)?(?:top[- ]level\s+)?["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
-      /(?:reasoning[_\.]effort)\b[^.;]{0,120}(?:instead|required|must\s+be|should\s+be|is\s+(?:supported|accepted|preferred|recommended|expected))\b/,
-      /(?:parameter|field|option)\s+(?:is|should be)\s+["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
-      /instead[^.;]{0,120}(?:use|try|set|send|pass|provide)\s+(?:the\s+)?["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
-      /(?:replace|change|switch)\s+(?:the\s+)?["'`]?thinking["'`]?\s+(?:with|to)\s+["'`]?reasoning[_\.]effort["'`]?(?![a-z0-9_])/,
+      /(?:use|try|set|send|pass|provide)\s+(?:the\s+)?(?:top[- ]level\s+)?["'`]?reasoning[_.]effort["'`]?(?![a-z0-9_])/,
+      /(?:reasoning[_.]effort)\b[^.;]{0,120}(?:instead|required|must\s+be|should\s+be|is\s+(?:supported|accepted|preferred|recommended|expected))\b/,
+      /(?:parameter|field|option)\s+(?:is|should be)\s+["'`]?reasoning[_.]effort["'`]?(?![a-z0-9_])/,
+      /instead[^.;]{0,120}(?:use|try|set|send|pass|provide)\s+(?:the\s+)?["'`]?reasoning[_.]effort["'`]?(?![a-z0-9_])/,
+      /(?:replace|change|switch)\s+(?:the\s+)?["'`]?thinking["'`]?\s+(?:with|to)\s+["'`]?reasoning[_.]effort["'`]?(?![a-z0-9_])/,
     ].some((pattern) => pattern.test(clause));
   });
 }
 
-function hasReasoningProtocolRejectionSignal(headers: Record<string, string> | undefined): boolean {
+function hasReasoningProtocolRejectionSignal(
+  headers: Record<string, string> | undefined,
+): boolean {
   if (!headers) return false;
   // Each response header is one diagnostic unit. Joining all values can pair a
   // rejection from one header with unrelated documentation in another.
   return Object.entries(headers).some(([key, headerValue]) =>
-    hasReasoningProtocolRejectionText(`${key}: ${headerValue}`)
+    hasReasoningProtocolRejectionText(`${key}: ${headerValue}`),
   );
 }
 
-function getOptionalAssistantHttpStatus(record: UnknownRecord): number | undefined {
+function getOptionalAssistantHttpStatus(
+  record: UnknownRecord,
+): number | undefined {
   const readStatus = (value: unknown): number | undefined => {
-    if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) return value;
+    if (
+      typeof value === "number" &&
+      Number.isInteger(value) &&
+      value >= 100 &&
+      value <= 599
+    )
+      return value;
     if (typeof value === "string" && /^\d{3}$/.test(value.trim())) {
       const parsed = Number(value.trim());
       return parsed >= 100 && parsed <= 599 ? parsed : undefined;
@@ -3927,7 +5622,10 @@ function getOptionalAssistantHttpStatus(record: UnknownRecord): number | undefin
   // on the finalized assistant message itself. Traverse only these known
   // diagnostic wrappers, with a small depth bound; never inspect arbitrary
   // payload/message fields for a number that happens to look like a status.
-  const scanDiagnosticStatus = (value: unknown, depth: number): number | undefined => {
+  const scanDiagnosticStatus = (
+    value: unknown,
+    depth: number,
+  ): number | undefined => {
     if (depth > 2) return undefined;
     if (Array.isArray(value)) {
       for (const item of value) {
@@ -3938,7 +5636,13 @@ function getOptionalAssistantHttpStatus(record: UnknownRecord): number | undefin
     }
     const source = asRecord(value);
     if (!source) return undefined;
-    for (const key of ["status", "statusCode", "httpStatus", "httpStatusCode", "code"]) {
+    for (const key of [
+      "status",
+      "statusCode",
+      "httpStatus",
+      "httpStatusCode",
+      "code",
+    ]) {
       const status = readStatus(source[key]);
       if (status !== undefined) return status;
     }
@@ -3948,7 +5652,13 @@ function getOptionalAssistantHttpStatus(record: UnknownRecord): number | undefin
     }
     return undefined;
   };
-  for (const key of ["diagnostics", "diagnostic", "details", "error", "cause"]) {
+  for (const key of [
+    "diagnostics",
+    "diagnostic",
+    "details",
+    "error",
+    "cause",
+  ]) {
     const status = scanDiagnosticStatus(record[key], 0);
     if (status !== undefined) return status;
   }
@@ -3981,20 +5691,32 @@ function hasReasoningProtocolRejectionErrorMessage(message: unknown): boolean {
   // normal Pi path, so recover it only from structured diagnostics or the
   // adapter's status-shaped error prefix. A text-only 400-looking parameter
   // message is not enough evidence for a protocol repair.
-  return getOptionalAssistantHttpStatus(record) === 400 &&
-    hasReasoningProtocolRejectionText(record.errorMessage);
+  return (
+    getOptionalAssistantHttpStatus(record) === 400 &&
+    hasReasoningProtocolRejectionText(record.errorMessage)
+  );
 }
 
-function isReasoningProtocolRejectionSignalApplicable(model: PiModel | undefined): boolean {
+function isReasoningProtocolRejectionSignalApplicable(
+  model: PiModel | undefined,
+): boolean {
   // A provider error can teach us which protocol it expects, so this gate is
   // intentionally broader than the explicit DeepSeek-format diagnostic gate.
   // The model family identifies the affected cache/compat bucket; the error
   // text, not the model name, supplies the wire-protocol evidence.
-  return !!model && isOpenAICompatibleProxyApi(model.api) && isDeepSeekLikeModel(model);
+  return (
+    !!model &&
+    isOpenAICompatibleProxyApi(model.api) &&
+    isDeepSeekLikeModel(model)
+  );
 }
 
-function isReasoningProtocolRejectionForModel(message: unknown, model: PiModel | undefined): boolean {
-  if (!model || !isReasoningProtocolRejectionSignalApplicable(model)) return false;
+function isReasoningProtocolRejectionForModel(
+  message: unknown,
+  model: PiModel | undefined,
+): boolean {
+  if (!model || !isReasoningProtocolRejectionSignalApplicable(model))
+    return false;
   if (!hasReasoningProtocolRejectionErrorMessage(message)) return false;
   const record = getAssistantRecord(message);
   if (!record) return false;
@@ -4002,8 +5724,10 @@ function isReasoningProtocolRejectionForModel(message: unknown, model: PiModel |
   const messageModel = firstNonEmptyString(record.responseModel, record.model);
   // An explicit identity in the finalized assistant error is authoritative.
   // Do not broaden a model-scoped observation to another DeepSeek-named model.
-  return (!messageProvider || messageProvider === model.provider) &&
-    (!messageModel || messageModel === model.id);
+  return (
+    (!messageProvider || messageProvider === model.provider) &&
+    (!messageModel || messageModel === model.id)
+  );
 }
 
 async function notifyReasoningProtocolObservation(
@@ -4018,20 +5742,25 @@ async function notifyReasoningProtocolObservation(
   warnedModelKeys.add(key);
 
   const receipt = await readModelsJsonFixReceipt();
-  const matchingReceipt = isActionableModelsJsonFixReceipt(receipt) &&
+  const matchingReceipt =
+    isActionableModelsJsonFixReceipt(receipt) &&
     receipt.provider === model.provider &&
     receipt.modelId === model.id;
   const recovery = matchingReceipt
     ? "A matching confirmed fix receipt exists; run /cache-optimizer rollback to undo it safely."
     : "Run /cache-optimizer fix to review a model-scoped repair.";
+  if (!isCompatWarningsEnabled()) return;
   ctx.ui.notify(
     `⚠️ ${LOG_PREFIX}: ${key} rejected the configured reasoning format. ${recovery} ` +
-    "No configuration was changed automatically.",
+      "No configuration was changed automatically.",
     "warning",
   );
 }
 
-function fixSuggestionIdentity(model: PiModel): { providerLabel: string; modelId: string } {
+function fixSuggestionIdentity(model: PiModel): {
+  providerLabel: string;
+  modelId: string;
+} {
   const key = modelKey(model);
   const slashIdx = key.indexOf("/");
   return {
@@ -4040,15 +5769,24 @@ function fixSuggestionIdentity(model: PiModel): { providerLabel: string; modelId
   };
 }
 
-function mergeFixSuggestions(...suggestions: Array<FixSuggestion | undefined>): FixSuggestion | undefined {
-  const present = suggestions.filter((suggestion): suggestion is FixSuggestion => suggestion !== undefined);
+function mergeFixSuggestions(
+  ...suggestions: Array<FixSuggestion | undefined>
+): FixSuggestion | undefined {
+  const present = suggestions.filter(
+    (suggestion): suggestion is FixSuggestion => suggestion !== undefined,
+  );
   if (present.length === 0) return undefined;
   const first = present[0];
   return {
     providerLabel: first.providerLabel,
     modelId: first.modelId,
-    compatKeys: Object.assign({}, ...present.map((suggestion) => suggestion.compatKeys)),
-    forceModelLevel: present.some((suggestion) => suggestion.forceModelLevel === true),
+    compatKeys: Object.assign(
+      {},
+      ...present.map((suggestion) => suggestion.compatKeys),
+    ),
+    forceModelLevel: present.some(
+      (suggestion) => suggestion.forceModelLevel === true,
+    ),
   };
 }
 
@@ -4057,7 +5795,8 @@ function buildReasoningProtocolFixSuggestion(
   protocolRejectionObserved = false,
 ): FixSuggestion | undefined {
   if (!protocolRejectionObserved) return undefined;
-  if (!isDeepSeekLikeModel(model) || !isOpenAICompatibleProxyApi(model.api)) return undefined;
+  if (!isDeepSeekLikeModel(model) || !isOpenAICompatibleProxyApi(model.api))
+    return undefined;
 
   const compat = getCompat(model);
   // Explicit provider-specific formats are user/provider evidence in their own
@@ -4106,7 +5845,10 @@ type CompatAdvicePlacement = {
   modelId?: string;
 };
 
-function buildProviderCompatOverride(providerLabel: string, compat: Record<string, unknown>): Record<string, unknown> {
+function buildProviderCompatOverride(
+  providerLabel: string,
+  compat: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     providers: {
       [providerLabel]: {
@@ -4116,7 +5858,11 @@ function buildProviderCompatOverride(providerLabel: string, compat: Record<strin
   };
 }
 
-function buildModelCompatOverride(providerLabel: string, modelId: string, compat: Record<string, unknown>): Record<string, unknown> {
+function buildModelCompatOverride(
+  providerLabel: string,
+  modelId: string,
+  compat: Record<string, unknown>,
+): Record<string, unknown> {
   return {
     providers: {
       [providerLabel]: {
@@ -4130,30 +5876,62 @@ function buildModelCompatOverride(providerLabel: string, modelId: string, compat
   };
 }
 
-function appendCredentialSafeProviderGuidance(lines: string[], placement: CompatAdvicePlacement, compatSuggestion: Record<string, unknown>): void {
+function appendCredentialSafeProviderGuidance(
+  lines: string[],
+  placement: CompatAdvicePlacement,
+  compatSuggestion: Record<string, unknown>,
+): void {
   const providerLabel = placement.providerLabel;
   if (!providerLabel) return;
 
   lines.push("");
   lines.push("If this channel has no models.json provider entry yet:");
-  lines.push("- Keep existing authentication as-is; do not copy credentials, tokens, or API keys.");
-  lines.push(`- Add only cache/routing compat overrides in ${getModelsJsonDisplayPath()}.`);
+  lines.push(
+    "- Keep existing authentication as-is; do not copy credentials, tokens, or API keys.",
+  );
+  lines.push(
+    `- Add only cache/routing compat overrides in ${getModelsJsonDisplayPath()}.`,
+  );
 
   if (Object.keys(compatSuggestion).length === 0) {
-    lines.push("- No safe copyable override is available for the missing flags shown above.");
+    lines.push(
+      "- No safe copyable override is available for the missing flags shown above.",
+    );
     return;
   }
 
   lines.push("Provider-level minimal override:");
-  lines.push(JSON.stringify(buildProviderCompatOverride(providerLabel, compatSuggestion), null, 2));
+  lines.push(
+    JSON.stringify(
+      buildProviderCompatOverride(providerLabel, compatSuggestion),
+      null,
+      2,
+    ),
+  );
 
   if (placement.modelId) {
-    lines.push("Single-model override (use this if only this model should change):");
-    lines.push(JSON.stringify(buildModelCompatOverride(providerLabel, placement.modelId, compatSuggestion), null, 2));
+    lines.push(
+      "Single-model override (use this if only this model should change):",
+    );
+    lines.push(
+      JSON.stringify(
+        buildModelCompatOverride(
+          providerLabel,
+          placement.modelId,
+          compatSuggestion,
+        ),
+        null,
+        2,
+      ),
+    );
   }
 }
 
-function appendOpenAIProxyCompatAdviceLines(lines: string[], missing: string[], options: { includeJsonIntro?: boolean } & CompatAdvicePlacement = {}): void {
+function appendOpenAIProxyCompatAdviceLines(
+  lines: string[],
+  missing: string[],
+  options: { includeJsonIntro?: boolean } & CompatAdvicePlacement = {},
+): void {
   const suggestion = buildSafeOpenAIProxyCompatSuggestion(missing);
   const hasSafeSuggestion = Object.keys(suggestion).length > 0;
 
@@ -4165,16 +5943,23 @@ function appendOpenAIProxyCompatAdviceLines(lines: string[], missing: string[], 
   }
 
   if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for third-party proxies when supported; it helps keep one Pi session on the same upstream/backend.");
+    lines.push(
+      "- sendSessionAffinityHeaders: recommended for third-party proxies when supported; it helps keep one Pi session on the same upstream/backend.",
+    );
   }
   appendCredentialSafeProviderGuidance(lines, options, suggestion);
 }
 
-function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: string[]): void {
+function appendOptionalOpenAIProxyCompatAdviceLines(
+  lines: string[],
+  optional: string[],
+): void {
   if (!optional.includes("supportsLongCacheRetention")) return;
   lines.push("");
   lines.push("Optional (not required, not auto-fixed):");
-  lines.push("- supportsLongCacheRetention: enable only after your endpoint/proxy explicitly supports OpenAI long prompt cache retention.");
+  lines.push(
+    "- supportsLongCacheRetention: enable only after your endpoint/proxy explicitly supports OpenAI long prompt cache retention.",
+  );
   lines.push(`- ${getPromptCacheRetentionUnsupportedHint()}`);
 }
 
@@ -4190,7 +5975,10 @@ function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: s
  * Expected use: the openai adapter's warningText calls this function; tests
  * exercise it via __internals_for_tests.
  */
-function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): string {
+function buildOpenAIProxyCompatWarningText(
+  key: string,
+  missing: string[],
+): string {
   // Extract provider id from the model key (e.g. "otokapi/gpt-5.5" -> "otokapi").
   // If no slash is found, fall back to the key itself.
   const slashIdx = key.indexOf("/");
@@ -4204,7 +5992,10 @@ function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): stri
     ``,
   ];
 
-  appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId });
+  appendOpenAIProxyCompatAdviceLines(lines, missing, {
+    providerLabel,
+    modelId,
+  });
 
   return lines.join("\n");
 }
@@ -4220,9 +6011,11 @@ function isDeepSeekWireCompatApplicable(model: PiModel): boolean {
   // `thinkingFormat` is the only wire-protocol signal. The model family is
   // still name/id based for adapter selection, while provider, URL, and
   // supportsReasoningEffort remain deliberately irrelevant here.
-  return isDeepSeekLikeModel(model)
-    && isOpenAICompatibleProxyApi(model.api)
-    && getCompat(model).thinkingFormat === "deepseek";
+  return (
+    isDeepSeekLikeModel(model) &&
+    isOpenAICompatibleProxyApi(model.api) &&
+    getCompat(model).thinkingFormat === "deepseek"
+  );
 }
 
 function describeMissingDeepSeekCompat(model: PiModel): string[] {
@@ -4263,7 +6056,9 @@ function describeMissingCacheCompatForModel(model: PiModel): string[] {
   return missing;
 }
 
-function buildDeepSeekCompatSuggestion(missing: string[]): Record<string, unknown> {
+function buildDeepSeekCompatSuggestion(
+  missing: string[],
+): Record<string, unknown> {
   const suggestion: Record<string, unknown> = {
     ...buildSafeOpenAIProxyCompatSuggestion(missing),
   };
@@ -4273,7 +6068,11 @@ function buildDeepSeekCompatSuggestion(missing: string[]): Record<string, unknow
   return suggestion;
 }
 
-function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
+function appendDeepSeekCompatAdviceLines(
+  lines: string[],
+  missing: string[],
+  placement: CompatAdvicePlacement = {},
+): void {
   const suggestion = buildDeepSeekCompatSuggestion(missing);
   if (Object.keys(suggestion).length > 0) {
     lines.push("Recommended DeepSeek reasoning/replay compat snippet:");
@@ -4281,16 +6080,23 @@ function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], pla
   }
 
   if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
-    lines.push('- requiresReasoningContentOnAssistantMessages: true keeps replayed assistant turns compatible with an explicitly selected DeepSeek reasoning wire format.');
+    lines.push(
+      "- requiresReasoningContentOnAssistantMessages: true keeps replayed assistant turns compatible with an explicitly selected DeepSeek reasoning wire format.",
+    );
   }
   if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for third-party OpenAI-compatible proxies when supported; it helps keep one Pi session on the same upstream/backend.");
+    lines.push(
+      "- sendSessionAffinityHeaders: recommended for third-party OpenAI-compatible proxies when supported; it helps keep one Pi session on the same upstream/backend.",
+    );
   }
 
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
 }
 
-function buildDeepSeekCompatWarningText(key: string, missing: string[]): string {
+function buildDeepSeekCompatWarningText(
+  key: string,
+  missing: string[],
+): string {
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
@@ -4316,7 +6122,9 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
       return isDeepSeekLikeAssistantMessage(message, model);
     },
     normalizeUsage(message) {
-      return normalizeWithFallback(message, getDeepSeekRawUsage, { allowInputOnlyPiUsage: true });
+      return normalizeWithFallback(message, getDeepSeekRawUsage, {
+        allowInputOnlyPiUsage: true,
+      });
     },
     warningText(model) {
       const missing = describeMissingCacheCompatForModel(model);
@@ -4341,7 +6149,12 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
       return normalizeWithFallback(message, getAnthropicRawUsage);
     },
     warningText(model) {
-      if (!isClaudeLikeModel(model) || !isOpenAICompatibleApi(model.api) || isPiBuiltInLlamaCppModel(model)) return undefined;
+      if (
+        !isClaudeLikeModel(model) ||
+        !isOpenAICompatibleApi(model.api) ||
+        isPiBuiltInLlamaCppModel(model)
+      )
+        return undefined;
       if (getCompat(model).cacheControlFormat === "anthropic") return undefined;
 
       return (
@@ -5270,16 +7083,23 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
   },
 ];
 
-function selectAdapterForModel(model: PiModel | undefined): CacheProviderAdapter | undefined {
+function selectAdapterForModel(
+  model: PiModel | undefined,
+): CacheProviderAdapter | undefined {
   return CACHE_PROVIDER_ADAPTERS.find((adapter) => adapter.matchesModel(model));
 }
 
-function selectAdapterForAssistantMessage(message: unknown, model: PiModel | undefined): CacheProviderAdapter | undefined {
+function selectAdapterForAssistantMessage(
+  message: unknown,
+  model: PiModel | undefined,
+): CacheProviderAdapter | undefined {
   // Assistant message metadata is request-local and authoritative for virtual
   // routing providers. Use it first for every model; direct providers normally
   // echo the same provider/model and therefore remain unchanged.
   const responseModel = modelFromAssistantMessage(message, model);
-  return CACHE_PROVIDER_ADAPTERS.find((adapter) => adapter.matchesAssistantMessage(message, responseModel));
+  return CACHE_PROVIDER_ADAPTERS.find((adapter) =>
+    adapter.matchesAssistantMessage(message, responseModel),
+  );
 }
 
 function notifyCacheCompatIfNeeded(
@@ -5288,6 +7108,7 @@ function notifyCacheCompatIfNeeded(
   warnedModels: Set<string>,
 ): void {
   if (!model) return;
+  if (!isCompatWarningsEnabled()) return;
 
   // A protocol rejection is retained separately from ordinary compat warnings;
   // it is surfaced once by the response hook and can be used by a later fix.
@@ -5302,7 +7123,10 @@ function notifyCacheCompatIfNeeded(
       const key = `adaptive-thinking:${modelKey(model)}`;
       if (!warnedModels.has(key)) {
         warnedModels.add(key);
-        ctx.ui.notify(buildAdaptiveThinkingCompatWarningText(modelKey(model), missing), "warning");
+        ctx.ui.notify(
+          buildAdaptiveThinkingCompatWarningText(modelKey(model), missing),
+          "warning",
+        );
       }
     }
     // Still check adapter warnings for other compat issues.
@@ -5338,8 +7162,12 @@ function emptyCacheStats(day = currentLocalDay()): CacheStats {
   };
 }
 
-function emptyAllCacheStats(day = currentLocalDay()): Partial<Record<CacheProviderId, CacheStats>> {
-  return Object.fromEntries(CACHE_PROVIDER_IDS.map((id) => [id, emptyCacheStats(day)])) as Partial<Record<CacheProviderId, CacheStats>>;
+function emptyAllCacheStats(
+  day = currentLocalDay(),
+): Partial<Record<CacheProviderId, CacheStats>> {
+  return Object.fromEntries(
+    CACHE_PROVIDER_IDS.map((id) => [id, emptyCacheStats(day)]),
+  ) as Partial<Record<CacheProviderId, CacheStats>>;
 }
 
 function addUsageToCacheStats(stats: CacheStats, usage: UsageSnapshot): void {
@@ -5359,18 +7187,25 @@ function formatTokenCount(value: number): string {
   return `${millions.toFixed(2)}M`;
 }
 
-function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats): string {
-  const percent = stats.totalInputTokens > 0
-    ? (stats.cachedInputTokens / stats.totalInputTokens) * 100
-    : 0;
-  const writeText = adapter.showCacheWrite && stats.cacheWriteInputTokens > 0
-    ? `·write ${formatTokenCount(stats.cacheWriteInputTokens)}`
-    : "";
+function formatCacheStats(
+  adapter: CacheProviderAdapter,
+  stats: CacheStats,
+): string {
+  const percent =
+    stats.totalInputTokens > 0
+      ? (stats.cachedInputTokens / stats.totalInputTokens) * 100
+      : 0;
+  const writeText =
+    adapter.showCacheWrite && stats.cacheWriteInputTokens > 0
+      ? `·write ${formatTokenCount(stats.cacheWriteInputTokens)}`
+      : "";
 
   return `${adapter.label} ${stats.hitRequests}/${stats.totalRequests}·${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} ${percent.toFixed(1)}%${writeText}`;
 }
 
-function prefixFooterStatus(statusText: string | undefined): string | undefined {
+function prefixFooterStatus(
+  statusText: string | undefined,
+): string | undefined {
   if (!statusText || statusText.startsWith("· ")) return statusText;
   return `· ${statusText}`;
 }
@@ -5402,7 +7237,10 @@ function formatTokenM(value: number): string {
  * absent/zero AND raw usage fields (prompt_tokens, etc.) are also absent/zero
  * for the given adapter.
  */
-function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter): boolean {
+function hasMissingUsageFields(
+  message: unknown,
+  adapter: CacheProviderAdapter,
+): boolean {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return true;
 
@@ -5412,13 +7250,22 @@ function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter):
   const cacheWrite = getNonNegativeNumber(usage, "cacheWrite");
 
   // If Pi-normalized fields exist with non-zero values, usage is present
-  if (cacheRead !== undefined || cacheWrite !== undefined || (input !== undefined && input > 0)) {
+  if (
+    cacheRead !== undefined ||
+    cacheWrite !== undefined ||
+    (input !== undefined && input > 0)
+  ) {
     return false;
   }
 
   // Check raw usage for the adapter's provider family
   const rawUsage = adapter.normalizeUsage(message);
-  if (!rawUsage || (rawUsage.cacheRead === 0 && rawUsage.cacheWrite === 0 && rawUsage.totalInput === 0)) {
+  if (
+    !rawUsage ||
+    (rawUsage.cacheRead === 0 &&
+      rawUsage.cacheWrite === 0 &&
+      rawUsage.totalInput === 0)
+  ) {
     return true;
   }
 
@@ -5429,7 +7276,10 @@ function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter):
  * Build a summary string for the recent trend (last N samples).
  * Example: "Recent 10: 7/10 hits · 65% tok cached · no missing usage"
  */
-function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number): string {
+function formatRecentTrendSummary(
+  samples: CacheUsageSample[],
+  maxCount: number,
+): string {
   const recent = samples.slice(-maxCount);
   if (recent.length === 0) return `Recent ${maxCount}: no samples yet`;
 
@@ -5438,8 +7288,8 @@ function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number)
   const totalInput = recent.reduce((sum, s) => sum + s.totalInputTokens, 0);
   const missingCount = recent.filter((s) => s.missingUsageFields).length;
 
-  const hitRatio = formatHitRatio(hits, recent.length);
-  const tokenRatio = totalInput > 0 ? formatHitRatio(totalCached, totalInput) : "N/A";
+  const tokenRatio =
+    totalInput > 0 ? formatHitRatio(totalCached, totalInput) : "N/A";
 
   let result = `Recent ${recent.length}/${maxCount}: ${hits}/${recent.length} hits · ${tokenRatio} tok cached`;
   if (missingCount > 0) {
@@ -5452,19 +7302,28 @@ function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number)
  * Build the output for `/cache-optimizer stats`.
  */
 function formatCompactStats(stats: CacheStats): string {
-  const percent = stats.totalInputTokens > 0
-    ? (stats.cachedInputTokens / stats.totalInputTokens) * 100
-    : 0;
+  const percent =
+    stats.totalInputTokens > 0
+      ? (stats.cachedInputTokens / stats.totalInputTokens) * 100
+      : 0;
   return `${stats.hitRequests}/${stats.totalRequests}·${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} ${percent.toFixed(1)}%`;
 }
 
-function modelFromStatsKey(key: string, ref?: PersistedRoutedModelRef): PiModel | undefined {
+function modelFromStatsKey(
+  key: string,
+  ref?: PersistedRoutedModelRef,
+): PiModel | undefined {
   const slash = key.indexOf("/");
   if (slash <= 0 || slash >= key.length - 1) return undefined;
-  return routedModelRefToPiModel(ref ?? { provider: key.slice(0, slash), id: key.slice(slash + 1) });
+  return routedModelRefToPiModel(
+    ref ?? { provider: key.slice(0, slash), id: key.slice(slash + 1) },
+  );
 }
 
-function sortStatsEntries(entries: Array<[string, CacheStats]>, activeModelKey?: string): Array<[string, CacheStats]> {
+function sortStatsEntries(
+  entries: Array<[string, CacheStats]>,
+  activeModelKey?: string,
+): Array<[string, CacheStats]> {
   return entries.sort(([left], [right]) => {
     if (left === activeModelKey) return -1;
     if (right === activeModelKey) return 1;
@@ -5479,64 +7338,131 @@ function buildSessionStatsOutput(
 ): string {
   const activeKey = activeModel ? modelKey(activeModel) : undefined;
   const models = { ...sessionModels };
-  if (activeModel && selectAdapterForModel(activeModel) && !models[activeKey!]) {
+  if (
+    activeModel &&
+    selectAdapterForModel(activeModel) &&
+    !models[activeKey!]
+  ) {
     models[activeKey!] = emptyCacheStats();
   }
   const entries = sortStatsEntries(Object.entries(models), activeKey);
-  if (entries.length === 0) return "ℹ️ No cache statistics recorded for the current session today.";
-  const lines = ["Scope: current session", `Day:   ${currentLocalDay()}`, `Models: ${entries.length}`];
+  if (entries.length === 0)
+    return "ℹ️ No cache statistics recorded for the current session today.";
+  const lines = [
+    "Scope: current session",
+    `Day:   ${currentLocalDay()}`,
+    `Models: ${entries.length}`,
+  ];
   for (const [key, stats] of entries) {
     const model = modelFromStatsKey(key, modelRefsByKey[key]);
     const adapter = model ? selectAdapterForModel(model) : undefined;
-    lines.push("", `── ${key} ──`, `Adapter: ${adapter?.label ?? "Unknown cache adapter"}`);
-    lines.push(`Requests:      ${stats.hitRequests} hit / ${stats.totalRequests} total`);
-    lines.push(`Cached tokens: ${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} input · ${stats.totalInputTokens > 0 ? `${((stats.cachedInputTokens / stats.totalInputTokens) * 100).toFixed(1)}%` : "0.0%"}`);
+    lines.push(
+      "",
+      `── ${key} ──`,
+      `Adapter: ${adapter?.label ?? "Unknown cache adapter"}`,
+    );
+    lines.push(
+      `Requests:      ${stats.hitRequests} hit / ${stats.totalRequests} total`,
+    );
+    lines.push(
+      `Cached tokens: ${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} input · ${stats.totalInputTokens > 0 ? `${((stats.cachedInputTokens / stats.totalInputTokens) * 100).toFixed(1)}%` : "0.0%"}`,
+    );
     lines.push(`Summary:       ${formatCompactStats(stats)}`);
-    if (stats.cacheWriteInputTokens > 0) lines.push(`Cache write:   ${formatTokenCount(stats.cacheWriteInputTokens)}`);
+    if (stats.cacheWriteInputTokens > 0)
+      lines.push(
+        `Cache write:   ${formatTokenCount(stats.cacheWriteInputTokens)}`,
+      );
   }
   return lines.join("\n");
 }
 
 function buildAllStatsOutput(aggregate: ShardAggregate): string {
   const entries = sortStatsEntries(Object.entries(aggregate.totalsByModel));
-  if (entries.length === 0) return "ℹ️ No local cache statistics recorded today.";
+  if (entries.length === 0)
+    return "ℹ️ No local cache statistics recorded today.";
   const sessionCount = Object.keys(aggregate.instancesBySession).length;
-  const instanceCount = Object.values(aggregate.instancesBySession).reduce((sum, value) => sum + value, 0);
-  const lines = ["Scope: all local sessions", `Day:   ${currentLocalDay()}`, `Sessions: ${sessionCount}`, `Instances: ${instanceCount}`];
+  const instanceCount = Object.values(aggregate.instancesBySession).reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+  const lines = [
+    "Scope: all local sessions",
+    `Day:   ${currentLocalDay()}`,
+    `Sessions: ${sessionCount}`,
+    `Instances: ${instanceCount}`,
+  ];
   for (const [key, stats] of entries) {
     const model = modelFromStatsKey(key, aggregate.modelRefsByKey[key]);
     const adapter = model ? selectAdapterForModel(model) : undefined;
-    lines.push("", `── ${key} ──`, `Adapter: ${adapter?.label ?? "Unknown cache adapter"}`);
-    lines.push(`Sessions: ${aggregate.sessionsByModel[key] ?? 0} · Instances: ${aggregate.instancesByModel[key] ?? 0}`);
-    lines.push(`Requests:      ${stats.hitRequests} hit / ${stats.totalRequests} total`);
-    lines.push(`Cached tokens: ${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} input · ${stats.totalInputTokens > 0 ? `${((stats.cachedInputTokens / stats.totalInputTokens) * 100).toFixed(1)}%` : "0.0%"}`);
+    lines.push(
+      "",
+      `── ${key} ──`,
+      `Adapter: ${adapter?.label ?? "Unknown cache adapter"}`,
+    );
+    lines.push(
+      `Sessions: ${aggregate.sessionsByModel[key] ?? 0} · Instances: ${aggregate.instancesByModel[key] ?? 0}`,
+    );
+    lines.push(
+      `Requests:      ${stats.hitRequests} hit / ${stats.totalRequests} total`,
+    );
+    lines.push(
+      `Cached tokens: ${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} input · ${stats.totalInputTokens > 0 ? `${((stats.cachedInputTokens / stats.totalInputTokens) * 100).toFixed(1)}%` : "0.0%"}`,
+    );
     lines.push(`Summary:       ${formatCompactStats(stats)}`);
-    if (stats.cacheWriteInputTokens > 0) lines.push(`Cache write:   ${formatTokenCount(stats.cacheWriteInputTokens)}`);
+    if (stats.cacheWriteInputTokens > 0)
+      lines.push(
+        `Cache write:   ${formatTokenCount(stats.cacheWriteInputTokens)}`,
+      );
   }
   return lines.join("\n");
 }
 
-function buildContributorsStatsOutput(aggregate: ShardAggregate, activeModel: PiModel | undefined, currentSessionHash?: string): string {
+function buildContributorsStatsOutput(
+  aggregate: ShardAggregate,
+  activeModel: PiModel | undefined,
+  currentSessionHash?: string,
+): string {
   if (!activeModel) return "ℹ️ No active model selected.";
   const key = modelKey(activeModel);
   const rows = Object.entries(aggregate.bySession)
     .filter(([, models]) => models[key])
-    .sort(([left], [right]) => left === currentSessionHash ? -1 : right === currentSessionHash ? 1 : left.localeCompare(right));
+    .sort(([left], [right]) =>
+      left === currentSessionHash
+        ? -1
+        : right === currentSessionHash
+          ? 1
+          : left.localeCompare(right),
+    );
   if (rows.length === 0) return `ℹ️ No contributors recorded for ${key} today.`;
   const lines = [`Model: ${key}`, "Scope: contributing local sessions today"];
   let otherIndex = 0;
   for (const [sessionHash, models] of rows) {
-    const label = sessionHash === currentSessionHash ? "Current session" : `Other session ${++otherIndex}`;
-    lines.push("", label, `  Instances: ${aggregate.instancesBySessionModel[sessionHash]?.[key] ?? 0}`, `  ${formatCompactStats(models[key])}`);
+    const label =
+      sessionHash === currentSessionHash
+        ? "Current session"
+        : `Other session ${++otherIndex}`;
+    lines.push(
+      "",
+      label,
+      `  Instances: ${aggregate.instancesBySessionModel[sessionHash]?.[key] ?? 0}`,
+      `  ${formatCompactStats(models[key])}`,
+    );
   }
   return lines.join("\n");
 }
 
-function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdapter | undefined, stats: CacheStats | undefined, recentSamples: CacheUsageSample[]): string {
+function buildStatsOutput(
+  model: PiModel | undefined,
+  adapter: CacheProviderAdapter | undefined,
+  stats: CacheStats | undefined,
+  recentSamples: CacheUsageSample[],
+): string {
   const lines: string[] = [];
 
   if (!model || !adapter) {
-    lines.push("ℹ️ No cache-adapter-matched model active. Select a model with a recognized provider family.");
+    lines.push(
+      "ℹ️ No cache-adapter-matched model active. Select a model with a recognized provider family.",
+    );
     return lines.join("\n");
   }
 
@@ -5547,10 +7473,16 @@ function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdap
   lines.push(`Adapter:   ${adapter.label}`);
   lines.push("");
   lines.push("── Today ──");
-  lines.push(`Requests:      ${currentStats.hitRequests} hit / ${currentStats.totalRequests} total · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`);
-  lines.push(`Cached tokens: ${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M input · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "N/A"}`);
+  lines.push(
+    `Requests:      ${currentStats.hitRequests} hit / ${currentStats.totalRequests} total · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`,
+  );
+  lines.push(
+    `Cached tokens: ${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M input · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "N/A"}`,
+  );
   if (currentStats.cacheWriteInputTokens > 0) {
-    lines.push(`Cache write:   ${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
+    lines.push(
+      `Cache write:   ${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`,
+    );
   }
 
   lines.push("");
@@ -5562,8 +7494,12 @@ function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdap
   const missingAny = recentSamples.some((s) => s.missingUsageFields);
   if (missingAny) {
     lines.push("");
-    lines.push("⚠️ Some recent responses had missing or empty cache usage fields. Footer may under-report hits.");
-    lines.push("   The proxy may not return prompt_cache_hit_tokens or usage.input/cacheRead in responses.");
+    lines.push(
+      "⚠️ Some recent responses had missing or empty cache usage fields. Footer may under-report hits.",
+    );
+    lines.push(
+      "   The proxy may not return prompt_cache_hit_tokens or usage.input/cacheRead in responses.",
+    );
   }
 
   return lines.join("\n");
@@ -5577,14 +7513,19 @@ function getErrorCode(error: unknown): string | undefined {
 
 function parseCacheStats(value: unknown): CacheStats | undefined {
   const stats = asRecord(value);
-  if (!stats || typeof stats.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(stats.day)) {
+  if (
+    !stats ||
+    typeof stats.day !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(stats.day)
+  ) {
     return undefined;
   }
 
   const totalRequests = getNonNegativeNumber(stats, "totalRequests");
   const hitRequests = getNonNegativeNumber(stats, "hitRequests");
   const cachedInputTokens = getNonNegativeNumber(stats, "cachedInputTokens");
-  const cacheWriteInputTokens = getNonNegativeNumber(stats, "cacheWriteInputTokens") ?? 0;
+  const cacheWriteInputTokens =
+    getNonNegativeNumber(stats, "cacheWriteInputTokens") ?? 0;
   const totalInputTokens = getNonNegativeNumber(stats, "totalInputTokens");
 
   if (
@@ -5621,7 +7562,10 @@ function addCacheStatsTotals(target: CacheStats, source: CacheStats): void {
   target.totalInputTokens += source.totalInputTokens;
 }
 
-function mergeCacheStatsForTotal(existing: CacheStats | undefined, incoming: CacheStats): CacheStats {
+function mergeCacheStatsForTotal(
+  existing: CacheStats | undefined,
+  incoming: CacheStats,
+): CacheStats {
   if (!existing) return cloneCacheStats(incoming);
   if (incoming.day > existing.day) return cloneCacheStats(incoming);
   if (incoming.day < existing.day) return existing;
@@ -5629,7 +7573,9 @@ function mergeCacheStatsForTotal(existing: CacheStats | undefined, incoming: Cac
   return existing;
 }
 
-function deriveTotalsByModelFromSessionStats(statsByModel: Record<string, CacheStats>): Record<string, CacheStats> {
+function deriveTotalsByModelFromSessionStats(
+  statsByModel: Record<string, CacheStats>,
+): Record<string, CacheStats> {
   const totals: Record<string, CacheStats> = {};
   for (const [fullKey, stats] of Object.entries(statsByModel)) {
     totals[modelKeyFromSessionKey(fullKey)] = mergeCacheStatsForTotal(
@@ -5640,7 +7586,9 @@ function deriveTotalsByModelFromSessionStats(statsByModel: Record<string, CacheS
   return totals;
 }
 
-function parsePersistedTotalsByModel(value: unknown): Record<string, CacheStats> | undefined {
+function parsePersistedTotalsByModel(
+  value: unknown,
+): Record<string, CacheStats> | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
 
@@ -5652,7 +7600,9 @@ function parsePersistedTotalsByModel(value: unknown): Record<string, CacheStats>
   return totals;
 }
 
-function parsePersistedRoutedModelRef(value: unknown): PersistedRoutedModelRef | undefined {
+function parsePersistedRoutedModelRef(
+  value: unknown,
+): PersistedRoutedModelRef | undefined {
   const record = asRecord(value);
   const provider = record?.provider;
   const id = record?.id;
@@ -5692,7 +7642,9 @@ function selectFooterStatsForModel(
   if (mode === "total") return totalsByModel[modelKey(model)];
   if (mode === "process") return processByModel[modelKey(model)];
   if (!sessionHash) return undefined;
-  return statsByModel[makeSessionModelKey(sessionHash, model.provider, model.id)];
+  return statsByModel[
+    makeSessionModelKey(sessionHash, model.provider, model.id)
+  ];
 }
 
 function buildExactRouterStatusEntry(
@@ -5702,7 +7654,9 @@ function buildExactRouterStatusEntry(
   totalsByModel: Record<string, CacheStats> = {},
   mode: FooterStatsMode = "total",
   processByModel: Record<string, CacheStats> = {},
-): { model: PiModel; adapter: CacheProviderAdapter; stats: CacheStats } | undefined {
+):
+  | { model: PiModel; adapter: CacheProviderAdapter; stats: CacheStats }
+  | undefined {
   if (!sessionHash || !lastRoutedModel) return undefined;
 
   const model = routedModelRefToPiModel(lastRoutedModel);
@@ -5712,7 +7666,15 @@ function buildExactRouterStatusEntry(
   return {
     model,
     adapter,
-    stats: selectFooterStatsForModel(mode, sessionHash, statsByModel, totalsByModel, model, processByModel) ?? emptyCacheStats(),
+    stats:
+      selectFooterStatsForModel(
+        mode,
+        sessionHash,
+        statsByModel,
+        totalsByModel,
+        model,
+        processByModel,
+      ) ?? emptyCacheStats(),
   };
 }
 
@@ -5722,17 +7684,30 @@ function findBestRouterModelStats(
   statsByModel: Record<string, CacheStats>,
   totalsByModel: Record<string, CacheStats>,
   processByModel: Record<string, CacheStats> = {},
-): { model: PiModel; adapter: CacheProviderAdapter; stats: CacheStats } | undefined {
-  const entries = mode === "total"
-    ? Object.entries(totalsByModel)
-    : mode === "process"
-      ? Object.entries(processByModel)
-    : sessionHash
-      ? Object.entries(statsByModel)
-        .filter(([key]) => key.startsWith(`${sessionHash}:`))
-        .map(([key, stats]) => [key.slice(sessionHash.length + 1), stats] as const)
-      : [];
-  let best: { model: PiModel; adapter: CacheProviderAdapter; stats: CacheStats; total: number } | undefined;
+):
+  | { model: PiModel; adapter: CacheProviderAdapter; stats: CacheStats }
+  | undefined {
+  const entries =
+    mode === "total"
+      ? Object.entries(totalsByModel)
+      : mode === "process"
+        ? Object.entries(processByModel)
+        : sessionHash
+          ? Object.entries(statsByModel)
+              .filter(([key]) => key.startsWith(`${sessionHash}:`))
+              .map(
+                ([key, stats]) =>
+                  [key.slice(sessionHash.length + 1), stats] as const,
+              )
+          : [];
+  let best:
+    | {
+        model: PiModel;
+        adapter: CacheProviderAdapter;
+        stats: CacheStats;
+        total: number;
+      }
+    | undefined;
 
   for (const [modelKeyPart, stats] of entries) {
     const slashIdx = modelKeyPart.indexOf("/");
@@ -5748,7 +7723,9 @@ function findBestRouterModelStats(
     }
   }
 
-  return best ? { model: best.model, adapter: best.adapter, stats: best.stats } : undefined;
+  return best
+    ? { model: best.model, adapter: best.adapter, stats: best.stats }
+    : undefined;
 }
 
 function parsePersistedCacheStats(value: unknown): CacheStatsState | undefined {
@@ -5789,19 +7766,28 @@ function parsePersistedCacheStats(value: unknown): CacheStatsState | undefined {
       }
     }
 
-    const lastRoutedModelBySession: Record<string, PersistedRoutedModelRef> = {};
+    const lastRoutedModelBySession: Record<string, PersistedRoutedModelRef> =
+      {};
     const rawLastRoutedModels = asRecord(record.lastRoutedModelBySession);
     if (rawLastRoutedModels) {
-      for (const [sessionHash, rawModel] of Object.entries(rawLastRoutedModels)) {
+      for (const [sessionHash, rawModel] of Object.entries(
+        rawLastRoutedModels,
+      )) {
         const parsed = parsePersistedRoutedModelRef(rawModel);
         if (parsed) lastRoutedModelBySession[sessionHash] = parsed;
       }
     }
 
     const parsedTotals = parsePersistedTotalsByModel(record.totalsByModel);
-    const totalsByModel = parsedTotals ?? deriveTotalsByModelFromSessionStats(statsByModel);
+    const totalsByModel =
+      parsedTotals ?? deriveTotalsByModelFromSessionStats(statsByModel);
 
-    return { statsByModel, totalsByModel, legacyFamily, lastRoutedModelBySession };
+    return {
+      statsByModel,
+      totalsByModel,
+      legacyFamily,
+      lastRoutedModelBySession,
+    };
   }
 
   // version 3: migrate to v4/v5 semantics by wrapping statsByModel into sessions
@@ -5824,7 +7810,11 @@ function parsePersistedCacheStats(value: unknown): CacheStatsState | undefined {
       }
     }
 
-    return { statsByModel, totalsByModel: deriveTotalsByModelFromSessionStats(statsByModel), legacyFamily };
+    return {
+      statsByModel,
+      totalsByModel: deriveTotalsByModelFromSessionStats(statsByModel),
+      legacyFamily,
+    };
   }
 
   // version 2: migrate statsByProvider into legacyFamily
@@ -5843,7 +7833,13 @@ function parsePersistedCacheStats(value: unknown): CacheStatsState | undefined {
   // version 1: single DeepSeek stats -> migrate to legacyFamily.deepseek
   if (record.version === 1) {
     const migrated = parseCacheStats(record.stats);
-    return migrated ? { statsByModel: {}, totalsByModel: {}, legacyFamily: { deepseek: migrated } } : undefined;
+    return migrated
+      ? {
+          statsByModel: {},
+          totalsByModel: {},
+          legacyFamily: { deepseek: migrated },
+        }
+      : undefined;
   }
 
   return undefined;
@@ -5855,7 +7851,10 @@ async function readPersistedCacheStats(): Promise<CacheStatsState | undefined> {
     return parsePersistedCacheStats(JSON.parse(raw));
   } catch (error) {
     if (getErrorCode(error) !== "ENOENT") {
-      console.warn(`${LOG_PREFIX}: failed to read persisted cache stats`, error);
+      console.warn(
+        `${LOG_PREFIX}: failed to read persisted cache stats`,
+        error,
+      );
       return undefined;
     }
   }
@@ -5872,11 +7871,17 @@ async function readPersistedCacheStats(): Promise<CacheStatsState | undefined> {
           await unlink(LEGACY_STATE_FILE_PATH);
         } catch (unlinkError) {
           if (getErrorCode(unlinkError) !== "ENOENT") {
-            console.warn(`${LOG_PREFIX}: failed to remove legacy stats file`, unlinkError);
+            console.warn(
+              `${LOG_PREFIX}: failed to remove legacy stats file`,
+              unlinkError,
+            );
           }
         }
       } catch (writeError) {
-        console.warn(`${LOG_PREFIX}: failed to migrate legacy cache stats`, writeError);
+        console.warn(
+          `${LOG_PREFIX}: failed to migrate legacy cache stats`,
+          writeError,
+        );
       }
       return parsed;
     }
@@ -5905,7 +7910,9 @@ function filterRestorableStatsForSession(
       filteredModelStats[`${currentSessionHash}:${fullKey}`] = stats;
     } else if (fullKey.startsWith("_nosession:")) {
       // Transitional _nosession bucket — migrate to current session.
-      filteredModelStats[`${currentSessionHash}:${fullKey.slice("_nosession:".length)}`] = stats;
+      filteredModelStats[
+        `${currentSessionHash}:${fullKey.slice("_nosession:".length)}`
+      ] = stats;
     }
   }
 
@@ -5954,25 +7961,7 @@ function mergeCacheSessions(
     sessions[hash] = { ...models };
   }
 
-  if (currentSessionHash !== undefined) {
-    // Explicit hash mode: extract this session's data from state.statsByModel.
-    // When the session has no entries (e.g. after reset of sole bucket), this
-    // still sets an empty map, ensuring the deleted bucket does not return.
-    const prefix = `${currentSessionHash}:`;
-    const currentModelStats: Record<string, CacheStats> = {};
-    for (const [fullKey, stats] of Object.entries(state.statsByModel)) {
-      if (fullKey.startsWith(prefix)) {
-        currentModelStats[fullKey.slice(prefix.length)] = stats;
-      }
-    }
-    sessions[currentSessionHash] = currentModelStats;
-
-    // _nosession is a transitional legacy migration bucket — once we write
-    // under an authoritative session hash, those entries have already been
-    // consumed and migrated into memory by restoreCacheStats. Delete to
-    // prevent resurrection of reset stats on the next reload.
-    delete sessions["_nosession"];
-  } else {
+  if (currentSessionHash === undefined) {
     // No-hash mode: group entries by their existing hash prefix to avoid
     // collapsing multiple sessions into one bucket. Keys without a hash
     // prefix (legacy v3) go under "_nosession" so restoreCacheStats can
@@ -5993,12 +7982,32 @@ function mergeCacheSessions(
     if (Object.keys(nosessionMap).length > 0) {
       sessions["_nosession"] = nosessionMap;
     }
+  } else {
+    // Explicit hash mode: extract this session's data from state.statsByModel.
+    // When the session has no entries (e.g. after reset of sole bucket), this
+    // still sets an empty map, ensuring the deleted bucket does not return.
+    const prefix = `${currentSessionHash}:`;
+    const currentModelStats: Record<string, CacheStats> = {};
+    for (const [fullKey, stats] of Object.entries(state.statsByModel)) {
+      if (fullKey.startsWith(prefix)) {
+        currentModelStats[fullKey.slice(prefix.length)] = stats;
+      }
+    }
+    sessions[currentSessionHash] = currentModelStats;
+
+    // _nosession is a transitional legacy migration bucket — once we write
+    // under an authoritative session hash, those entries have already been
+    // consumed and migrated into memory by restoreCacheStats. Delete to
+    // prevent resurrection of reset stats on the next reload.
+    delete sessions["_nosession"];
   }
 
   return sessions;
 }
 
-function createSerializedAsyncRunner(): <T>(operation: () => Promise<T>) => Promise<T> {
+function createSerializedAsyncRunner(): <T>(
+  operation: () => Promise<T>,
+) => Promise<T> {
   let tail: Promise<unknown> = Promise.resolve();
   return <T>(operation: () => Promise<T>): Promise<T> => {
     const result = tail.then(operation);
@@ -6026,7 +8035,9 @@ function mergeLastRoutedModels(
   state: CacheStatsState,
   currentSessionHash?: string,
 ): Record<string, PersistedRoutedModelRef> {
-  const merged: Record<string, PersistedRoutedModelRef> = { ...existingLastRoutedModelBySession };
+  const merged: Record<string, PersistedRoutedModelRef> = {
+    ...existingLastRoutedModelBySession,
+  };
   const incoming = state.lastRoutedModelBySession ?? {};
 
   if (currentSessionHash !== undefined) {
@@ -6055,9 +8066,12 @@ async function writePersistedCacheStats(
   await mkdir(STATE_DIR, { recursive: true });
 
   // Read existing file to preserve other sessions' data.
-  let existingSessions: Record<string, Record<string, CacheStats>> = {};
+  const existingSessions: Record<string, Record<string, CacheStats>> = {};
   let existingTotalsByModel: Record<string, CacheStats> = {};
-  let existingLastRoutedModelBySession: Record<string, PersistedRoutedModelRef> = {};
+  let existingLastRoutedModelBySession: Record<
+    string,
+    PersistedRoutedModelRef
+  > = {};
   try {
     const raw = await readFile(STATE_FILE_PATH, "utf8");
     const parsed = parsePersistedCacheStats(JSON.parse(raw));
@@ -6074,14 +8088,24 @@ async function writePersistedCacheStats(
         }
       }
       existingTotalsByModel = { ...(parsed.totalsByModel ?? {}) };
-      existingLastRoutedModelBySession = { ...(parsed.lastRoutedModelBySession ?? {}) };
+      existingLastRoutedModelBySession = {
+        ...(parsed.lastRoutedModelBySession ?? {}),
+      };
     }
   } catch {
     // Ignore read errors (file may not exist yet).
   }
 
-  const sessions = mergeCacheSessions(existingSessions, state, currentSessionHash);
-  const totalsByModel = mergeCacheTotals(existingTotalsByModel, state.totalsByModel, options);
+  const sessions = mergeCacheSessions(
+    existingSessions,
+    state,
+    currentSessionHash,
+  );
+  const totalsByModel = mergeCacheTotals(
+    existingTotalsByModel,
+    state.totalsByModel,
+    options,
+  );
   const lastRoutedModelBySession = mergeLastRoutedModels(
     existingLastRoutedModelBySession,
     state,
@@ -6093,7 +8117,9 @@ async function writePersistedCacheStats(
     sessions,
     totalsByModel,
     legacyFamily: state.legacyFamily,
-    ...(Object.keys(lastRoutedModelBySession).length > 0 ? { lastRoutedModelBySession } : {}),
+    ...(Object.keys(lastRoutedModelBySession).length > 0
+      ? { lastRoutedModelBySession }
+      : {}),
   };
   const tempPath = `${STATE_FILE_PATH}.${process.pid}.${Date.now()}.tmp`;
 
@@ -6102,7 +8128,10 @@ async function writePersistedCacheStats(
 }
 
 function modelEpochPath(modelKeyValue: string): string {
-  return join(SHARD_MODEL_EPOCH_DIR, `${createHash("sha256").update(modelKeyValue).digest("hex")}.json`);
+  return join(
+    SHARD_MODEL_EPOCH_DIR,
+    `${createHash("sha256").update(modelKeyValue).digest("hex")}.json`,
+  );
 }
 
 function initialEpoch(scope: string): string {
@@ -6111,12 +8140,16 @@ function initialEpoch(scope: string): string {
 
 function parseEpochRecord(value: unknown): string | undefined {
   const record = asRecord(value);
-  return record?.version === 1 && isNonEmptyString(record.epoch) ? record.epoch.trim() : undefined;
+  return record?.version === 1 && isNonEmptyString(record.epoch)
+    ? record.epoch.trim()
+    : undefined;
 }
 
 async function readEpochFile(path: string, fallback: string): Promise<string> {
   try {
-    return parseEpochRecord(JSON.parse(await readFile(path, "utf8"))) ?? fallback;
+    return (
+      parseEpochRecord(JSON.parse(await readFile(path, "utf8"))) ?? fallback
+    );
   } catch {
     return fallback;
   }
@@ -6127,13 +8160,21 @@ async function readGlobalStatsEpoch(): Promise<string> {
 }
 
 async function readModelStatsEpoch(modelKeyValue: string): Promise<string> {
-  return readEpochFile(modelEpochPath(modelKeyValue), initialEpoch(`model:${modelKeyValue}`));
+  return readEpochFile(
+    modelEpochPath(modelKeyValue),
+    initialEpoch(`model:${modelKeyValue}`),
+  );
 }
 
 async function writeStatsEpoch(path: string, epoch: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-  await writeFile(tempPath, JSON.stringify({ version: 1, epoch, createdAt: Date.now() }, null, 2) + "\n", "utf8");
+  await writeFile(
+    tempPath,
+    JSON.stringify({ version: 1, epoch, createdAt: Date.now() }, null, 2) +
+      "\n",
+    "utf8",
+  );
   await rename(tempPath, path);
 }
 
@@ -6149,7 +8190,9 @@ async function advanceModelStatsEpoch(modelKeyValue: string): Promise<string> {
   return epoch;
 }
 
-function parsePersistedStatsShardV7(value: unknown): PersistedStatsShardV7 | undefined {
+function parsePersistedStatsShardV7(
+  value: unknown,
+): PersistedStatsShardV7 | undefined {
   const record = asRecord(value);
   const processRecord = asRecord(record?.process);
   const lifecycle = asRecord(record?.lifecycle);
@@ -6171,22 +8214,29 @@ function parsePersistedStatsShardV7(value: unknown): PersistedStatsShardV7 | und
     !/^\d{4}-\d{2}-\d{2}$/.test(record.day) ||
     !isNonEmptyString(record.globalEpoch) ||
     !rawModels
-  ) return undefined;
+  )
+    return undefined;
 
   const models: PersistedStatsShardV7["models"] = {};
   for (const [key, rawEntry] of Object.entries(rawModels)) {
     const entry = asRecord(rawEntry);
     const stats = parseCacheStats(entry?.stats);
     if (
-      !entry || !stats || !isNonEmptyString(entry.modelEpoch) ||
-      !isNonEmptyString(entry.provider) || !isNonEmptyString(entry.modelId) ||
+      !entry ||
+      !stats ||
+      !isNonEmptyString(entry.modelEpoch) ||
+      !isNonEmptyString(entry.provider) ||
+      !isNonEmptyString(entry.modelId) ||
       key !== `${entry.provider.trim()}/${entry.modelId.trim()}`
-    ) continue;
+    )
+      continue;
     models[key] = {
       modelEpoch: entry.modelEpoch.trim(),
       provider: entry.provider.trim(),
       modelId: entry.modelId.trim(),
-      ...(isNonEmptyString(entry.modelName) ? { modelName: entry.modelName.trim() } : {}),
+      ...(isNonEmptyString(entry.modelName)
+        ? { modelName: entry.modelName.trim() }
+        : {}),
       ...(isNonEmptyString(entry.api) ? { api: entry.api.trim() } : {}),
       stats,
     };
@@ -6207,7 +8257,9 @@ function parsePersistedStatsShardV7(value: unknown): PersistedStatsShardV7 | und
       state: lifecycle.state,
       createdAt: lifecycle.createdAt,
       updatedAt: lifecycle.updatedAt,
-      ...(typeof lifecycle.closedAt === "number" ? { closedAt: lifecycle.closedAt } : {}),
+      ...(typeof lifecycle.closedAt === "number"
+        ? { closedAt: lifecycle.closedAt }
+        : {}),
     },
     day: record.day,
     globalEpoch: record.globalEpoch.trim(),
@@ -6216,14 +8268,19 @@ function parsePersistedStatsShardV7(value: unknown): PersistedStatsShardV7 | und
   };
 }
 
-async function writeStatsShardV7(path: string, shard: PersistedStatsShardV7): Promise<void> {
+async function writeStatsShardV7(
+  path: string,
+  shard: PersistedStatsShardV7,
+): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await writeFile(tempPath, JSON.stringify(shard, null, 2) + "\n", "utf8");
   await rename(tempPath, path);
 }
 
-async function readValidStatsShardsV7(directory: string = SHARD_FILES_DIR): Promise<PersistedStatsShardV7[]> {
+async function readValidStatsShardsV7(
+  directory: string = SHARD_FILES_DIR,
+): Promise<PersistedStatsShardV7[]> {
   let names: string[];
   try {
     names = await readdir(directory);
@@ -6238,9 +8295,12 @@ async function readValidStatsShardsV7(directory: string = SHARD_FILES_DIR): Prom
     try {
       const info = await lstat(path);
       if (!info.isFile() || info.isSymbolicLink()) continue;
-      const parsed = parsePersistedStatsShardV7(JSON.parse(await readFile(path, "utf8")));
+      const parsed = parsePersistedStatsShardV7(
+        JSON.parse(await readFile(path, "utf8")),
+      );
       const filenameInstanceId = name.slice(0, -".json".length);
-      if (parsed && parsed.instanceId === filenameInstanceId) shards.push(parsed);
+      if (parsed && parsed.instanceId === filenameInstanceId)
+        shards.push(parsed);
     } catch {
       // Ignore malformed or transiently unavailable shards. Atomic writers will
       // publish a complete replacement on the next successful update.
@@ -6272,9 +8332,13 @@ async function aggregateStatsShardsV7(
   for (const shard of shards) {
     if (shard.day !== day || shard.globalEpoch !== globalEpoch) continue;
     let contributed = false;
-    if (shard.lastRoutedModel && (routedUpdatedAt.get(shard.sessionHash) ?? -1) < shard.lifecycle.updatedAt) {
+    if (
+      shard.lastRoutedModel &&
+      (routedUpdatedAt.get(shard.sessionHash) ?? -1) < shard.lifecycle.updatedAt
+    ) {
       routedUpdatedAt.set(shard.sessionHash, shard.lifecycle.updatedAt);
-      result.lastRoutedModelBySession[shard.sessionHash] = shard.lastRoutedModel;
+      result.lastRoutedModelBySession[shard.sessionHash] =
+        shard.lastRoutedModel;
     }
     for (const [key, entry] of Object.entries(shard.models)) {
       let epoch = modelEpochs.get(key);
@@ -6284,9 +8348,15 @@ async function aggregateStatsShardsV7(
       }
       if (entry.modelEpoch !== epoch || entry.stats.day !== day) continue;
       contributed = true;
-      const sessionModels = result.bySession[shard.sessionHash] ??= {};
-      sessionModels[key] = mergeCacheStatsForTotal(sessionModels[key], entry.stats);
-      result.totalsByModel[key] = mergeCacheStatsForTotal(result.totalsByModel[key], entry.stats);
+      const sessionModels = (result.bySession[shard.sessionHash] ??= {});
+      sessionModels[key] = mergeCacheStatsForTotal(
+        sessionModels[key],
+        entry.stats,
+      );
+      result.totalsByModel[key] = mergeCacheStatsForTotal(
+        result.totalsByModel[key],
+        entry.stats,
+      );
       result.instancesByModel[key] = (result.instancesByModel[key] ?? 0) + 1;
       if ((modelRefUpdatedAt.get(key) ?? -1) < shard.lifecycle.updatedAt) {
         modelRefUpdatedAt.set(key, shard.lifecycle.updatedAt);
@@ -6296,21 +8366,27 @@ async function aggregateStatsShardsV7(
           name: entry.modelName ?? entry.modelId,
         };
       }
-      const sessionInstances = result.instancesBySessionModel[shard.sessionHash] ??= {};
+      const sessionInstances = (result.instancesBySessionModel[
+        shard.sessionHash
+      ] ??= {});
       sessionInstances[key] = (sessionInstances[key] ?? 0) + 1;
       const sessions = modelSessions.get(key) ?? new Set<string>();
       sessions.add(shard.sessionHash);
       modelSessions.set(key, sessions);
     }
     if (contributed) {
-      result.instancesBySession[shard.sessionHash] = (result.instancesBySession[shard.sessionHash] ?? 0) + 1;
+      result.instancesBySession[shard.sessionHash] =
+        (result.instancesBySession[shard.sessionHash] ?? 0) + 1;
     }
   }
-  for (const [key, sessions] of modelSessions) result.sessionsByModel[key] = sessions.size;
+  for (const [key, sessions] of modelSessions)
+    result.sessionsByModel[key] = sessions.size;
   return result;
 }
 
-async function loadStatsShardAggregateV7(directory: string = SHARD_FILES_DIR): Promise<ShardAggregate> {
+async function loadStatsShardAggregateV7(
+  directory: string = SHARD_FILES_DIR,
+): Promise<ShardAggregate> {
   return aggregateStatsShardsV7(await readValidStatsShardsV7(directory));
 }
 
@@ -6329,12 +8405,19 @@ async function removeLegacyStatsFiles(): Promise<void> {
     try {
       await unlink(path);
     } catch (error) {
-      if (getErrorCode(error) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove obsolete stats file ${path}`, error);
+      if (getErrorCode(error) !== "ENOENT")
+        console.warn(
+          `${LOG_PREFIX}: failed to remove obsolete stats file ${path}`,
+          error,
+        );
     }
   }
 }
 
-async function cleanupStatsShardsV7(now = Date.now(), directory: string = SHARD_FILES_DIR): Promise<number> {
+async function cleanupStatsShardsV7(
+  now = Date.now(),
+  directory: string = SHARD_FILES_DIR,
+): Promise<number> {
   let names: string[];
   try {
     names = await readdir(directory);
@@ -6354,11 +8437,17 @@ async function cleanupStatsShardsV7(now = Date.now(), directory: string = SHARD_
       if (isTemp) {
         if (now - info.mtimeMs < SHARD_TEMP_RETENTION_MS) continue;
       } else {
-        const parsed = parsePersistedStatsShardV7(JSON.parse(await readFile(path, "utf8")));
+        const parsed = parsePersistedStatsShardV7(
+          JSON.parse(await readFile(path, "utf8")),
+        );
         if (parsed?.day === today) continue;
         const updatedAt = parsed?.lifecycle.updatedAt ?? info.mtimeMs;
         if (now - updatedAt < SHARD_RETENTION_MS) continue;
-        if (parsed?.lifecycle.state === "active" && isProcessAlive(parsed.process.pid)) continue;
+        if (
+          parsed?.lifecycle.state === "active" &&
+          isProcessAlive(parsed.process.pid)
+        )
+          continue;
       }
       await unlink(path);
       removed += 1;
@@ -6374,7 +8463,9 @@ async function maybeCleanupStatsShardsV7(now = Date.now()): Promise<void> {
   try {
     const marker = await stat(SHARD_CLEANUP_MARKER_PATH);
     if (now - marker.mtimeMs < SHARD_CLEANUP_INTERVAL_MS) return;
-  } catch {}
+  } catch {
+    // No cleanup marker yet — the first maintenance pass proceeds.
+  }
 
   try {
     await mkdir(SHARD_CLEANUP_LOCK_PATH);
@@ -6401,24 +8492,34 @@ async function maybeCleanupStatsShardsV7(now = Date.now()): Promise<void> {
 }
 
 function isCompatCheckApplicable(model: PiModel): boolean {
-  return isOpenAICompatibleProxyApi(model.api) && isKnownThirdPartyOpenAIEndpoint(model) && !isPiBuiltInLlamaCppModel(model);
+  return (
+    isOpenAICompatibleProxyApi(model.api) &&
+    isKnownThirdPartyOpenAIEndpoint(model) &&
+    !isPiBuiltInLlamaCppModel(model)
+  );
 }
 
 function isPromptCacheRetention400Applicable(model: PiModel): boolean {
-  return isOpenAICompatibleApi(model.api) &&
+  return (
+    isOpenAICompatibleApi(model.api) &&
     isKnownThirdPartyOpenAIEndpoint(model) &&
     !isPiBuiltInLlamaCppModel(model) &&
-    getCompat(model).supportsLongCacheRetention === true;
+    getCompat(model).supportsLongCacheRetention === true
+  );
 }
 
-function isExplicitPromptCacheRetentionUnsupportedApplicable(model: PiModel): boolean {
+function isExplicitPromptCacheRetentionUnsupportedApplicable(
+  model: PiModel,
+): boolean {
   // A finalized assistant error with an explicit unsupported-parameter signal
   // proves that prompt_cache_retention reached this provider/model. Do not
   // require compat inherited from the active fallback model: router shells may
   // have no upstream compat metadata when no live routing registry is present.
-  return isOpenAICompatibleApi(model.api) &&
+  return (
+    isOpenAICompatibleApi(model.api) &&
     !isOfficialOpenAIBaseUrl(model) &&
-    !isPiBuiltInLlamaCppModel(model);
+    !isPiBuiltInLlamaCppModel(model)
+  );
 }
 
 /**
@@ -6485,7 +8586,11 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
   // Router/channel diagnostics only apply to OpenAI-compatible proxy APIs.
   // Native APIs like mistral-conversations, azure-openai-responses,
   // anthropic-messages, or bedrock-converse-stream are intentionally excluded.
-  if (api === "azure-openai-responses" || isMistralConversationsApi(api) || !isOpenAICompatibleApi(api)) {
+  if (
+    api === "azure-openai-responses" ||
+    isMistralConversationsApi(api) ||
+    !isOpenAICompatibleApi(api)
+  ) {
     return notes;
   }
 
@@ -6509,30 +8614,32 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     provider.includes("openrouter")
   ) {
     const compat = getCompat(model);
-    const routing = asRecord((compat as Record<string, unknown>)["openRouterRouting"]);
+    const routing = asRecord(
+      (compat as Record<string, unknown>)["openRouterRouting"],
+    );
     const hasOnly = !!routing?.only;
     const hasOrder = !!routing?.order;
 
     notes.push(
       "🔀 Router/channel: OpenRouter detected. OpenRouter is a multi-provider router; " +
-      "low cache hit rates are common when each turn lands on a different upstream provider.",
+        "low cache hit rates are common when each turn lands on a different upstream provider.",
     );
 
     if (!hasOnly && !hasOrder) {
       notes.push(
         "   Suggestion: Add an openRouterRouting config to fix the upstream provider. " +
-        "Example for models.json -> providers[\"<providerId>\"] -> compat:",
+          'Example for models.json -> providers["<providerId>"] -> compat:',
       );
       notes.push(
         `   { "sendSessionAffinityHeaders": true, "supportsLongCacheRetention": true, ` +
-        `"openRouterRouting": { "only": ["<provider-slug>"] } }`,
+          `"openRouterRouting": { "only": ["<provider-slug>"] } }`,
       );
       notes.push(
         '   Replace <provider-slug> with the actual OpenRouter provider slug (e.g. "openai", "anthropic").',
       );
       notes.push(
-        "   Alternatively, use openRouterRouting.order: [\"<provider-slug>\", \"...\"] for fallback order. " +
-        "Only set supportsLongCacheRetention if your upstream supports long cache retention.",
+        '   Alternatively, use openRouterRouting.order: ["<provider-slug>", "..."] for fallback order. ' +
+          "Only set supportsLongCacheRetention if your upstream supports long cache retention.",
       );
     }
 
@@ -6546,26 +8653,28 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     provider.includes("vercel-ai-gateway")
   ) {
     const compat = getCompat(model);
-    const routing = asRecord((compat as Record<string, unknown>)["vercelGatewayRouting"]);
+    const routing = asRecord(
+      (compat as Record<string, unknown>)["vercelGatewayRouting"],
+    );
     const hasOnly = !!routing?.only;
     const hasOrder = !!routing?.order;
 
     notes.push(
       "🔀 Router/channel: Vercel AI Gateway detected. The gateway may route to different " +
-      "provider endpoints per request, reducing cache locality.",
+        "provider endpoints per request, reducing cache locality.",
     );
 
     if (!hasOnly && !hasOrder) {
       notes.push(
         "   Suggestion: Add a vercelGatewayRouting config to fix the upstream. " +
-        "Example for models.json -> providers[\"<providerId>\"] -> compat:",
+          'Example for models.json -> providers["<providerId>"] -> compat:',
       );
       notes.push(
         `   { "sendSessionAffinityHeaders": true, "supportsLongCacheRetention": true, ` +
-        `"vercelGatewayRouting": { "only": ["<provider-id>"] } }`,
+          `"vercelGatewayRouting": { "only": ["<provider-id>"] } }`,
       );
       notes.push(
-        "   Replace <provider-id> with the actual Vercel provider ID (e.g. \"openai\").",
+        '   Replace <provider-id> with the actual Vercel provider ID (e.g. "openai").',
       );
       notes.push(
         "   Only set supportsLongCacheRetention if your upstream supports it.",
@@ -6576,18 +8685,24 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
   }
 
   // ── 3. LiteLLM / OneAPI / NewAPI / VoAPI (self-hosted aggregation) ──
-  const aggregationPatterns = ["litellm", "oneapi", "one-api", "newapi", "new-api", "voapi", "vo-api"];
+  const aggregationPatterns = [
+    "litellm",
+    "oneapi",
+    "one-api",
+    "newapi",
+    "new-api",
+    "voapi",
+    "vo-api",
+  ];
   if (
     aggregationPatterns.some((p) => baseUrl.includes(p)) ||
     aggregationPatterns.some((p) => provider.includes(p))
   ) {
     notes.push(
       "🔀 Router/channel: Self-hosted aggregation proxy detected (LiteLLM / OneAPI / NewAPI / VoAPI). " +
-      "These proxies route to multiple upstream accounts or instances, which can split the cache.",
+        "These proxies route to multiple upstream accounts or instances, which can split the cache.",
     );
-    notes.push(
-      "   Suggestions:",
-    );
+    notes.push("   Suggestions:");
     notes.push(
       "   • Ensure the proxy can fix to a single upstream per session (session_id affinity).",
     );
@@ -6651,7 +8766,10 @@ function getCompatCheckNotApplicableLines(model: PiModel): string[] {
     ];
   }
 
-  if (api === "openai-codex-responses" || (api === "openai-responses" && isOfficialOpenAIBaseUrl(model))) {
+  if (
+    api === "openai-codex-responses" ||
+    (api === "openai-responses" && isOfficialOpenAIBaseUrl(model))
+  ) {
     return [
       "ℹ️ Compat check not applicable for this model.",
       "   Native Responses transports already use Pi core request handling; OpenAI-compatible proxy compat flags do not apply.",
@@ -6668,32 +8786,51 @@ function getCompatCheckNotApplicableLines(model: PiModel): string[] {
   return ["ℹ️ Compat check not applicable for this model."];
 }
 
-function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400?: boolean; promptCacheKey400?: boolean; anthropicTtlOrderError?: boolean; sessionAffinity403?: boolean; openAISdkHeader403?: boolean } = {}): string {
+function buildDoctorDiagnosis(
+  model: PiModel,
+  options: {
+    promptCacheRetention400?: boolean;
+    promptCacheKey400?: boolean;
+    anthropicTtlOrderError?: boolean;
+    sessionAffinity403?: boolean;
+    openAISdkHeader403?: boolean;
+  } = {},
+): string {
   const lines: string[] = [];
   lines.push(`Provider: ${model.provider}`);
   lines.push(`Model:    ${model.id}`);
-  if (model.name && model.name !== model.id) lines.push(`Name:     ${model.name}`);
+  if (model.name && model.name !== model.id)
+    lines.push(`Name:     ${model.name}`);
   lines.push(`API:      ${model.api}`);
   lines.push(`Base URL: ${model.baseUrl || "(default)"}`);
 
   const compat = getCompat(model);
   lines.push(`Compat:   ${JSON.stringify(compat)}`);
 
+  const retentionResolved = resolveEffectiveCacheRetentionMode();
+  lines.push(
+    `Retention: ${retentionResolved.mode} (${retentionResolved.source}) · ${PI_CACHE_RETENTION_ENV}=${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`,
+  );
+
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
   const missing = describeMissingCacheCompatForModel(model);
-  const optionalOpenAIProxyCompat = !adaptiveThinkingApplicable
-    ? describeOptionalOpenAICompatibleProxyCompat(model)
-    : [];
+  const optionalOpenAIProxyCompat = adaptiveThinkingApplicable
+    ? []
+    : describeOptionalOpenAICompatibleProxyCompat(model);
   const fixSug = buildFixSuggestion(model);
   const safeFixableMissing = fixSug ? Object.keys(fixSug.compatKeys) : [];
-  const advisoryMissing = missing.filter(m => !safeFixableMissing.includes(m));
+  const advisoryMissing = missing.filter(
+    (m) => !safeFixableMissing.includes(m),
+  );
 
   if (safeFixableMissing.length > 0) {
     lines.push(`⚠️  Missing compat flags: ${safeFixableMissing.join(", ")}`);
   }
   if (advisoryMissing.length > 0) {
-    lines.push(`ℹ️  Optional: ${advisoryMissing.join(", ")} (enable only if needed)`);
+    lines.push(
+      `ℹ️  Optional: ${advisoryMissing.join(", ")} (enable only if needed)`,
+    );
   }
 
   if (missing.length > 0) {
@@ -6701,45 +8838,88 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
     const modelsJsonPath = getModelsJsonDisplayPath();
-    lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (same level as baseUrl/api/apiKey/models).`);
+    lines.push(
+      `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (same level as baseUrl/api/apiKey/models).`,
+    );
     if (adaptiveThinkingApplicable) {
-      appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendAdaptiveThinkingCompatAdviceLines(lines, missing, {
+        providerLabel,
+        modelId: model.id,
+      });
     } else if (deepSeekCompatApplicable) {
-      appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendDeepSeekCompatAdviceLines(lines, missing, {
+        providerLabel,
+        modelId: model.id,
+      });
+      appendOptionalOpenAIProxyCompatAdviceLines(
+        lines,
+        optionalOpenAIProxyCompat,
+      );
     } else {
-      appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendOpenAIProxyCompatAdviceLines(lines, missing, {
+        providerLabel,
+        modelId: model.id,
+      });
+      appendOptionalOpenAIProxyCompatAdviceLines(
+        lines,
+        optionalOpenAIProxyCompat,
+      );
     }
-  } else if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
+  } else if (
+    adaptiveThinkingApplicable ||
+    deepSeekCompatApplicable ||
+    isCompatCheckApplicable(model)
+  ) {
     lines.push("✅ Compat fully configured.");
-    appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+    appendOptionalOpenAIProxyCompatAdviceLines(
+      lines,
+      optionalOpenAIProxyCompat,
+    );
   } else {
     lines.push(...getCompatCheckNotApplicableLines(model));
   }
 
-  if (options.promptCacheKey400 && isPromptCacheKeyUnsupportedApplicable(model)) {
+  if (
+    options.promptCacheKey400 &&
+    isPromptCacheKeyUnsupportedApplicable(model)
+  ) {
     lines.push("");
-    lines.push("⚠️  This model previously rejected prompt_cache_key with an explicit HTTP 400 signal.");
-    lines.push("   /cache-optimizer fix will offer a precise model-scoped opt-out.");
-    lines.push("   The opt-out removes both prompt_cache_key and promptCacheKey from the final request body.");
+    lines.push(
+      "⚠️  This model previously rejected prompt_cache_key with an explicit HTTP 400 signal.",
+    );
+    lines.push(
+      "   /cache-optimizer fix will offer a precise model-scoped opt-out.",
+    );
+    lines.push(
+      "   The opt-out removes both prompt_cache_key and promptCacheKey from the final request body.",
+    );
   }
 
   if (isPromptCacheRetention400Applicable(model)) {
     lines.push("");
     if (options.promptCacheRetention400) {
-      lines.push("⚠️  A 400 response was observed while supportsLongCacheRetention is enabled.");
+      lines.push(
+        "⚠️  A 400 response was observed while supportsLongCacheRetention is enabled.",
+      );
       lines.push(`   ${getPromptCacheRetentionUnsupportedHint()}`);
     } else {
-      lines.push(`ℹ️ Long retention is enabled. ${getPromptCacheRetentionUnsupportedHint()}`);
+      lines.push(
+        `ℹ️ Long retention is enabled. ${getPromptCacheRetentionUnsupportedHint()}`,
+      );
     }
   }
 
   if (options.anthropicTtlOrderError) {
     lines.push("");
-    lines.push("⚠️  An Anthropic cache-control TTL ordering error was observed for this model.");
-    lines.push("   Runtime requests now fall back from 1h to the default 5-minute cache TTL.");
-    lines.push(`   Run /cache-optimizer fix to set model-level supportsLongCacheRetention: false in ${getModelsJsonDisplayPath()}.`);
+    lines.push(
+      "⚠️  An Anthropic cache-control TTL ordering error was observed for this model.",
+    );
+    lines.push(
+      "   Runtime requests now fall back from 1h to the default 5-minute cache TTL.",
+    );
+    lines.push(
+      `   Run /cache-optimizer fix to set model-level supportsLongCacheRetention: false in ${getModelsJsonDisplayPath()}.`,
+    );
   }
 
   // ── Session affinity 403 diagnostics ──
@@ -6750,28 +8930,58 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
   if (isSessionAffinity403Applicable(model)) {
     lines.push("");
     if (options.sessionAffinity403) {
-      lines.push("⚠️  A 403 response was observed while sendSessionAffinityHeaders is enabled.");
-      lines.push("   The proxy/CDN likely blocks Pi's custom session-affinity headers (session_id,");
-      lines.push("   x-client-request-id, x-session-affinity). Run /cache-optimizer fix to");
-      lines.push(`   set sendSessionAffinityHeaders: false in ${getModelsJsonDisplayPath()}.`);
+      lines.push(
+        "⚠️  A 403 response was observed while sendSessionAffinityHeaders is enabled.",
+      );
+      lines.push(
+        "   The proxy/CDN likely blocks Pi's custom session-affinity headers (session_id,",
+      );
+      lines.push(
+        "   x-client-request-id, x-session-affinity). Run /cache-optimizer fix to",
+      );
+      lines.push(
+        `   set sendSessionAffinityHeaders: false in ${getModelsJsonDisplayPath()}.`,
+      );
     } else {
-      lines.push("ℹ️ Session affinity headers are enabled. Some CDNs/WAFs block custom headers");
-      lines.push("   (session_id, x-client-request-id, x-session-affinity) and return 403. If you");
-      lines.push("   see 403 errors, run /cache-optimizer fix to set sendSessionAffinityHeaders: false.");
+      lines.push(
+        "ℹ️ Session affinity headers are enabled. Some CDNs/WAFs block custom headers",
+      );
+      lines.push(
+        "   (session_id, x-client-request-id, x-session-affinity) and return 403. If you",
+      );
+      lines.push(
+        "   see 403 errors, run /cache-optimizer fix to set sendSessionAffinityHeaders: false.",
+      );
     }
   } else if (isOpenAISdkHeader403Applicable(model)) {
     lines.push("");
     if (options.openAISdkHeader403) {
-      lines.push("⚠️  A 403 response was observed while sendSessionAffinityHeaders is not enabled.");
-      lines.push("   The proxy/CDN may be blocking the OpenAI JS SDK request fingerprint");
-      lines.push("   (for example User-Agent: OpenAI/JS ... or X-Stainless-* headers). This");
-      lines.push("   is provider/WAF-specific; /cache-optimizer fix will not auto-write headers.");
-      lines.push(`   Manual workaround: add a provider-level headers.User-Agent override in ${getModelsJsonDisplayPath()}`);
+      lines.push(
+        "⚠️  A 403 response was observed while sendSessionAffinityHeaders is not enabled.",
+      );
+      lines.push(
+        "   The proxy/CDN may be blocking the OpenAI JS SDK request fingerprint",
+      );
+      lines.push(
+        "   (for example User-Agent: OpenAI/JS ... or X-Stainless-* headers). This",
+      );
+      lines.push(
+        "   is provider/WAF-specific; /cache-optimizer fix will not auto-write headers.",
+      );
+      lines.push(
+        `   Manual workaround: add a provider-level headers.User-Agent override in ${getModelsJsonDisplayPath()}`,
+      );
       lines.push("   only after testing the value with the affected provider.");
     } else {
-      lines.push("ℹ️ If 403 persists after disabling sendSessionAffinityHeaders, some CDNs/WAFs");
-      lines.push("   may block the OpenAI JS SDK User-Agent / X-Stainless-* headers. Test the");
-      lines.push("   provider manually before adding a provider-level headers.User-Agent override.");
+      lines.push(
+        "ℹ️ If 403 persists after disabling sendSessionAffinityHeaders, some CDNs/WAFs",
+      );
+      lines.push(
+        "   may block the OpenAI JS SDK User-Agent / X-Stainless-* headers. Test the",
+      );
+      lines.push(
+        "   provider manually before adding a provider-level headers.User-Agent override.",
+      );
     }
   }
 
@@ -6791,13 +9001,21 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     if (mins < 5) {
       lines.push("");
       lines.push("⚠️  Recent prompt integrity issue detected:");
-      lines.push(`   Last detected ${mins > 0 ? `${mins} min` : `${Math.floor(ago / 1000)}s`} ago. The prompt reorder was`);
+      lines.push(
+        `   Last detected ${mins > 0 ? `${mins} min` : `${Math.floor(ago / 1000)}s`} ago. The prompt reorder was`,
+      );
       lines.push(`   skipped on that turn to preserve structural markers.`);
-      lines.push(`   Common causes: extension system prompt format change, substring collision.`);
+      lines.push(
+        `   Common causes: extension system prompt format change, substring collision.`,
+      );
       lines.push(`   Steps:`);
       lines.push(`     1. Run /reload to reset (may clear transient issues).`);
-      lines.push(`     2. Set PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 & /reload to disable reorder.`);
-      lines.push(`     3. If persistent, file an issue with this doctor output.`);
+      lines.push(
+        `     2. Set PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 & /reload to disable reorder.`,
+      );
+      lines.push(
+        `     3. If persistent, file an issue with this doctor output.`,
+      );
     }
   }
 
@@ -6819,20 +9037,22 @@ function buildLowHitDiagnosis(
 
   // 1. Missing compat flags (adapter-aware: DeepSeek has extra reasoning compat)
   const fixSugLHD = buildFixSuggestion(model);
-  const safeFixableMissingLHD = fixSugLHD ? Object.keys(fixSugLHD.compatKeys) : [];
+  const safeFixableMissingLHD = fixSugLHD
+    ? Object.keys(fixSugLHD.compatKeys)
+    : [];
 
   // 2. Router/channel risk (reuse existing check)
   const routerNotes = describeRouterChannelDiagnostics(model);
 
   // 3. Recent samples missing usage fields
-  const missingUsageSamples = samples.filter((s) => s.missingUsageFields).length;
+  const missingUsageSamples = samples.filter(
+    (s) => s.missingUsageFields,
+  ).length;
 
   // 4. Recent trend analysis
   const recent10 = samples.slice(-10);
   const recent10Hits = recent10.filter((s) => s.hit).length;
   const recent10Total = recent10.length;
-  const recent10Cached = recent10.reduce((sum, s) => sum + s.cachedInputTokens, 0);
-  const recent10Input = recent10.reduce((sum, s) => sum + s.totalInputTokens, 0);
 
   // 5. Today's overall trend from persisted stats
   const todayStats = stats ?? emptyCacheStats();
@@ -6844,20 +9064,29 @@ function buildLowHitDiagnosis(
   // Today's cached-token ratio is used both inside and outside the recent-sample
   // branch. Keep it block-external so doctor/stats never throw for low-hit
   // models that have persisted counters but no recent in-memory samples.
-  const todayHitRatio = todayStats.totalInputTokens > 0
-    ? Math.round((todayStats.cachedInputTokens / todayStats.totalInputTokens) * 100)
-    : 0;
+  const todayHitRatio =
+    todayStats.totalInputTokens > 0
+      ? Math.round(
+          (todayStats.cachedInputTokens / todayStats.totalInputTokens) * 100,
+        )
+      : 0;
 
   // Determine if there are actual issues worth flagging
-  const hasActualIssues = hasMissingCompat || hasUsageMissing ||
+  const hasActualIssues =
+    hasMissingCompat ||
+    hasUsageMissing ||
     // Low hit trend (today total > 3 and hit ratio < 30%)
-    (todayStats.totalRequests > 3 && todayStats.totalInputTokens > 0 &&
-     (todayStats.cachedInputTokens / todayStats.totalInputTokens) < 0.3) ||
+    (todayStats.totalRequests > 3 &&
+      todayStats.totalInputTokens > 0 &&
+      todayStats.cachedInputTokens / todayStats.totalInputTokens < 0.3) ||
     // Low hit rate in recent samples (recent10Total >= 3 and all misses)
     (recent10Total >= 3 && recent10Hits === 0);
 
   // Skip section if no issues
-  if (!hasActualIssues && !(hasRouterRisk && (hasMissingCompat || hasUsageMissing))) {
+  if (
+    !hasActualIssues &&
+    !(hasRouterRisk && (hasMissingCompat || hasUsageMissing))
+  ) {
     return lines;
   }
 
@@ -6867,34 +9096,54 @@ function buildLowHitDiagnosis(
   // Priority 1: missing compat flags
   if (hasMissingCompat) {
     lines.push(`⚠️  Missing compat flags: ${safeFixableMissingLHD.join(", ")}`);
-    lines.push("   These flags enable prompt caching and session-affinity routing.");
+    lines.push(
+      "   These flags enable prompt caching and session-affinity routing.",
+    );
     lines.push("   Run /cache-optimizer compat for edit instructions.");
   }
 
   // Priority 2: router/channel risk (only flag when there are other issues)
   // Router notes are already shown in the main doctor output, so we only
   // mention them in the diagnosis section when they compound a problem.
-  if (hasRouterRisk && (hasMissingCompat || hasUsageMissing || hasActualIssues)) {
+  if (
+    hasRouterRisk &&
+    (hasMissingCompat || hasUsageMissing || hasActualIssues)
+  ) {
     lines.push("🔀 Router/channel proxy detected — see routing notes above.");
   }
 
   // Priority 3: usage fields missing
   if (hasUsageMissing) {
-    lines.push(`⚠️  ${missingUsageSamples}/${samples.length} recent responses had missing/empty usage fields.`);
+    lines.push(
+      `⚠️  ${missingUsageSamples}/${samples.length} recent responses had missing/empty usage fields.`,
+    );
     lines.push("   Footer may under-report cache hit rate.");
-    lines.push("   Verify the proxy returns prompt-level usage (prompt_tokens, input_tokens_details).");
+    lines.push(
+      "   Verify the proxy returns prompt-level usage (prompt_tokens, input_tokens_details).",
+    );
   }
 
   // Priority 4: recent trend low
   if (recent10Total > 0) {
-    const hitRatio = recent10Input > 0 ? Math.round((recent10Cached / recent10Input) * 100) : 0;
-    if (recent10Hits === 0 && todayStats.totalRequests > 3 && todayHitRatio < 30) {
-      lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${recent10Total} recent samples).`);
-      lines.push("   Likely causes: proxy routing to different backends per request,");
+    if (
+      recent10Hits === 0 &&
+      todayStats.totalRequests > 3 &&
+      todayHitRatio < 30
+    ) {
+      lines.push(
+        `📉 Cache hit rate is low: ${todayHitRatio}% today (${recent10Total} recent samples).`,
+      );
+      lines.push(
+        "   Likely causes: proxy routing to different backends per request,",
+      );
       lines.push("   or prompt prefix changes across turns.");
-      lines.push("   Verify session affinity (sendSessionAffinityHeaders) and long cache retention.");
+      lines.push(
+        "   Verify session affinity (sendSessionAffinityHeaders) and long cache retention.",
+      );
     } else if (todayHitRatio < 30 && todayStats.totalRequests > 3) {
-      lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${todayStats.totalRequests} total requests).`);
+      lines.push(
+        `📉 Cache hit rate is low: ${todayHitRatio}% today (${todayStats.totalRequests} total requests).`,
+      );
       lines.push("   Check compat flags and proxy upstream routing.");
     }
 
@@ -6906,12 +9155,23 @@ function buildLowHitDiagnosis(
   }
 
   // For fully configured but low hit models, emphasize sticky routing
-  if (!hasMissingCompat && !hasRouterRisk && todayStats.totalRequests > 3 && todayHitRatio < 30) {
+  if (
+    !hasMissingCompat &&
+    !hasRouterRisk &&
+    todayStats.totalRequests > 3 &&
+    todayHitRatio < 30
+  ) {
     lines.push("💡 Compat is configured but cache hit rate remains low.");
     lines.push("   Possible causes:");
-    lines.push("   • Proxy still routes to multiple backends — check session affinity on the proxy side.");
-    lines.push("   • Prompt prefix varies per turn — check dynamic context in system prompt.");
-    lines.push("   • Provider does not return cache usage fields — footer can't measure hits.");
+    lines.push(
+      "   • Proxy still routes to multiple backends — check session affinity on the proxy side.",
+    );
+    lines.push(
+      "   • Prompt prefix varies per turn — check dynamic context in system prompt.",
+    );
+    lines.push(
+      "   • Provider does not return cache usage fields — footer can't measure hits.",
+    );
   }
 
   return lines;
@@ -6921,15 +9181,22 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
   const missing = describeMissingCacheCompatForModel(model);
   const fixSugC = buildFixSuggestion(model);
   const safeFixableMissingC = fixSugC ? Object.keys(fixSugC.compatKeys) : [];
-  const advisoryMissingC = missing.filter(m => !safeFixableMissingC.includes(m));
+  const advisoryMissingC = missing.filter(
+    (m) => !safeFixableMissingC.includes(m),
+  );
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
-  const optionalOpenAIProxyCompat = !adaptiveThinkingApplicable
-    ? describeOptionalOpenAICompatibleProxyCompat(model)
-    : [];
+  const optionalOpenAIProxyCompat = adaptiveThinkingApplicable
+    ? []
+    : describeOptionalOpenAICompatibleProxyCompat(model);
   const routerNotes = describeRouterChannelDiagnostics(model);
 
-  if (missing.length === 0 && routerNotes.length === 0 && optionalOpenAIProxyCompat.length === 0) return undefined;
+  if (
+    missing.length === 0 &&
+    routerNotes.length === 0 &&
+    optionalOpenAIProxyCompat.length === 0
+  )
+    return undefined;
 
   const key = modelKey(model);
   const lines: string[] = [];
@@ -6943,25 +9210,51 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
       lines.push(`Safe-fixable: ${safeFixableMissingC.join(", ")}`);
     }
     if (advisoryMissingC.length > 0) {
-      lines.push(`Optional: ${advisoryMissingC.join(", ")} (enable only if needed)`);
+      lines.push(
+        `Optional: ${advisoryMissingC.join(", ")} (enable only if needed)`,
+      );
     }
     lines.push("");
-    lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat`);
+    lines.push(
+      `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat`,
+    );
     lines.push(`(at the same level as baseUrl/api/apiKey/models).`);
     if (adaptiveThinkingApplicable) {
-      appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendAdaptiveThinkingCompatAdviceLines(lines, missing, {
+        providerLabel,
+        modelId: model.id,
+      });
     } else if (deepSeekCompatApplicable) {
-      appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendDeepSeekCompatAdviceLines(lines, missing, {
+        providerLabel,
+        modelId: model.id,
+      });
+      appendOptionalOpenAIProxyCompatAdviceLines(
+        lines,
+        optionalOpenAIProxyCompat,
+      );
     } else {
-      appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendOpenAIProxyCompatAdviceLines(lines, missing, {
+        providerLabel,
+        modelId: model.id,
+      });
+      appendOptionalOpenAIProxyCompatAdviceLines(
+        lines,
+        optionalOpenAIProxyCompat,
+      );
     }
   }
 
   // When compat is fully configured but router/optional notes exist, prefix the status.
-  if ((routerNotes.length > 0 || optionalOpenAIProxyCompat.length > 0) && missing.length === 0) {
-    if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
+  if (
+    (routerNotes.length > 0 || optionalOpenAIProxyCompat.length > 0) &&
+    missing.length === 0
+  ) {
+    if (
+      adaptiveThinkingApplicable ||
+      deepSeekCompatApplicable ||
+      isCompatCheckApplicable(model)
+    ) {
       lines.push("✅ Compat fully configured.");
       if (isPromptCacheRetention400Applicable(model)) {
         lines.push(getPromptCacheRetentionUnsupportedHint());
@@ -6970,7 +9263,7 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
       // or OpenAI SDK header/User-Agent blocking after session affinity is disabled.
       if (isSessionAffinity403Applicable(model)) {
         lines.push(
-          "ℹ️ Session affinity headers are enabled. If you see 403 \"blocked\" errors,",
+          'ℹ️ Session affinity headers are enabled. If you see 403 "blocked" errors,',
           "   the proxy/CDN may be blocking Pi's custom headers. Set sendSessionAffinityHeaders: false.",
         );
       } else if (isOpenAISdkHeader403Applicable(model)) {
@@ -6980,7 +9273,10 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
           "   provider-level headers.User-Agent override manually; /fix does not auto-write it.",
         );
       }
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendOptionalOpenAIProxyCompatAdviceLines(
+        lines,
+        optionalOpenAIProxyCompat,
+      );
     } else {
       lines.push(...getCompatCheckNotApplicableLines(model));
     }
@@ -7026,7 +9322,10 @@ function skipJsonWhitespace(text: string, pos: number): number {
  * Returns the decoded value and the offset just past the closing quote,
  * or undefined when the literal is unterminated/malformed.
  */
-function readJsonStringLiteral(text: string, pos: number): { value: string; end: number } | undefined {
+function readJsonStringLiteral(
+  text: string,
+  pos: number,
+): { value: string; end: number } | undefined {
   if (text[pos] !== '"') return undefined;
   let i = pos + 1;
   let value = "";
@@ -7062,7 +9361,10 @@ function readJsonStringLiteral(text: string, pos: number): { value: string; end:
  * Find the offset of the `}` / `]` matching the opener at `openPos`,
  * skipping string literals. Returns undefined on imbalance.
  */
-function findMatchingBracket(text: string, openPos: number): number | undefined {
+function findMatchingBracket(
+  text: string,
+  openPos: number,
+): number | undefined {
   const open = text[openPos];
   if (open !== "{" && open !== "[") return undefined;
   let depth = 0;
@@ -7098,7 +9400,12 @@ function skipJsonValue(text: string, pos: number): number | undefined {
     return end === undefined ? undefined : end + 1;
   }
   let i = pos;
-  while (i < text.length && !",}]".includes(text[i]) && !isJsonWhitespace(text[i])) i++;
+  while (
+    i < text.length &&
+    !",}]".includes(text[i]) &&
+    !isJsonWhitespace(text[i])
+  )
+    i++;
   return i > pos ? i : undefined;
 }
 
@@ -7118,7 +9425,9 @@ function findJsonObjectKey(
 ): { keyStart: number; valueStart: number; count: number } | undefined {
   if (text[openBracePos] !== "{") return undefined;
   let i = openBracePos + 1;
-  let found: { keyStart: number; valueStart: number; count: number } | undefined;
+  let found:
+    | { keyStart: number; valueStart: number; count: number }
+    | undefined;
   let count = 0;
   while (i < text.length) {
     i = skipJsonWhitespace(text, i);
@@ -7159,7 +9468,11 @@ function lineIndentOf(text: string, pos: number): string {
  * `openBrace`..`closeBrace` in the ORIGINAL text. Falls back to the
  * opener's line indent plus two spaces for single-line objects.
  */
-function deriveInnerIndent(text: string, openBrace: number, closeBrace: number): string {
+function deriveInnerIndent(
+  text: string,
+  openBrace: number,
+  closeBrace: number,
+): string {
   const nl = text.indexOf("\n", openBrace + 1);
   if (nl >= 0 && nl < closeBrace) {
     let i = nl + 1;
@@ -7232,7 +9545,7 @@ function stripJsoncComments(text: string): string {
         const sc = text[i];
         out.push(sc);
         i++;
-        if (sc === '\\' && i < text.length) {
+        if (sc === "\\" && i < text.length) {
           out.push(text[i]);
           i++;
         } else if (sc === '"') {
@@ -7242,30 +9555,30 @@ function stripJsoncComments(text: string): string {
       continue;
     }
 
-    if (ch === '/' && i + 1 < text.length && text[i + 1] === '/') {
+    if (ch === "/" && i + 1 < text.length && text[i + 1] === "/") {
       // Line comment — replace BOTH slashes and every comment byte with
       // spaces, but leave the newline to be copied by the normal path.
-      out.push(' ', ' ');
+      out.push(" ", " ");
       i += 2;
-      while (i < text.length && text[i] !== '\n') {
-        out.push(' ');
+      while (i < text.length && text[i] !== "\n") {
+        out.push(" ");
         i++;
       }
       continue;
     }
 
-    if (ch === '/' && i + 1 < text.length && text[i + 1] === '*') {
+    if (ch === "/" && i + 1 < text.length && text[i + 1] === "*") {
       // Block comment — replace every byte with a space except newlines.
       // This deliberately preserves text.length and all structural offsets.
-      out.push(' ', ' ');
+      out.push(" ", " ");
       i += 2;
       while (i < text.length) {
-        if (text[i] === '*' && i + 1 < text.length && text[i + 1] === '/') {
-          out.push(' ', ' ');
+        if (text[i] === "*" && i + 1 < text.length && text[i + 1] === "/") {
+          out.push(" ", " ");
           i += 2;
           break;
         }
-        out.push(text[i] === '\n' ? '\n' : ' ');
+        out.push(text[i] === "\n" ? "\n" : " ");
         i++;
       }
       continue;
@@ -7274,7 +9587,7 @@ function stripJsoncComments(text: string): string {
     out.push(ch);
     i++;
   }
-  return out.join('');
+  return out.join("");
 }
 
 /**
@@ -7293,14 +9606,14 @@ function stripJsoncTrailingCommas(text: string): string {
       continue;
     }
 
-    if (chars[i] === ',') {
+    if (chars[i] === ",") {
       let j = i + 1;
       while (j < chars.length && isJsonWhitespace(chars[j])) j++;
-      if (chars[j] === '}' || chars[j] === ']') chars[i] = ' ';
+      if (chars[j] === "}" || chars[j] === "]") chars[i] = " ";
     }
     i++;
   }
-  return chars.join('');
+  return chars.join("");
 }
 
 function parseJsonc(text: string): unknown {
@@ -7331,7 +9644,7 @@ function resolveExplicitCompatValue(
 
   const override = asRecord(asRecord(provider.modelOverrides)?.[modelId]);
   const overrideCompat = asRecord(override?.compat);
-  if (overrideCompat && Object.prototype.hasOwnProperty.call(overrideCompat, compatKey)) {
+  if (overrideCompat && Object.hasOwn(overrideCompat, compatKey)) {
     return { source: "modelOverride", value: overrideCompat[compatKey] };
   }
 
@@ -7340,12 +9653,12 @@ function resolveExplicitCompatValue(
     modelId,
   );
   const modelCompat = asRecord(model?.compat);
-  if (modelCompat && Object.prototype.hasOwnProperty.call(modelCompat, compatKey)) {
+  if (modelCompat && Object.hasOwn(modelCompat, compatKey)) {
     return { source: "model", value: modelCompat[compatKey] };
   }
 
   const providerCompat = asRecord(provider.compat);
-  if (providerCompat && Object.prototype.hasOwnProperty.call(providerCompat, compatKey)) {
+  if (providerCompat && Object.hasOwn(providerCompat, compatKey)) {
     return { source: "provider", value: providerCompat[compatKey] };
   }
 
@@ -7357,12 +9670,14 @@ function hasExplicitLongRetentionOptInFromConfig(
   providerLabel: string,
   modelId: string,
 ): boolean {
-  return resolveExplicitCompatValue(
-    config,
-    providerLabel,
-    modelId,
-    "supportsLongCacheRetention",
-  )?.value === true;
+  return (
+    resolveExplicitCompatValue(
+      config,
+      providerLabel,
+      modelId,
+      "supportsLongCacheRetention",
+    )?.value === true
+  );
 }
 
 /**
@@ -7441,12 +9756,22 @@ function locateModelOverrideInJsonc(
   const providersEnd = findMatchingBracket(clean, providersBrace);
   if (providersEnd === undefined) return undefined;
   const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
-  if (!providerKey || providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
+  if (
+    !providerKey ||
+    providerKey.count !== 1 ||
+    providerKey.keyStart > providersEnd
+  )
+    return undefined;
   const providerObjectBrace = skipJsonWhitespace(clean, providerKey.valueStart);
   if (clean[providerObjectBrace] !== "{") return undefined;
   const providerObjectEnd = findMatchingBracket(clean, providerObjectBrace);
-  if (providerObjectEnd === undefined || providerObjectEnd > providersEnd) return undefined;
-  const providerCompatKey = findJsonObjectKey(clean, providerObjectBrace, "compat");
+  if (providerObjectEnd === undefined || providerObjectEnd > providersEnd)
+    return undefined;
+  const providerCompatKey = findJsonObjectKey(
+    clean,
+    providerObjectBrace,
+    "compat",
+  );
   if (providerCompatKey?.count && providerCompatKey.count > 1) return undefined;
   const modelsKey = findJsonObjectKey(clean, providerObjectBrace, "models");
   if (modelsKey?.count && modelsKey.count > 1) return undefined;
@@ -7459,7 +9784,11 @@ function locateModelOverrideInJsonc(
   let modelOverrideCompatEnd = -1;
   let modelOverrideKeyCount = 0;
   let modelOverrideCompatKeyCount = 0;
-  const overridesKey = findJsonObjectKey(clean, providerObjectBrace, "modelOverrides");
+  const overridesKey = findJsonObjectKey(
+    clean,
+    providerObjectBrace,
+    "modelOverrides",
+  );
   if (overridesKey?.count && overridesKey.count > 1) return undefined;
   if (overridesKey && overridesKey.keyStart < providerObjectEnd) {
     const brace = skipJsonWhitespace(clean, overridesKey.valueStart);
@@ -7540,11 +9869,17 @@ function locateModelInJsonc(
   if (providersEnd === undefined) return undefined;
 
   const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
-  if (!providerKey || providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
+  if (
+    !providerKey ||
+    providerKey.count !== 1 ||
+    providerKey.keyStart > providersEnd
+  )
+    return undefined;
   const providerBrace = skipJsonWhitespace(clean, providerKey.valueStart);
   if (clean[providerBrace] !== "{") return undefined;
   const providerEndBrace = findMatchingBracket(clean, providerBrace);
-  if (providerEndBrace === undefined || providerEndBrace > providersEnd) return undefined;
+  if (providerEndBrace === undefined || providerEndBrace > providersEnd)
+    return undefined;
 
   // Provider-level compat is a direct provider child only. Nested model
   // compat objects are intentionally skipped whole by findJsonObjectKey.
@@ -7562,33 +9897,58 @@ function locateModelInJsonc(
     providerCompatEnd = end;
   }
 
-  const modelOverridesKey = findJsonObjectKey(clean, providerBrace, "modelOverrides");
+  const modelOverridesKey = findJsonObjectKey(
+    clean,
+    providerBrace,
+    "modelOverrides",
+  );
   if (modelOverridesKey?.count && modelOverridesKey.count > 1) return undefined;
   if (modelOverridesKey) {
-    const modelOverridesBrace = skipJsonWhitespace(clean, modelOverridesKey.valueStart);
+    const modelOverridesBrace = skipJsonWhitespace(
+      clean,
+      modelOverridesKey.valueStart,
+    );
     if (clean[modelOverridesBrace] !== "{") return undefined;
     const modelOverridesEnd = findMatchingBracket(clean, modelOverridesBrace);
-    if (modelOverridesEnd === undefined || modelOverridesEnd > providerEndBrace) return undefined;
+    if (modelOverridesEnd === undefined || modelOverridesEnd > providerEndBrace)
+      return undefined;
     const overrideKey = findJsonObjectKey(clean, modelOverridesBrace, modelId);
     if (overrideKey?.count && overrideKey.count > 1) return undefined;
     if (overrideKey) {
       const overrideBrace = skipJsonWhitespace(clean, overrideKey.valueStart);
       if (clean[overrideBrace] !== "{") return undefined;
       const overrideEnd = findMatchingBracket(clean, overrideBrace);
-      if (overrideEnd === undefined || overrideEnd > modelOverridesEnd) return undefined;
-      const overrideCompatKey = findJsonObjectKey(clean, overrideBrace, "compat");
-      if (overrideCompatKey?.count && overrideCompatKey.count > 1) return undefined;
+      if (overrideEnd === undefined || overrideEnd > modelOverridesEnd)
+        return undefined;
+      const overrideCompatKey = findJsonObjectKey(
+        clean,
+        overrideBrace,
+        "compat",
+      );
+      if (overrideCompatKey?.count && overrideCompatKey.count > 1)
+        return undefined;
     }
   }
 
-  const overrideLocation = locateModelOverrideInJsonc(text, providerLabel, modelId);
-  const modelOverrideObjectBrace = overrideLocation?.modelOverrideObjectBrace ?? -1;
+  const overrideLocation = locateModelOverrideInJsonc(
+    text,
+    providerLabel,
+    modelId,
+  );
+  const modelOverrideObjectBrace =
+    overrideLocation?.modelOverrideObjectBrace ?? -1;
   const modelOverrideObjectEnd = overrideLocation?.modelOverrideObjectEnd ?? -1;
-  const modelOverrideCompatBrace = overrideLocation?.modelOverrideCompatBrace ?? -1;
+  const modelOverrideCompatBrace =
+    overrideLocation?.modelOverrideCompatBrace ?? -1;
   const modelOverrideCompatEnd = overrideLocation?.modelOverrideCompatEnd ?? -1;
 
   const modelsKey = findJsonObjectKey(clean, providerBrace, "models");
-  if (!modelsKey || modelsKey.count !== 1 || modelsKey.keyStart > providerEndBrace) return undefined;
+  if (
+    !modelsKey ||
+    modelsKey.count !== 1 ||
+    modelsKey.keyStart > providerEndBrace
+  )
+    return undefined;
 
   let modelsScan = skipJsonWhitespace(clean, modelsKey.valueStart);
   if (clean[modelsScan] !== "[") return undefined;
@@ -7607,12 +9967,12 @@ function locateModelInJsonc(
 
   while (modelsScan < modelsEnd) {
     modelsScan = skipJsonWhitespace(clean, modelsScan);
-    if (clean[modelsScan] === ',') {
+    if (clean[modelsScan] === ",") {
       modelsScan++;
       continue;
     }
-    if (modelsScan >= modelsEnd || clean[modelsScan] === ']') break;
-    if (clean[modelsScan] !== '{') return undefined;
+    if (modelsScan >= modelsEnd || clean[modelsScan] === "]") break;
+    if (clean[modelsScan] !== "{") return undefined;
 
     const elementBrace = modelsScan;
     const elementEnd = findMatchingBracket(clean, elementBrace);
@@ -7663,12 +10023,12 @@ function locateModelInJsonc(
 
   // Derive indentation from the model object's opening `{` line in original text
   // Look backwards to find the line start
-  let lineStart = text.lastIndexOf('\n', modelBrace);
+  let lineStart = text.lastIndexOf("\n", modelBrace);
   if (lineStart < 0) lineStart = 0;
   const lineBefore = text.slice(lineStart, modelBrace);
   const indentMatch = lineBefore.match(/^(\s*)/);
-  const baseIndent = indentMatch ? indentMatch[1] : '  ';
-  const indent = baseIndent + '  '; // +2 for one level deeper
+  const baseIndent = indentMatch ? indentMatch[1] : "  ";
+  const indent = baseIndent + "  "; // +2 for one level deeper
 
   return {
     modelObjectBrace: modelBrace,
@@ -7698,9 +10058,22 @@ function locateModelInJsonc(
  * `locateModelInJsonc` cannot find the target provider/model.
  */
 type MissingEntryDiagnosis =
-  | { scenario: "provider_missing"; providersBrace: number; providersEnd: number }
-  | { scenario: "model_missing"; modelsEnd: number; providerBrace: number; providerEndBrace: number }
-  | { scenario: "provider_without_models"; providerBrace: number; providerEndBrace: number };
+  | {
+      scenario: "provider_missing";
+      providersBrace: number;
+      providersEnd: number;
+    }
+  | {
+      scenario: "model_missing";
+      modelsEnd: number;
+      providerBrace: number;
+      providerEndBrace: number;
+    }
+  | {
+      scenario: "provider_without_models";
+      providerBrace: number;
+      providerEndBrace: number;
+    };
 
 /**
  * Light second-pass scan that determines *why* `locateModelInJsonc` failed.
@@ -7732,13 +10105,15 @@ function analyzeModelsJsonForMissingEntry(
   if (!providerKey) {
     return { scenario: "provider_missing", providersBrace, providersEnd };
   }
-  if (providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
+  if (providerKey.count !== 1 || providerKey.keyStart > providersEnd)
+    return undefined;
 
   // Provider exists. Check for a models array so we know where to append.
   const providerBrace = skipJsonWhitespace(clean, providerKey.valueStart);
   if (clean[providerBrace] !== "{") return undefined;
   const providerEndBrace = findMatchingBracket(clean, providerBrace);
-  if (providerEndBrace === undefined || providerEndBrace > providersEnd) return undefined;
+  if (providerEndBrace === undefined || providerEndBrace > providersEnd)
+    return undefined;
 
   const modelsKey = findJsonObjectKey(clean, providerBrace, "models");
   if (modelsKey?.count && modelsKey.count > 1) return undefined;
@@ -7746,7 +10121,8 @@ function analyzeModelsJsonForMissingEntry(
     const mScan = skipJsonWhitespace(clean, modelsKey.valueStart);
     if (clean[mScan] !== "[") return undefined;
     const modelsEnd = findMatchingBracket(clean, mScan);
-    if (modelsEnd === undefined || modelsEnd > providerEndBrace) return undefined;
+    if (modelsEnd === undefined || modelsEnd > providerEndBrace)
+      return undefined;
 
     // Confirm that the target really is absent before offering an insertion.
     // This second pass also refuses malformed/ambiguous existing entries, so
@@ -7776,12 +10152,21 @@ function analyzeModelsJsonForMissingEntry(
       modelScan = elementEnd + 1;
     }
     if (targetFound) return undefined;
-    return { scenario: "model_missing", modelsEnd, providerBrace, providerEndBrace };
+    return {
+      scenario: "model_missing",
+      modelsEnd,
+      providerBrace,
+      providerEndBrace,
+    };
   }
 
   // Provider exists, but there's no discoverable models array — treat as
   // a provider that needs one.
-  return { scenario: "provider_without_models", providerBrace, providerEndBrace };
+  return {
+    scenario: "provider_without_models",
+    providerBrace,
+    providerEndBrace,
+  };
 }
 
 /**
@@ -7796,8 +10181,12 @@ function formatMissingEntryManualSnippet(
   compatKeys: Record<string, unknown>,
 ): string {
   const lines: string[] = [];
-  const sorted = Object.entries(compatKeys).sort(([a], [b]) => a.localeCompare(b));
-  const compatItems = sorted.map(([k, v]) => `          ${JSON.stringify(k)}: ${JSON.stringify(v)}`);
+  const sorted = Object.entries(compatKeys).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+  const compatItems = sorted.map(
+    ([k, v]) => `          ${JSON.stringify(k)}: ${JSON.stringify(v)}`,
+  );
   lines.push(`${JSON.stringify(providerLabel)}: {`);
   lines.push(`    "modelOverrides": {`);
   lines.push(`      ${JSON.stringify(modelId)}: {`);
@@ -7821,9 +10210,16 @@ function composeModelOverrideInsertion(
   modelId: string,
   compatKeys: Record<string, unknown>,
 ): { modifiedText: string; placementLabel: string } | undefined {
-  const location = locateModelOverrideInJsonc(originalText, providerLabel, modelId);
+  const location = locateModelOverrideInJsonc(
+    originalText,
+    providerLabel,
+    modelId,
+  );
 
-  if (location?.modelOverrideObjectBrace !== undefined && location.modelOverrideObjectBrace >= 0) {
+  if (
+    location?.modelOverrideObjectBrace !== undefined &&
+    location.modelOverrideObjectBrace >= 0
+  ) {
     const modelLocation: ModelNodeLocation = {
       providerKeyCount: location.providerKeyCount,
       modelObjectBrace: -1,
@@ -7846,22 +10242,37 @@ function composeModelOverrideInsertion(
       allModelIds: [],
     };
     return {
-      modifiedText: composeFixInsertion(originalText, modelLocation, compatKeys, "modelOverride"),
+      modifiedText: composeFixInsertion(
+        originalText,
+        modelLocation,
+        compatKeys,
+        "modelOverride",
+      ),
       placementLabel: `providers["${providerLabel}"] -> modelOverrides["${modelId}"] -> compat`,
     };
   }
 
-  const sortedEntries = Object.entries(compatKeys).sort(([a], [b]) => a.localeCompare(b));
+  const sortedEntries = Object.entries(compatKeys).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
   const formatOverrideEntry = (keyIndent: string, unit: string): string => {
     const propertyIndent = keyIndent + unit;
     const compatIndent = propertyIndent + unit;
     const compatLines = sortedEntries
-      .map(([key, value]) => `${compatIndent}${JSON.stringify(key)}: ${JSON.stringify(value)}`)
+      .map(
+        ([key, value]) =>
+          `${compatIndent}${JSON.stringify(key)}: ${JSON.stringify(value)}`,
+      )
       .join(",\n");
-    return `${keyIndent}${JSON.stringify(modelId)}: {\n` +
-      `${propertyIndent}"compat": {\n${compatLines}\n${propertyIndent}}\n${keyIndent}}`;
+    return (
+      `${keyIndent}${JSON.stringify(modelId)}: {\n` +
+      `${propertyIndent}"compat": {\n${compatLines}\n${propertyIndent}}\n${keyIndent}}`
+    );
   };
-  const previousTokenNeedsComma = (clean: string, closeBrace: number): boolean => {
+  const previousTokenNeedsComma = (
+    clean: string,
+    closeBrace: number,
+  ): boolean => {
     let pos = closeBrace - 1;
     while (pos >= 0 && isJsonWhitespace(clean[pos])) pos--;
     return clean[pos] !== "{" && clean[pos] !== ",";
@@ -7870,53 +10281,92 @@ function composeModelOverrideInsertion(
   if (location) {
     const clean = stripJsoncComments(originalText);
     if (location.modelOverridesObjectBrace >= 0) {
-      const containerIndent = lineIndentOf(originalText, location.modelOverridesObjectBrace);
+      const containerIndent = lineIndentOf(
+        originalText,
+        location.modelOverridesObjectBrace,
+      );
       const keyIndent = deriveInnerIndent(
         originalText,
         location.modelOverridesObjectBrace,
         location.modelOverridesObjectEnd,
       );
-      const unit = keyIndent.length > containerIndent.length
-        ? keyIndent.slice(containerIndent.length)
-        : "  ";
-      const comma = previousTokenNeedsComma(clean, location.modelOverridesObjectEnd) ? "," : "";
+      const unit =
+        keyIndent.length > containerIndent.length
+          ? keyIndent.slice(containerIndent.length)
+          : "  ";
+      const comma = previousTokenNeedsComma(
+        clean,
+        location.modelOverridesObjectEnd,
+      )
+        ? ","
+        : "";
       const insertion = `${comma}\n${formatOverrideEntry(keyIndent, unit)}\n${containerIndent}`;
       return {
-        modifiedText: originalText.slice(0, location.modelOverridesObjectEnd) + insertion + originalText.slice(location.modelOverridesObjectEnd),
+        modifiedText:
+          originalText.slice(0, location.modelOverridesObjectEnd) +
+          insertion +
+          originalText.slice(location.modelOverridesObjectEnd),
         placementLabel: `providers["${providerLabel}"] -> modelOverrides -> (new entry "${modelId}")`,
       };
     }
 
-    const providerIndent = lineIndentOf(originalText, location.providerObjectBrace);
-    const propertyIndent = deriveInnerIndent(originalText, location.providerObjectBrace, location.providerObjectEnd);
-    const unit = propertyIndent.length > providerIndent.length
-      ? propertyIndent.slice(providerIndent.length)
-      : "  ";
+    const providerIndent = lineIndentOf(
+      originalText,
+      location.providerObjectBrace,
+    );
+    const propertyIndent = deriveInnerIndent(
+      originalText,
+      location.providerObjectBrace,
+      location.providerObjectEnd,
+    );
+    const unit =
+      propertyIndent.length > providerIndent.length
+        ? propertyIndent.slice(providerIndent.length)
+        : "  ";
     const entryIndent = propertyIndent + unit;
-    const block = `\n${propertyIndent}"modelOverrides": {\n` +
+    const block =
+      `\n${propertyIndent}"modelOverrides": {\n` +
       `${formatOverrideEntry(entryIndent, unit)}\n${propertyIndent}},`;
     return {
-      modifiedText: originalText.slice(0, location.providerObjectBrace + 1) + block + originalText.slice(location.providerObjectBrace + 1),
+      modifiedText:
+        originalText.slice(0, location.providerObjectBrace + 1) +
+        block +
+        originalText.slice(location.providerObjectBrace + 1),
       placementLabel: `providers["${providerLabel}"] -> (new modelOverrides entry "${modelId}")`,
     };
   }
 
-  const diagnosis = analyzeModelsJsonForMissingEntry(originalText, providerLabel, modelId);
+  const diagnosis = analyzeModelsJsonForMissingEntry(
+    originalText,
+    providerLabel,
+    modelId,
+  );
   if (!diagnosis || diagnosis.scenario !== "provider_missing") return undefined;
   const clean = stripJsoncComments(originalText);
   const providersIndent = lineIndentOf(originalText, diagnosis.providersEnd);
-  const providerIndent = deriveInnerIndent(originalText, diagnosis.providersBrace, diagnosis.providersEnd);
-  const unit = providerIndent.length > providersIndent.length
-    ? providerIndent.slice(providersIndent.length)
-    : "  ";
+  const providerIndent = deriveInnerIndent(
+    originalText,
+    diagnosis.providersBrace,
+    diagnosis.providersEnd,
+  );
+  const unit =
+    providerIndent.length > providersIndent.length
+      ? providerIndent.slice(providersIndent.length)
+      : "  ";
   const overridesIndent = providerIndent + unit;
   const entryIndent = overridesIndent + unit;
-  const comma = previousTokenNeedsComma(clean, diagnosis.providersEnd) ? "," : "";
-  const block = `${comma}\n${providerIndent}${JSON.stringify(providerLabel)}: {\n` +
+  const comma = previousTokenNeedsComma(clean, diagnosis.providersEnd)
+    ? ","
+    : "";
+  const block =
+    `${comma}\n${providerIndent}${JSON.stringify(providerLabel)}: {\n` +
     `${overridesIndent}"modelOverrides": {\n${formatOverrideEntry(entryIndent, unit)}\n` +
     `${overridesIndent}}\n${providerIndent}}\n${providersIndent}`;
   return {
-    modifiedText: originalText.slice(0, diagnosis.providersEnd) + block + originalText.slice(diagnosis.providersEnd),
+    modifiedText:
+      originalText.slice(0, diagnosis.providersEnd) +
+      block +
+      originalText.slice(diagnosis.providersEnd),
     placementLabel: `providers -> (new modelOverrides-only entry "${providerLabel}/${modelId}")`,
   };
 }
@@ -7961,7 +10411,9 @@ function composeMissingEntryInsertion(
 
   // Figure out the base indent from the insertion point's own line.
   // Then derive inner indents (+1 and +2 levels).
-  const sorted = Object.entries(compatKeys).sort(([a], [b]) => a.localeCompare(b));
+  const sorted = Object.entries(compatKeys).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
   const formatCompactCompat = (indent: string): string => {
     // Single-line compact when there's only one key, multi-line otherwise.
     if (sorted.length === 1) {
@@ -7970,7 +10422,9 @@ function composeMissingEntryInsertion(
     }
     return (
       "{\n" +
-      sorted.map(([k, v]) => `${indent}${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(",\n") +
+      sorted
+        .map(([k, v]) => `${indent}${JSON.stringify(k)}: ${JSON.stringify(v)}`)
+        .join(",\n") +
       "\n" +
       indent.slice(0, -2) +
       "}"
@@ -7987,10 +10441,12 @@ function composeMissingEntryInsertion(
     // Determine whether the array is empty (need to skip the leading comma).
     // Search for the models `[` on the comment-stripped text so a `[` inside
     // a comment cannot be mistaken for the array opener.
-    const arrayInterior = cleanText.slice(
-      cleanText.lastIndexOf("[", diagnosis.modelsEnd) + 1,
-      diagnosis.modelsEnd,
-    ).trim();
+    const arrayInterior = cleanText
+      .slice(
+        cleanText.lastIndexOf("[", diagnosis.modelsEnd) + 1,
+        diagnosis.modelsEnd,
+      )
+      .trim();
     const hasExistingElements = arrayInterior.length > 0;
 
     const compatBlock = formatCompactCompat(inner2);
@@ -8001,7 +10457,9 @@ function composeMissingEntryInsertion(
       inner1 + `"compat": ` + compatBlock,
       inner0 + "}",
       unit,
-    ].filter(Boolean).join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     const insertionPoint = diagnosis.modelsEnd;
     const prefix = originalText.slice(0, insertionPoint);
@@ -8024,10 +10482,12 @@ function composeMissingEntryInsertion(
     const compatBlock = formatCompactCompat(inner3);
     // Search for the providers `{` on the comment-stripped text so a `{`
     // inside a comment cannot be mistaken for the providers object opener.
-    const providersInterior = cleanText.slice(
-      cleanText.lastIndexOf("{", diagnosis.providersEnd) + 1,
-      diagnosis.providersEnd,
-    ).trim();
+    const providersInterior = cleanText
+      .slice(
+        cleanText.lastIndexOf("{", diagnosis.providersEnd) + 1,
+        diagnosis.providersEnd,
+      )
+      .trim();
     const hasExisting = providersInterior.length > 0;
 
     const providerBlock = [
@@ -8041,7 +10501,9 @@ function composeMissingEntryInsertion(
       inner1 + "]",
       inner0 + "}",
       unit,
-    ].filter(Boolean).join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     const insertionPoint = diagnosis.providersEnd;
     const prefix = originalText.slice(0, insertionPoint);
@@ -8073,7 +10535,10 @@ function composeMissingEntryInsertion(
   ].join("\n");
 
   return {
-    modifiedText: originalText.slice(0, afterBrace) + modelsBlock + originalText.slice(afterBrace),
+    modifiedText:
+      originalText.slice(0, afterBrace) +
+      modelsBlock +
+      originalText.slice(afterBrace),
     placementLabel: `providers["${providerLabel}"] -> (new "models" array with "${modelId}")`,
   };
 }
@@ -8100,12 +10565,15 @@ function selfCheckMissingEntryInsertion(
     const providers = asRecord(asRecord(modParsed)?.providers);
     if (!providers) return "Modified file: providers object missing or invalid";
     const provider = asRecord(providers[providerLabel]);
-    if (!provider) return `Modified file: provider "${providerLabel}" not found`;
+    if (!provider)
+      return `Modified file: provider "${providerLabel}" not found`;
     const models = provider.models;
     const targetModel = Array.isArray(models)
       ? models.find((m: unknown) => asRecord(m)?.id === modelId)
       : undefined;
-    const targetOverride = asRecord(asRecord(provider.modelOverrides)?.[modelId]);
+    const targetOverride = asRecord(
+      asRecord(provider.modelOverrides)?.[modelId],
+    );
     if (!targetModel && !targetOverride) {
       return `Modified file: model or modelOverrides entry "${modelId}" not found in provider after insertion`;
     }
@@ -8115,7 +10583,7 @@ function selfCheckMissingEntryInsertion(
       : undefined;
     for (const [k, v] of Object.entries(compatKeys)) {
       if (effectiveCompat) {
-        if (!Object.prototype.hasOwnProperty.call(effectiveCompat, k)) {
+        if (!Object.hasOwn(effectiveCompat, k)) {
           return `Modified file: effective compat.${k} not found`;
         }
         if ((effectiveCompat as Record<string, unknown>)[k] !== v) {
@@ -8123,7 +10591,12 @@ function selfCheckMissingEntryInsertion(
         }
         continue;
       }
-      const effective = resolveExplicitCompatValue(modParsed, providerLabel, modelId, k);
+      const effective = resolveExplicitCompatValue(
+        modParsed,
+        providerLabel,
+        modelId,
+        k,
+      );
       if (!effective) return `Modified file: effective compat.${k} not found`;
       if (effective.value !== v) {
         return `Modified file: effective compat.${k} wrong value: expected ${JSON.stringify(v)}, got ${JSON.stringify(effective.value)} from ${effective.source}`;
@@ -8133,11 +10606,15 @@ function selfCheckMissingEntryInsertion(
     // Normalize only the intended override edit back to its original shape,
     // then require the complete parsed structure to match. This catches data
     // loss while allowing legitimate shorter repairs such as false -> true.
-    const normalized = JSON.parse(JSON.stringify(modParsed)) as Record<string, unknown>;
+    const normalized = JSON.parse(JSON.stringify(modParsed)) as Record<
+      string,
+      unknown
+    >;
     const origProviders = asRecord(asRecord(origParsed)?.providers);
     const origProvider = asRecord(origProviders?.[providerLabel]);
     const normalizedProviders = asRecord(normalized.providers);
-    if (!normalizedProviders) return "Modified file: normalized providers object missing";
+    if (!normalizedProviders)
+      return "Modified file: normalized providers object missing";
 
     if (!origProvider) {
       delete normalizedProviders[providerLabel];
@@ -8150,26 +10627,28 @@ function selfCheckMissingEntryInsertion(
       if (!normalizedProvider || !normalizedOverrides) {
         return `Modified file: modelOverrides["${modelId}"] missing during structure validation`;
       }
-      if (!origOverride) {
-        delete normalizedOverrides[modelId];
-        if (!origOverrides) delete normalizedProvider.modelOverrides;
-      } else {
+      if (origOverride) {
         const normalizedOverride = asRecord(normalizedOverrides[modelId]);
-        if (!normalizedOverride) return `Modified file: modelOverrides["${modelId}"] invalid`;
+        if (!normalizedOverride)
+          return `Modified file: modelOverrides["${modelId}"] invalid`;
         const origCompat = asRecord(origOverride.compat);
         const normalizedCompat = asRecord(normalizedOverride.compat);
-        if (!origCompat) {
-          delete normalizedOverride.compat;
-        } else {
-          if (!normalizedCompat) return `Modified file: modelOverrides["${modelId}"].compat invalid`;
+        if (origCompat) {
+          if (!normalizedCompat)
+            return `Modified file: modelOverrides["${modelId}"].compat invalid`;
           for (const key of Object.keys(compatKeys)) {
-            if (Object.prototype.hasOwnProperty.call(origCompat, key)) {
+            if (Object.hasOwn(origCompat, key)) {
               normalizedCompat[key] = origCompat[key];
             } else {
               delete normalizedCompat[key];
             }
           }
+        } else {
+          delete normalizedOverride.compat;
         }
+      } else {
+        delete normalizedOverrides[modelId];
+        if (!origOverrides) delete normalizedProvider.modelOverrides;
       }
     } else {
       // Backward-compatible validation for the legacy models[] insertion
@@ -8207,7 +10686,11 @@ function selfCheckMissingEntryInsertion(
  * Deep-equal comparison of two values, used for post-write self-check.
  * Compares all keys recursively, allowing `extraKeys` to be present in `a` but not in `b`.
  */
-function deepEqualIgnoringKeys(a: unknown, b: unknown, extraKeys: string[]): boolean {
+function deepEqualIgnoringKeys(
+  a: unknown,
+  b: unknown,
+  extraKeys: string[],
+): boolean {
   if (a === b) return true;
   if (typeof a !== typeof b) return false;
   if (Array.isArray(a) && Array.isArray(b)) {
@@ -8217,17 +10700,27 @@ function deepEqualIgnoringKeys(a: unknown, b: unknown, extraKeys: string[]): boo
     }
     return true;
   }
-  if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null) {
-    const aKeys = Object.keys(a as Record<string, unknown>).filter(k => !extraKeys.includes(k));
+  if (
+    typeof a === "object" &&
+    a !== null &&
+    typeof b === "object" &&
+    b !== null
+  ) {
+    const aKeys = Object.keys(a as Record<string, unknown>).filter(
+      (k) => !extraKeys.includes(k),
+    );
     const bKeys = Object.keys(b as Record<string, unknown>);
     if (aKeys.length !== bKeys.length) return false;
     for (const k of aKeys) {
       if (!(k in (b as Record<string, unknown>))) return false;
-      if (!deepEqualIgnoringKeys(
-        (a as Record<string, unknown>)[k],
-        (b as Record<string, unknown>)[k],
-        extraKeys,
-      )) return false;
+      if (
+        !deepEqualIgnoringKeys(
+          (a as Record<string, unknown>)[k],
+          (b as Record<string, unknown>)[k],
+          extraKeys,
+        )
+      )
+        return false;
     }
     return true;
   }
@@ -8282,7 +10775,8 @@ function decideFixPlacement(
   if (siblings.length <= 1) {
     return {
       placement: "provider",
-      reason: "this provider has only one model — provider-level compat is equivalent and easier to maintain",
+      reason:
+        "this provider has only one model — provider-level compat is equivalent and easier to maintain",
     };
   }
 
@@ -8293,17 +10787,25 @@ function decideFixPlacement(
     if (key === "forceAdaptiveThinking") {
       const allAdaptive = siblings.every((id) => {
         const sibling = syntheticModelForId(providerLabel, id);
-        return isAdaptiveGenerationModel(sibling) || isKimiCodingAdaptiveModel(sibling);
+        return (
+          isAdaptiveGenerationModel(sibling) ||
+          isKimiCodingAdaptiveModel(sibling)
+        );
       });
       if (!allAdaptive) unsafeKeys.push(key);
       continue;
     }
     if (key === "allowEmptySignature") {
-      const allKimiCodingAdaptive = siblings.every((id) => isKimiCodingAdaptiveModel(syntheticModelForId(providerLabel, id)));
+      const allKimiCodingAdaptive = siblings.every((id) =>
+        isKimiCodingAdaptiveModel(syntheticModelForId(providerLabel, id)),
+      );
       if (!allKimiCodingAdaptive) unsafeKeys.push(key);
       continue;
     }
-    if (key === "thinkingFormat" || key === "requiresReasoningContentOnAssistantMessages") {
+    if (
+      key === "thinkingFormat" ||
+      key === "requiresReasoningContentOnAssistantMessages"
+    ) {
       // Reasoning wire/replay behavior is model-specific. Sibling ids do not
       // prove that they use the same protocol, so never broaden this repair to
       // provider scope based on a shared DeepSeek name alone.
@@ -8350,18 +10852,24 @@ function chooseFixPlacement(
   if (location.modelOverrideObjectBrace >= 0) {
     return {
       placement: "modelOverride",
-      reason: "an existing modelOverrides entry has Pi's highest precedence — repairing it directly",
+      reason:
+        "an existing modelOverrides entry has Pi's highest precedence — repairing it directly",
     };
   }
 
   if (forceModelLevel) {
     return {
       placement: "modelOverride",
-      reason: "runtime-observed provider/model failure — using Pi's highest-precedence model override",
+      reason:
+        "runtime-observed provider/model failure — using Pi's highest-precedence model override",
     };
   }
 
-  const decision = decideFixPlacement(compatKeys, providerLabel, location.allModelIds);
+  const decision = decideFixPlacement(
+    compatKeys,
+    providerLabel,
+    location.allModelIds,
+  );
   const existingModelKeys = findExistingCompatKeysInJsonc(
     original,
     location.compatObjectBrace,
@@ -8390,37 +10898,45 @@ function composeFixInsertion(
   placement: "provider" | "model" | "modelOverride" = "model",
 ): string {
   // Resolve the target compat object and its container based on placement.
-  const targetCompatBrace = placement === "provider"
-    ? location.providerCompatBrace
-    : placement === "modelOverride"
-      ? location.modelOverrideCompatBrace
-      : location.compatObjectBrace;
-  const targetCompatEnd = placement === "provider"
-    ? location.providerCompatEnd
-    : placement === "modelOverride"
-      ? location.modelOverrideCompatEnd
-      : location.compatObjectEnd;
-  const containerBrace = placement === "provider"
-    ? location.providerObjectBrace
-    : placement === "modelOverride"
-      ? location.modelOverrideObjectBrace
-      : location.modelObjectBrace;
+  const targetCompatBrace =
+    placement === "provider"
+      ? location.providerCompatBrace
+      : placement === "modelOverride"
+        ? location.modelOverrideCompatBrace
+        : location.compatObjectBrace;
+  const targetCompatEnd =
+    placement === "provider"
+      ? location.providerCompatEnd
+      : placement === "modelOverride"
+        ? location.modelOverrideCompatEnd
+        : location.compatObjectEnd;
+  const containerBrace =
+    placement === "provider"
+      ? location.providerObjectBrace
+      : placement === "modelOverride"
+        ? location.modelOverrideObjectBrace
+        : location.modelObjectBrace;
 
   // Helper: format key/value pairs as lines with the given indent,
   // alphabetically sorted for stable previews and deterministic edits.
-  const sortedEntries = Object.entries(compatKeys).sort(([a], [b]) => a.localeCompare(b));
-  const formatEntries = (indent: string, entries: Array<[string, unknown]>): string =>
+  const sortedEntries = Object.entries(compatKeys).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+  const formatEntries = (
+    indent: string,
+    entries: Array<[string, unknown]>,
+  ): string =>
     entries
       .map(([k, v]) => `${indent}${JSON.stringify(k)}: ${JSON.stringify(v)}`)
-      .join(',\n');
+      .join(",\n");
 
   // Helper: line-start indentation of the line containing `offset` in `original`.
   const lineIndentAt = (offset: number): string => {
-    let ls = original.lastIndexOf('\n', offset);
+    let ls = original.lastIndexOf("\n", offset);
     if (ls < 0) ls = -1;
     const line = original.slice(ls + 1, offset);
     const m = line.match(/^(\s*)/);
-    return m ? m[1] : '';
+    return m ? m[1] : "";
   };
 
   if (targetCompatBrace >= 0 && targetCompatEnd > targetCompatBrace) {
@@ -8436,7 +10952,7 @@ function composeFixInsertion(
     // else derive one level deeper than the compat brace's own line.
     const braceLineIndent = lineIndentAt(targetCompatBrace);
     const innerMatch = interior.match(/\r?\n([ \t]+)\S/);
-    const innerIndent = innerMatch ? innerMatch[1] : braceLineIndent + '  ';
+    const innerIndent = innerMatch ? innerMatch[1] : braceLineIndent + "  ";
 
     const edits: Array<{ start: number; end: number; text: string }> = [];
     const missingEntries: Array<[string, unknown]> = [];
@@ -8460,16 +10976,28 @@ function composeFixInsertion(
     if (missingEntries.length > 0) {
       const keysFormatted = formatEntries(innerIndent, missingEntries);
       if (hasContent) {
-        edits.push({ start: interiorStart, end: interiorStart, text: `\n${keysFormatted},` });
+        edits.push({
+          start: interiorStart,
+          end: interiorStart,
+          text: `\n${keysFormatted},`,
+        });
       } else {
-        edits.push({ start: interiorStart, end: targetCompatEnd, text: `\n${keysFormatted}\n${braceLineIndent}` });
+        edits.push({
+          start: interiorStart,
+          end: targetCompatEnd,
+          text: `\n${keysFormatted}\n${braceLineIndent}`,
+        });
       }
     }
 
     // Apply later edits first so earlier offsets remain valid.
     return edits
       .sort((a, b) => b.start - a.start)
-      .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), original);
+      .reduce(
+        (text, edit) =>
+          text.slice(0, edit.start) + edit.text + text.slice(edit.end),
+        original,
+      );
   }
 
   // ── No compat object yet: create one right after the container `{`. ──
@@ -8482,12 +11010,14 @@ function composeFixInsertion(
   // else one level deeper than the container brace's line.
   const containerLineIndent = lineIndentAt(containerBrace);
   const siblingMatch = suffix.match(/^\r?\n([ \t]+)\S/);
-  const keyIndent = siblingMatch ? siblingMatch[1] : containerLineIndent + '  ';
+  const keyIndent = siblingMatch ? siblingMatch[1] : containerLineIndent + "  ";
 
   // One more level for keys inside compat: reuse the file's own indent unit.
-  const unit = keyIndent.startsWith(containerLineIndent) && keyIndent.length > containerLineIndent.length
-    ? keyIndent.slice(containerLineIndent.length)
-    : '  ';
+  const unit =
+    keyIndent.startsWith(containerLineIndent) &&
+    keyIndent.length > containerLineIndent.length
+      ? keyIndent.slice(containerLineIndent.length)
+      : "  ";
   const innerIndent = keyIndent + unit;
 
   const compatBlock = `\n${keyIndent}"compat": {\n${formatEntries(innerIndent, sortedEntries)}\n${keyIndent}},`;
@@ -8534,8 +11064,10 @@ function selfCheckFix(
     }
 
     // Step 4: Find and validate target model
-    const targetModel = models.find((m: Record<string, unknown>) => m.id === modelId);
-    if (!targetModel || typeof targetModel !== 'object') {
+    const targetModel = models.find(
+      (m: Record<string, unknown>) => m.id === modelId,
+    );
+    if (!targetModel || typeof targetModel !== "object") {
       return `Modified file: model "${modelId}" not found in provider`;
     }
 
@@ -8544,8 +11076,12 @@ function selfCheckFix(
     // only on these exact target/provider compat objects — never on siblings.
     const origProviders = asRecord(asRecord(origParsed)?.providers);
     const origProvider = asRecord(origProviders?.[providerLabel]);
-    const origModels = Array.isArray(origProvider?.models) ? origProvider.models : undefined;
-    const origTargetModel = origModels?.find((m: unknown) => asRecord(m)?.id === modelId);
+    const origModels = Array.isArray(origProvider?.models)
+      ? origProvider.models
+      : undefined;
+    const origTargetModel = origModels?.find(
+      (m: unknown) => asRecord(m)?.id === modelId,
+    );
     const origTargetModelRecord = asRecord(origTargetModel);
     if (!origProvider || !origTargetModelRecord) {
       return `Original file: provider/model "${providerLabel}/${modelId}" not found`;
@@ -8556,11 +11092,19 @@ function selfCheckFix(
     // have written any persistent level, so validation must check what Pi will
     // actually use.
     const provCompatRaw = (provider as Record<string, unknown>).compat;
-    const provCompat = (provCompatRaw && typeof provCompatRaw === 'object' && !Array.isArray(provCompatRaw))
-      ? provCompatRaw as Record<string, unknown>
-      : {};
+    const provCompat =
+      provCompatRaw &&
+      typeof provCompatRaw === "object" &&
+      !Array.isArray(provCompatRaw)
+        ? (provCompatRaw as Record<string, unknown>)
+        : {};
     const modelCompatRaw = (targetModel as Record<string, unknown>).compat;
-    if (modelCompatRaw !== undefined && (typeof modelCompatRaw !== 'object' || modelCompatRaw === null || Array.isArray(modelCompatRaw))) {
+    if (
+      modelCompatRaw !== undefined &&
+      (typeof modelCompatRaw !== "object" ||
+        modelCompatRaw === null ||
+        Array.isArray(modelCompatRaw))
+    ) {
       return `Modified file: model "${modelId}" compat is not an object`;
     }
     const mdlCompat = (modelCompatRaw ?? {}) as Record<string, unknown>;
@@ -8571,7 +11115,10 @@ function selfCheckFix(
     }
     const overrideCompat = asRecord(overrideCompatRaw) ?? {};
     const mergedCompat: Record<string, unknown> = runtimeModel
-      ? resolveEffectiveCompatFromConfig(runtimeModel, modParsed) as Record<string, unknown>
+      ? (resolveEffectiveCompatFromConfig(runtimeModel, modParsed) as Record<
+          string,
+          unknown
+        >)
       : { ...provCompat, ...mdlCompat, ...overrideCompat };
 
     // Step 6: Validate all inserted keys are effective in the merged compat
@@ -8591,45 +11138,71 @@ function selfCheckFix(
     const editedCompatContainer = (value: Record<string, unknown>): boolean =>
       (placement === "provider" && value === origProvider) ||
       (placement === "model" && value === origTargetModelRecord) ||
-      (placement === "modelOverride" && value === asRecord(asRecord(origProvider.modelOverrides)?.[modelId]));
+      (placement === "modelOverride" &&
+        value === asRecord(asRecord(origProvider.modelOverrides)?.[modelId]));
 
     function sameCompatObject(
       originalCompatValue: unknown,
       modifiedCompatValue: unknown,
     ): boolean {
-      const originalCompat = originalCompatValue === undefined
-        ? {}
-        : asRecord(originalCompatValue);
+      const originalCompat =
+        originalCompatValue === undefined ? {} : asRecord(originalCompatValue);
       const modifiedCompat = asRecord(modifiedCompatValue);
       if (!originalCompat || !modifiedCompat) return false;
 
-      const allowedKeys = new Set([...Object.keys(originalCompat), ...Object.keys(compatKeys)]);
+      const allowedKeys = new Set([
+        ...Object.keys(originalCompat),
+        ...Object.keys(compatKeys),
+      ]);
       const modifiedKeys = Object.keys(modifiedCompat);
-      if (modifiedKeys.length !== allowedKeys.size || modifiedKeys.some((key) => !allowedKeys.has(key))) {
+      if (
+        modifiedKeys.length !== allowedKeys.size ||
+        modifiedKeys.some((key) => !allowedKeys.has(key))
+      ) {
         return false;
       }
 
       for (const key of allowedKeys) {
-        if (Object.prototype.hasOwnProperty.call(compatKeys, key)) {
-          if (!Object.prototype.hasOwnProperty.call(modifiedCompat, key) || modifiedCompat[key] !== compatKeys[key]) {
+        if (Object.hasOwn(compatKeys, key)) {
+          if (
+            !Object.hasOwn(modifiedCompat, key) ||
+            modifiedCompat[key] !== compatKeys[key]
+          ) {
             return false;
           }
           continue;
         }
-        if (!Object.prototype.hasOwnProperty.call(originalCompat, key) ||
-            !sameDocumentValue(originalCompat[key], modifiedCompat[key])) {
+        if (
+          !Object.hasOwn(originalCompat, key) ||
+          !sameDocumentValue(originalCompat[key], modifiedCompat[key])
+        ) {
           return false;
         }
       }
       return true;
     }
 
-    function sameDocumentValue(originalValue: unknown, modifiedValue: unknown): boolean {
+    function sameDocumentValue(
+      originalValue: unknown,
+      modifiedValue: unknown,
+    ): boolean {
       if (originalValue === modifiedValue) return true;
-      if (typeof originalValue !== typeof modifiedValue || originalValue === null || modifiedValue === null) return false;
+      if (
+        typeof originalValue !== typeof modifiedValue ||
+        originalValue === null ||
+        modifiedValue === null
+      )
+        return false;
       if (Array.isArray(originalValue) || Array.isArray(modifiedValue)) {
-        if (!Array.isArray(originalValue) || !Array.isArray(modifiedValue) || originalValue.length !== modifiedValue.length) return false;
-        return originalValue.every((value, index) => sameDocumentValue(value, modifiedValue[index]));
+        if (
+          !Array.isArray(originalValue) ||
+          !Array.isArray(modifiedValue) ||
+          originalValue.length !== modifiedValue.length
+        )
+          return false;
+        return originalValue.every((value, index) =>
+          sameDocumentValue(value, modifiedValue[index]),
+        );
       }
       if (typeof originalValue !== "object") return false;
 
@@ -8637,41 +11210,82 @@ function selfCheckFix(
       const modifiedObject = modifiedValue as Record<string, unknown>;
       const originalKeys = Object.keys(originalObject);
       const modifiedKeys = Object.keys(modifiedObject);
-      if (originalKeys.length !== modifiedKeys.length || modifiedKeys.some((key) => !Object.prototype.hasOwnProperty.call(originalObject, key))) {
+      if (
+        originalKeys.length !== modifiedKeys.length ||
+        modifiedKeys.some((key) => !Object.hasOwn(originalObject, key))
+      ) {
         return false;
       }
-      return originalKeys.every((key) => sameDocumentValue(originalObject[key], modifiedObject[key]));
+      return originalKeys.every((key) =>
+        sameDocumentValue(originalObject[key], modifiedObject[key]),
+      );
     }
 
-    function sameDocumentExceptEditedCompat(originalValue: unknown, modifiedValue: unknown): boolean {
+    function sameDocumentExceptEditedCompat(
+      originalValue: unknown,
+      modifiedValue: unknown,
+    ): boolean {
       if (originalValue === modifiedValue) return true;
-      if (typeof originalValue !== typeof modifiedValue || originalValue === null || modifiedValue === null) return false;
+      if (
+        typeof originalValue !== typeof modifiedValue ||
+        originalValue === null ||
+        modifiedValue === null
+      )
+        return false;
       if (Array.isArray(originalValue) || Array.isArray(modifiedValue)) {
-        if (!Array.isArray(originalValue) || !Array.isArray(modifiedValue) || originalValue.length !== modifiedValue.length) return false;
-        return originalValue.every((value, index) => sameDocumentExceptEditedCompat(value, modifiedValue[index]));
+        if (
+          !Array.isArray(originalValue) ||
+          !Array.isArray(modifiedValue) ||
+          originalValue.length !== modifiedValue.length
+        )
+          return false;
+        return originalValue.every((value, index) =>
+          sameDocumentExceptEditedCompat(value, modifiedValue[index]),
+        );
       }
       if (typeof originalValue !== "object") return false;
 
       const originalObject = originalValue as Record<string, unknown>;
       const modifiedObject = modifiedValue as Record<string, unknown>;
       if (editedCompatContainer(originalObject)) {
-        const originalKeys = Object.keys(originalObject).filter((key) => key !== "compat");
-        const modifiedKeys = Object.keys(modifiedObject).filter((key) => key !== "compat");
-        if (originalKeys.length !== modifiedKeys.length || modifiedKeys.some((key) => !Object.prototype.hasOwnProperty.call(originalObject, key))) {
+        const originalKeys = Object.keys(originalObject).filter(
+          (key) => key !== "compat",
+        );
+        const modifiedKeys = Object.keys(modifiedObject).filter(
+          (key) => key !== "compat",
+        );
+        if (
+          originalKeys.length !== modifiedKeys.length ||
+          modifiedKeys.some((key) => !Object.hasOwn(originalObject, key))
+        ) {
           return false;
         }
         for (const key of originalKeys) {
-          if (!sameDocumentExceptEditedCompat(originalObject[key], modifiedObject[key])) return false;
+          if (
+            !sameDocumentExceptEditedCompat(
+              originalObject[key],
+              modifiedObject[key],
+            )
+          )
+            return false;
         }
         return sameCompatObject(originalObject.compat, modifiedObject.compat);
       }
 
       const originalKeys = Object.keys(originalObject);
       const modifiedKeys = Object.keys(modifiedObject);
-      if (originalKeys.length !== modifiedKeys.length || modifiedKeys.some((key) => !Object.prototype.hasOwnProperty.call(originalObject, key))) {
+      if (
+        originalKeys.length !== modifiedKeys.length ||
+        modifiedKeys.some((key) => !Object.hasOwn(originalObject, key))
+      ) {
         return false;
       }
-      return originalKeys.every((key) => sameDocumentExceptEditedCompat(originalObject[key], modifiedObject[key]));
+      return originalKeys.every((key) =>
+        sameDocumentExceptEditedCompat(
+          originalObject[key],
+          modifiedObject[key],
+        ),
+      );
     }
 
     if (!sameDocumentExceptEditedCompat(origParsed, modParsed)) {
@@ -8695,7 +11309,9 @@ function selfCheckFix(
     if (rootEnd === undefined) {
       return "Modified file: root bracket mismatch";
     }
-    if (skipJsonWhitespace(modifiedClean, rootEnd + 1) !== modifiedClean.length) {
+    if (
+      skipJsonWhitespace(modifiedClean, rootEnd + 1) !== modifiedClean.length
+    ) {
       return "Modified file: trailing non-whitespace content after root object";
     }
 
@@ -8709,12 +11325,14 @@ function selfCheckFix(
  * Serialize a compat suggestion to the JSON text that will be inserted.
  * Returns the exact key-value pairs as a formatted JSON string without outer braces.
  */
-function formatCompatKeysForInsertion(compatKeys: Record<string, unknown>): string {
+function formatCompatKeysForInsertion(
+  compatKeys: Record<string, unknown>,
+): string {
   return Object.entries(compatKeys)
     .map(([k, v]) => {
       return `  ${JSON.stringify(k)}: ${JSON.stringify(v)}`;
     })
-    .join(',\n');
+    .join(",\n");
 }
 
 /**
@@ -8747,7 +11365,11 @@ function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
   const rightDev = Number(right.dev);
   const leftIno = Number(left.ino);
   const rightIno = Number(right.ino);
-  return leftIno === 0 || rightIno === 0 || (leftDev === rightDev && leftIno === rightIno);
+  return (
+    leftIno === 0 ||
+    rightIno === 0 ||
+    (leftDev === rightDev && leftIno === rightIno)
+  );
 }
 
 type AtomicTargetGuard = {
@@ -8762,7 +11384,9 @@ async function validateAtomicTarget(
 ): Promise<Awaited<ReturnType<typeof lstat>>> {
   const info = await lstat(targetPath);
   if (info.isSymbolicLink() || !info.isFile()) {
-    throw new Error("target is not a regular file; refusing atomic replacement");
+    throw new Error(
+      "target is not a regular file; refusing atomic replacement",
+    );
   }
   if (guard?.identity && !sameFileIdentity(guard.identity, info)) {
     throw new Error("target changed during atomic replacement");
@@ -8816,7 +11440,10 @@ async function atomicReplaceTextFilePreservingMode(
       await unlink(tempPath);
     } catch (cleanupError) {
       if (getErrorCode(cleanupError) !== "ENOENT") {
-        console.warn(`${LOG_PREFIX}: failed to remove temporary models.json file`, cleanupError);
+        console.warn(
+          `${LOG_PREFIX}: failed to remove temporary models.json file`,
+          cleanupError,
+        );
       }
     }
     throw error;
@@ -8844,14 +11471,20 @@ async function atomicCreateTextFileNoReplace(
     if (beforeLink) await beforeLink();
     await link(tempPath, targetPath);
     await unlink(tempPath).catch((cleanupError) => {
-      console.warn(`${LOG_PREFIX}: committed config file but failed to remove its temporary hard link`, cleanupError);
+      console.warn(
+        `${LOG_PREFIX}: committed config file but failed to remove its temporary hard link`,
+        cleanupError,
+      );
     });
   } catch (error) {
     try {
       await unlink(tempPath);
     } catch (cleanupError) {
       if (getErrorCode(cleanupError) !== "ENOENT") {
-        console.warn(`${LOG_PREFIX}: failed to remove temporary config file`, cleanupError);
+        console.warn(
+          `${LOG_PREFIX}: failed to remove temporary config file`,
+          cleanupError,
+        );
       }
     }
     throw error;
@@ -8886,7 +11519,10 @@ async function atomicRestoreFileFromBackup(
     }
     await chmod(tempPath, mode);
     const tempText = await readFile(tempPath, "utf8");
-    if (guard?.backupHash !== undefined && hashText(tempText) !== guard.backupHash) {
+    if (
+      guard?.backupHash !== undefined &&
+      hashText(tempText) !== guard.backupHash
+    ) {
       throw new Error("backup content changed during atomic restore");
     }
     await validateAtomicTarget(targetPath, {
@@ -8904,7 +11540,10 @@ async function atomicRestoreFileFromBackup(
       await unlink(tempPath);
     } catch (cleanupError) {
       if (getErrorCode(cleanupError) !== "ENOENT") {
-        console.warn(`${LOG_PREFIX}: failed to remove temporary restore file`, cleanupError);
+        console.warn(
+          `${LOG_PREFIX}: failed to remove temporary restore file`,
+          cleanupError,
+        );
       }
     }
     throw error;
@@ -8938,7 +11577,9 @@ function hashText(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-async function withModelsJsonTransactionLock<T>(operation: () => Promise<T>): Promise<T> {
+async function withModelsJsonTransactionLock<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
   await mkdir(STATE_DIR, { recursive: true });
   const deadline = Date.now() + MODELS_TRANSACTION_LOCK_WAIT_MS;
   const ownerToken = randomUUID();
@@ -8962,21 +11603,33 @@ async function withModelsJsonTransactionLock<T>(operation: () => Promise<T>): Pr
       break;
     } catch (error) {
       if (getErrorCode(error) !== "EEXIST") throw error;
-      const lockInfo = await lstat(MODELS_TRANSACTION_LOCK_PATH).catch(() => undefined);
+      const lockInfo = await lstat(MODELS_TRANSACTION_LOCK_PATH).catch(
+        () => undefined,
+      );
       if (!lockInfo) continue;
       if (lockInfo.isSymbolicLink() || !lockInfo.isFile()) {
         throw new Error("models.json transaction lock path is unsafe");
       }
       let staleOwnerPid: number | undefined;
       try {
-        const owner = asRecord(JSON.parse(await readFile(MODELS_TRANSACTION_LOCK_PATH, "utf8")));
+        const owner = asRecord(
+          JSON.parse(await readFile(MODELS_TRANSACTION_LOCK_PATH, "utf8")),
+        );
         if (typeof owner?.pid === "number") staleOwnerPid = owner.pid;
-      } catch {}
-      const stale = Date.now() - lockInfo.mtimeMs > MODELS_TRANSACTION_LOCK_STALE_MS;
-      if (stale && (staleOwnerPid === undefined || !isProcessAlive(staleOwnerPid))) {
+      } catch {
+        // Unreadable owner metadata is treated as unknown; staleness decides.
+      }
+      const stale =
+        Date.now() - lockInfo.mtimeMs > MODELS_TRANSACTION_LOCK_STALE_MS;
+      if (
+        stale &&
+        (staleOwnerPid === undefined || !isProcessAlive(staleOwnerPid))
+      ) {
         // Recheck identity immediately before unlinking so a recovered owner
         // cannot delete a replacement lease created at the same path.
-        const currentLock = await lstat(MODELS_TRANSACTION_LOCK_PATH).catch(() => undefined);
+        const currentLock = await lstat(MODELS_TRANSACTION_LOCK_PATH).catch(
+          () => undefined,
+        );
         if (currentLock && sameFileIdentity(lockInfo, currentLock)) {
           await unlink(MODELS_TRANSACTION_LOCK_PATH).catch((unlinkError) => {
             if (getErrorCode(unlinkError) !== "ENOENT") throw unlinkError;
@@ -8985,7 +11638,9 @@ async function withModelsJsonTransactionLock<T>(operation: () => Promise<T>): Pr
         continue;
       }
       if (Date.now() >= deadline) {
-        throw new Error("another cache-optimizer models.json transaction is still running");
+        throw new Error(
+          "another cache-optimizer models.json transaction is still running",
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -9003,13 +11658,16 @@ async function withModelsJsonTransactionLock<T>(operation: () => Promise<T>): Pr
         !currentLock.isSymbolicLink() &&
         currentLock.isFile() &&
         sameFileIdentity(ownedLockIdentity, currentLock) &&
-        await readFile(MODELS_TRANSACTION_LOCK_PATH, "utf8") === ownerText
+        (await readFile(MODELS_TRANSACTION_LOCK_PATH, "utf8")) === ownerText
       ) {
         await unlink(MODELS_TRANSACTION_LOCK_PATH);
       }
     } catch (error) {
       if (getErrorCode(error) !== "ENOENT") {
-        console.warn(`${LOG_PREFIX}: failed to remove models.json transaction lock`, error);
+        console.warn(
+          `${LOG_PREFIX}: failed to remove models.json transaction lock`,
+          error,
+        );
       }
     }
   }
@@ -9053,12 +11711,18 @@ async function applyModelsJsonFixTransactionUnderLock(
   }
   const originalMode = targetInfo.mode & 0o7777;
   const transactionName = options.purpose === "rollback" ? "rollback" : "fix";
-  if (options.expectedCurrentMode !== undefined && options.expectedCurrentMode !== originalMode) {
-    throw new Error(`models.json access mode changed since the ${transactionName} preview; no changes were made`);
+  if (
+    options.expectedCurrentMode !== undefined &&
+    options.expectedCurrentMode !== originalMode
+  ) {
+    throw new Error(
+      `models.json access mode changed since the ${transactionName} preview; no changes were made`,
+    );
   }
   const initialTargetText = await readFile(MODELS_JSON_PATH, "utf8");
   const transactionInitialHash = hashText(initialTargetText);
-  const expectedCurrentHash = options.expectedCurrentHash ?? transactionInitialHash;
+  const expectedCurrentHash =
+    options.expectedCurrentHash ?? transactionInitialHash;
   const expectedBackupHash = options.expectedBackupHash ?? expectedCurrentHash;
   const assertCurrentTargetUnchanged = async (): Promise<void> => {
     const currentInfo = await lstat(MODELS_JSON_PATH);
@@ -9068,22 +11732,30 @@ async function applyModelsJsonFixTransactionUnderLock(
       !sameFileIdentity(targetInfo, currentInfo) ||
       (currentInfo.mode & 0o7777) !== originalMode
     ) {
-      throw new Error(`models.json changed during ${transactionName}; no changes were made`);
+      throw new Error(
+        `models.json changed during ${transactionName}; no changes were made`,
+      );
     }
     const currentText = await readFile(MODELS_JSON_PATH, "utf8");
     if (hashText(currentText) !== expectedCurrentHash) {
-      throw new Error(`models.json changed since the ${transactionName} preview; no changes were made`);
+      throw new Error(
+        `models.json changed since the ${transactionName} preview; no changes were made`,
+      );
     }
   };
   const assertBackupUnchanged = async (): Promise<void> => {
     const backupInfo = await lstat(backupPath);
     if (backupInfo.isSymbolicLink() || !backupInfo.isFile()) {
-      throw new Error(`models.json ${transactionName} backup is not a regular file; no changes were made`);
+      throw new Error(
+        `models.json ${transactionName} backup is not a regular file; no changes were made`,
+      );
     }
     if (expectedBackupHash !== undefined) {
       const backupText = await readFile(backupPath, "utf8");
       if (hashText(backupText) !== expectedBackupHash) {
-        throw new Error(`models.json ${transactionName} backup changed during preparation; no changes were made`);
+        throw new Error(
+          `models.json ${transactionName} backup changed during preparation; no changes were made`,
+        );
       }
     }
   };
@@ -9092,7 +11764,9 @@ async function applyModelsJsonFixTransactionUnderLock(
   await copyFile(MODELS_JSON_PATH, backupPath, fsConstants.COPYFILE_EXCL);
   const createdBackupInfo = await lstat(backupPath);
   if (createdBackupInfo.isSymbolicLink() || !createdBackupInfo.isFile()) {
-    throw new Error(`models.json ${transactionName} backup is not a regular file; no changes were made`);
+    throw new Error(
+      `models.json ${transactionName} backup is not a regular file; no changes were made`,
+    );
   }
   await chmod(backupPath, originalMode);
   const chmodBackupInfo = await lstat(backupPath);
@@ -9101,7 +11775,9 @@ async function applyModelsJsonFixTransactionUnderLock(
     !chmodBackupInfo.isFile() ||
     !sameFileIdentity(createdBackupInfo, chmodBackupInfo)
   ) {
-    throw new Error(`models.json ${transactionName} backup changed during preparation; no changes were made`);
+    throw new Error(
+      `models.json ${transactionName} backup changed during preparation; no changes were made`,
+    );
   }
   await assertBackupUnchanged();
 
@@ -9114,26 +11790,40 @@ async function applyModelsJsonFixTransactionUnderLock(
       !currentInfo.isFile() ||
       (currentInfo.mode & 0o7777) !== originalMode
     ) {
-      throw new Error(`models.json changed after ${transactionName} replacement; refusing to overwrite user changes`);
+      throw new Error(
+        `models.json changed after ${transactionName} replacement; refusing to overwrite user changes`,
+      );
     }
     const currentText = await readFile(MODELS_JSON_PATH, "utf8");
     if (hashText(currentText) !== expectedModifiedHash) {
-      throw new Error(`models.json changed after ${transactionName} replacement; refusing to overwrite user changes`);
+      throw new Error(
+        `models.json changed after ${transactionName} replacement; refusing to overwrite user changes`,
+      );
     }
     await assertBackupUnchanged();
-    await atomicRestoreFileFromBackup(backupPath, MODELS_JSON_PATH, originalMode, {
-      identity: currentInfo,
-      hash: expectedModifiedHash,
-      mode: originalMode,
-      backupHash: expectedBackupHash,
-    });
+    await atomicRestoreFileFromBackup(
+      backupPath,
+      MODELS_JSON_PATH,
+      originalMode,
+      {
+        identity: currentInfo,
+        hash: expectedModifiedHash,
+        mode: originalMode,
+        backupHash: expectedBackupHash,
+      },
+    );
     const restoredInfo = await lstat(MODELS_JSON_PATH);
     if (restoredInfo.isSymbolicLink() || !restoredInfo.isFile()) {
       throw new Error(`models.json restore produced a non-regular file`);
     }
     const restoredText = await readFile(MODELS_JSON_PATH, "utf8");
-    if (expectedBackupHash !== undefined && hashText(restoredText) !== expectedBackupHash) {
-      throw new Error(`models.json restore did not match the transaction backup`);
+    if (
+      expectedBackupHash !== undefined &&
+      hashText(restoredText) !== expectedBackupHash
+    ) {
+      throw new Error(
+        `models.json restore did not match the transaction backup`,
+      );
     }
   };
 
@@ -9154,17 +11844,21 @@ async function applyModelsJsonFixTransactionUnderLock(
 
     const writtenInfo = await lstat(MODELS_JSON_PATH);
     if (writtenInfo.isSymbolicLink() || !writtenInfo.isFile()) {
-      throw new Error(`models.json became a non-regular file during ${transactionName} replacement`);
+      throw new Error(
+        `models.json became a non-regular file during ${transactionName} replacement`,
+      );
     }
     const writtenText = await readFile(MODELS_JSON_PATH, "utf8");
     const postCheckError = validateWrittenText(writtenText);
     const writtenMode = writtenInfo.mode & 0o7777;
-    const writeHashError = hashText(writtenText) === expectedModifiedHash
-      ? null
-      : `models.json changed during ${transactionName} replacement`;
-    const modeError = writtenMode === originalMode
-      ? null
-      : `models.json access mode changed from ${originalMode.toString(8)} to ${writtenMode.toString(8)}`;
+    const writeHashError =
+      hashText(writtenText) === expectedModifiedHash
+        ? null
+        : `models.json changed during ${transactionName} replacement`;
+    const modeError =
+      writtenMode === originalMode
+        ? null
+        : `models.json access mode changed from ${originalMode.toString(8)} to ${writtenMode.toString(8)}`;
     const effectiveError = postCheckError ?? writeHashError ?? modeError;
     if (effectiveError !== null) {
       await restoreTargetIfUnchanged();
@@ -9212,25 +11906,45 @@ async function applyModelsJsonFixTransaction(
   options: ModelsJsonFixTransactionOptions = {},
 ): Promise<ModelsJsonFixTransactionResult> {
   return withModelsJsonTransactionLock(() =>
-    applyModelsJsonFixTransactionUnderLock(modifiedText, backupPath, validateWrittenText, options)
+    applyModelsJsonFixTransactionUnderLock(
+      modifiedText,
+      backupPath,
+      validateWrittenText,
+      options,
+    ),
   );
 }
 
 function isReceiptScalar(value: unknown): value is ReceiptScalar {
-  return value === null || typeof value === "string" || typeof value === "boolean" ||
-    (typeof value === "number" && Number.isFinite(value));
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
 }
 
 function isReceiptScalarState(value: unknown): value is ReceiptScalarState {
   const record = asRecord(value);
   if (!record || record.present === undefined) return false;
-  if (record.present === false) return Object.keys(record).every((key) => key === "present");
-  return record.present === true && isReceiptScalar(record.value) && Object.keys(record).every((key) => key === "present" || key === "value");
+  if (record.present === false)
+    return Object.keys(record).every((key) => key === "present");
+  return (
+    record.present === true &&
+    isReceiptScalar(record.value) &&
+    Object.keys(record).every((key) => key === "present" || key === "value")
+  );
 }
 
-function sameReceiptScalarState(left: ReceiptScalarState, right: ReceiptScalarState): boolean {
+function sameReceiptScalarState(
+  left: ReceiptScalarState,
+  right: ReceiptScalarState,
+): boolean {
   if (left.present !== right.present) return false;
-  return !left.present || left.value === (right as { present: true; value: ReceiptScalar }).value;
+  return (
+    !left.present ||
+    left.value === (right as { present: true; value: ReceiptScalar }).value
+  );
 }
 
 function isFixReceiptPlacement(value: unknown): value is FixReceiptPlacement {
@@ -9241,19 +11955,25 @@ function isSha256(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
 }
 
-function hasReceiptReasoningProtocolChange(receipt: ModelsJsonFixReceiptV1): boolean {
+function hasReceiptReasoningProtocolChange(
+  receipt: ModelsJsonFixReceiptV1,
+): boolean {
   return [
     "thinkingFormat",
     "supportsReasoningEffort",
     "requiresReasoningContentOnAssistantMessages",
-  ].some((key) => Object.prototype.hasOwnProperty.call(receipt.changedKeys, key));
+  ].some((key) => Object.hasOwn(receipt.changedKeys, key));
 }
 
-function isActionableModelsJsonFixReceipt(receipt: ModelsJsonFixReceiptV1 | undefined): receipt is ModelsJsonFixReceiptV1 {
+function isActionableModelsJsonFixReceipt(
+  receipt: ModelsJsonFixReceiptV1 | undefined,
+): receipt is ModelsJsonFixReceiptV1 {
   return receipt !== undefined && receipt.status === undefined;
 }
 
-function createRollbackBackupPath(modelsPath: string = MODELS_JSON_PATH): string {
+function createRollbackBackupPath(
+  modelsPath: string = MODELS_JSON_PATH,
+): string {
   return `${modelsPath}.backup-cache-optimizer-rollback-${backupTimestamp()}`;
 }
 
@@ -9265,24 +11985,73 @@ function isReceiptTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | undefined {
+function parseModelsJsonFixReceipt(
+  value: unknown,
+): ModelsJsonFixReceiptV1 | undefined {
   const record = asRecord(value);
-  if (!record || record.version !== 1 || record.kind !== "pi-cache-optimizer-fix-receipt") return undefined;
+  if (
+    !record ||
+    record.version !== 1 ||
+    record.kind !== "pi-cache-optimizer-fix-receipt"
+  )
+    return undefined;
   const allowedKeys = new Set([
-    "version", "kind", "transactionId", "provider", "modelId", "placement",
-    "targetExistedBefore", "changedKeys", "beforeHash", "afterHash", "backupFile",
-    "createdAt", "appliedAt", "status", "rolledBackAt",
+    "version",
+    "kind",
+    "transactionId",
+    "provider",
+    "modelId",
+    "placement",
+    "targetExistedBefore",
+    "changedKeys",
+    "beforeHash",
+    "afterHash",
+    "backupFile",
+    "createdAt",
+    "appliedAt",
+    "status",
+    "rolledBackAt",
   ]);
-  if (Object.keys(record).some((key) => !allowedKeys.has(key))) return undefined;
-  if (!isSafeReceiptText(record.transactionId) || !isSafeReceiptText(record.provider) || !isSafeReceiptText(record.modelId)) return undefined;
-  if (!isFixReceiptPlacement(record.placement) || typeof record.targetExistedBefore !== "boolean") return undefined;
-  if (!isSha256(record.beforeHash) || !isSha256(record.afterHash) || record.beforeHash === record.afterHash) return undefined;
-  if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || record.backupFile.includes("..")) return undefined;
-  if (!/^models\.json\.backup-cache-optimizer-/.test(record.backupFile)) return undefined;
-  const beforeHash = typeof record.beforeHash === "string" ? record.beforeHash.toLowerCase() : "";
-  const afterHash = typeof record.afterHash === "string" ? record.afterHash.toLowerCase() : "";
+  if (Object.keys(record).some((key) => !allowedKeys.has(key)))
+    return undefined;
+  if (
+    !isSafeReceiptText(record.transactionId) ||
+    !isSafeReceiptText(record.provider) ||
+    !isSafeReceiptText(record.modelId)
+  )
+    return undefined;
+  if (
+    !isFixReceiptPlacement(record.placement) ||
+    typeof record.targetExistedBefore !== "boolean"
+  )
+    return undefined;
+  if (
+    !isSha256(record.beforeHash) ||
+    !isSha256(record.afterHash) ||
+    record.beforeHash === record.afterHash
+  )
+    return undefined;
+  if (
+    !isSafeReceiptText(record.backupFile) ||
+    basename(record.backupFile) !== record.backupFile ||
+    record.backupFile.includes("..")
+  )
+    return undefined;
+  if (!/^models\.json\.backup-cache-optimizer-/.test(record.backupFile))
+    return undefined;
+  const beforeHash =
+    typeof record.beforeHash === "string"
+      ? record.beforeHash.toLowerCase()
+      : "";
+  const afterHash =
+    typeof record.afterHash === "string" ? record.afterHash.toLowerCase() : "";
   if (beforeHash === afterHash) return undefined;
-  if (!isReceiptTimestamp(record.createdAt) || !isReceiptTimestamp(record.appliedAt) || record.appliedAt < record.createdAt) return undefined;
+  if (
+    !isReceiptTimestamp(record.createdAt) ||
+    !isReceiptTimestamp(record.appliedAt) ||
+    record.appliedAt < record.createdAt
+  )
+    return undefined;
   const changedKeys = asRecord(record.changedKeys);
   if (!changedKeys || Object.keys(changedKeys).length === 0) return undefined;
 
@@ -9290,7 +12059,12 @@ function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | und
   for (const [key, rawChange] of Object.entries(changedKeys)) {
     if (!RECEIPT_COMPAT_KEYS.has(key)) return undefined;
     const change = asRecord(rawChange);
-    if (!change || !isReceiptScalarState(change.before) || !isReceiptScalarState(change.after)) return undefined;
+    if (
+      !change ||
+      !isReceiptScalarState(change.before) ||
+      !isReceiptScalarState(change.after)
+    )
+      return undefined;
     if (sameReceiptScalarState(change.before, change.after)) return undefined;
     parsedChanges[key] = {
       before: change.before,
@@ -9298,9 +12072,16 @@ function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | und
     };
   }
 
-  if (record.status !== undefined && record.status !== "rolled_back") return undefined;
-  if (record.status === "rolled_back" && (!isReceiptTimestamp(record.rolledBackAt) || record.rolledBackAt < record.appliedAt)) return undefined;
-  if (record.status === undefined && record.rolledBackAt !== undefined) return undefined;
+  if (record.status !== undefined && record.status !== "rolled_back")
+    return undefined;
+  if (
+    record.status === "rolled_back" &&
+    (!isReceiptTimestamp(record.rolledBackAt) ||
+      record.rolledBackAt < record.appliedAt)
+  )
+    return undefined;
+  if (record.status === undefined && record.rolledBackAt !== undefined)
+    return undefined;
 
   return {
     version: 1,
@@ -9316,11 +12097,16 @@ function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | und
     backupFile: record.backupFile,
     createdAt: Number(record.createdAt),
     appliedAt: Number(record.appliedAt),
-    ...(record.status === "rolled_back" ? { status: "rolled_back", rolledBackAt: Number(record.rolledBackAt) } : {}),
+    ...(record.status === "rolled_back"
+      ? { status: "rolled_back", rolledBackAt: Number(record.rolledBackAt) }
+      : {}),
   };
 }
 
-function receiptBackupPath(receipt: ModelsJsonFixReceiptV1, receiptPath: string = FIX_RECEIPT_PATH): string {
+function receiptBackupPath(
+  receipt: ModelsJsonFixReceiptV1,
+  receiptPath: string = FIX_RECEIPT_PATH,
+): string {
   return join(dirname(receiptPath), receipt.backupFile);
 }
 
@@ -9331,16 +12117,19 @@ async function writeModelsJsonFixReceipt(
   /** Test-only race injector; production callers leave this undefined. */
   beforeRename?: () => Promise<void>,
 ): Promise<void> {
-  if (!parseModelsJsonFixReceipt(receipt)) throw new Error("invalid fix receipt");
+  if (!parseModelsJsonFixReceipt(receipt))
+    throw new Error("invalid fix receipt");
   if (expectedSnapshot) {
-    if (expectedSnapshot.receiptPath !== receiptPath) throw new Error("fix receipt path changed since the rollback preview");
+    if (expectedSnapshot.receiptPath !== receiptPath)
+      throw new Error("fix receipt path changed since the rollback preview");
     await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
   }
   await mkdir(dirname(receiptPath), { recursive: true });
   let existingReceiptInfo: { dev: number; ino: number } | undefined;
   try {
     const info = await lstat(receiptPath);
-    if (info.isSymbolicLink() || !info.isFile()) throw new Error("invalid fix receipt path");
+    if (info.isSymbolicLink() || !info.isFile())
+      throw new Error("invalid fix receipt path");
     existingReceiptInfo = info;
   } catch (error) {
     if (getErrorCode(error) !== "ENOENT") throw error;
@@ -9349,9 +12138,14 @@ async function writeModelsJsonFixReceipt(
 
   const tempPath = uniqueTempPath(receiptPath, "receipt");
   try {
-    await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", { encoding: "utf8", mode, flag: "wx" });
+    await writeFile(tempPath, JSON.stringify(receipt, null, 2) + "\n", {
+      encoding: "utf8",
+      mode,
+      flag: "wx",
+    });
     const tempInfo = await lstat(tempPath);
-    if (tempInfo.isSymbolicLink() || !tempInfo.isFile()) throw new Error("invalid temporary fix receipt");
+    if (tempInfo.isSymbolicLink() || !tempInfo.isFile())
+      throw new Error("invalid temporary fix receipt");
     await chmod(tempPath, mode);
     if (expectedSnapshot) {
       await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
@@ -9359,7 +12153,10 @@ async function writeModelsJsonFixReceipt(
     const assertReceiptDestinationUnchanged = async (): Promise<void> => {
       try {
         const currentReceiptInfo = await lstat(receiptPath);
-        if (!existingReceiptInfo || !sameFileIdentity(existingReceiptInfo, currentReceiptInfo)) {
+        if (
+          !existingReceiptInfo ||
+          !sameFileIdentity(existingReceiptInfo, currentReceiptInfo)
+        ) {
           throw new Error("fix receipt changed during atomic write");
         }
       } catch (error) {
@@ -9370,7 +12167,8 @@ async function writeModelsJsonFixReceipt(
           throw error;
         }
       }
-      if (expectedSnapshot) await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
+      if (expectedSnapshot)
+        await assertModelsJsonFixReceiptSnapshotUnchanged(expectedSnapshot);
     };
     await assertReceiptDestinationUnchanged();
     if (beforeRename) await beforeRename();
@@ -9380,14 +12178,21 @@ async function writeModelsJsonFixReceipt(
     } else {
       await link(tempPath, receiptPath);
       await unlink(tempPath).catch((cleanupError) => {
-        console.warn(`${LOG_PREFIX}: committed fix receipt but failed to remove its temporary hard link`, cleanupError);
+        console.warn(
+          `${LOG_PREFIX}: committed fix receipt but failed to remove its temporary hard link`,
+          cleanupError,
+        );
       });
     }
   } catch (error) {
     try {
       await unlink(tempPath);
     } catch (cleanupError) {
-      if (getErrorCode(cleanupError) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to remove temporary fix receipt`, cleanupError);
+      if (getErrorCode(cleanupError) !== "ENOENT")
+        console.warn(
+          `${LOG_PREFIX}: failed to remove temporary fix receipt`,
+          cleanupError,
+        );
     }
     throw error;
   }
@@ -9405,7 +12210,8 @@ async function readModelsJsonFixReceiptSnapshot(
       afterRead.isSymbolicLink() ||
       !afterRead.isFile() ||
       !sameFileIdentity(info, afterRead)
-    ) return undefined;
+    )
+      return undefined;
     const receipt = parseModelsJsonFixReceipt(JSON.parse(text));
     if (!receipt) return undefined;
     return {
@@ -9429,11 +12235,15 @@ async function markModelsJsonFixReceiptRolledBack(
   snapshot: ModelsJsonFixReceiptSnapshot,
 ): Promise<void> {
   const receipt = snapshot.receipt;
-  await writeModelsJsonFixReceipt({
-    ...receipt,
-    status: "rolled_back",
-    rolledBackAt: Date.now(),
-  }, snapshot.receiptPath, snapshot);
+  await writeModelsJsonFixReceipt(
+    {
+      ...receipt,
+      status: "rolled_back",
+      rolledBackAt: Date.now(),
+    },
+    snapshot.receiptPath,
+    snapshot,
+  );
 }
 
 type ReceiptCompatTarget = {
@@ -9456,7 +12266,8 @@ function locateReceiptCompatTarget(
       location.modelOverridesKeyCount > 1 ||
       location.modelOverrideKeyCount > 1 ||
       location.modelOverrideCompatKeyCount > 1
-    ) return undefined;
+    )
+      return undefined;
     return {
       targetExists: location.modelOverrideObjectBrace >= 0,
       compatBrace: location.modelOverrideCompatBrace,
@@ -9471,13 +12282,22 @@ function locateReceiptCompatTarget(
   // later user-added definition. Provider-level changes do not need to inspect
   // model compat, but duplicate target ids still make the receipt identity
   // ambiguous and are rejected for both placements.
-  if (location.allModelIds.filter((id) => id === modelId).length !== 1) return undefined;
-  if (placement === "provider" && location.providerCompatKeyCount > 1) return undefined;
-  if (placement === "model" && location.modelCompatKeyCount > 1) return undefined;
+  if (location.allModelIds.filter((id) => id === modelId).length !== 1)
+    return undefined;
+  if (placement === "provider" && location.providerCompatKeyCount > 1)
+    return undefined;
+  if (placement === "model" && location.modelCompatKeyCount > 1)
+    return undefined;
   return {
     targetExists: location.modelObjectBrace >= 0,
-    compatBrace: placement === "provider" ? location.providerCompatBrace : location.compatObjectBrace,
-    compatEnd: placement === "provider" ? location.providerCompatEnd : location.compatObjectEnd,
+    compatBrace:
+      placement === "provider"
+        ? location.providerCompatBrace
+        : location.compatObjectBrace,
+    compatEnd:
+      placement === "provider"
+        ? location.providerCompatEnd
+        : location.compatObjectEnd,
   };
 }
 
@@ -9486,12 +12306,17 @@ function readReceiptCompatScalarState(
   target: ReceiptCompatTarget | undefined,
   key: string,
 ): ReceiptScalarState | undefined {
-  if (!target || target.compatBrace < 0 || target.compatEnd <= target.compatBrace) {
+  if (
+    !target ||
+    target.compatBrace < 0 ||
+    target.compatEnd <= target.compatBrace
+  ) {
     return { present: false };
   }
   const clean = stripJsoncComments(text);
   const property = findJsonObjectKey(clean, target.compatBrace, key);
-  if (!property || property.keyStart >= target.compatEnd) return { present: false };
+  if (!property || property.keyStart >= target.compatEnd)
+    return { present: false };
   if (property.count !== 1) return undefined;
   const valueStart = skipJsonWhitespace(clean, property.valueStart);
   const valueEnd = skipJsonValue(clean, valueStart);
@@ -9516,19 +12341,40 @@ function createModelsJsonFixReceipt(
   now: number = Date.now(),
 ): ModelsJsonFixReceiptV1 | undefined {
   const backupFile = basename(backupPath);
-  if (!/^models\.json\.backup-cache-optimizer-/.test(backupFile)) return undefined;
-  const beforeTarget = locateReceiptCompatTarget(originalText, provider, modelId, placement);
-  const afterTarget = locateReceiptCompatTarget(modifiedText, provider, modelId, placement);
+  if (!/^models\.json\.backup-cache-optimizer-/.test(backupFile))
+    return undefined;
+  const beforeTarget = locateReceiptCompatTarget(
+    originalText,
+    provider,
+    modelId,
+    placement,
+  );
+  const afterTarget = locateReceiptCompatTarget(
+    modifiedText,
+    provider,
+    modelId,
+    placement,
+  );
   if (targetExistedBefore && !beforeTarget?.targetExists) return undefined;
   if (!afterTarget?.targetExists) return undefined;
 
   const changedKeys: Record<string, FixReceiptCompatChange> = {};
   for (const [key, afterValue] of Object.entries(compatKeys)) {
     if (!isReceiptScalar(afterValue)) return undefined;
-    const before = readReceiptCompatScalarState(originalText, beforeTarget, key);
+    const before = readReceiptCompatScalarState(
+      originalText,
+      beforeTarget,
+      key,
+    );
     const after = readReceiptCompatScalarState(modifiedText, afterTarget, key);
-    if (!before || !after || !sameReceiptScalarState(after, { present: true, value: afterValue })) return undefined;
-    if (!sameReceiptScalarState(before, after)) changedKeys[key] = { before, after };
+    if (
+      !before ||
+      !after ||
+      !sameReceiptScalarState(after, { present: true, value: afterValue })
+    )
+      return undefined;
+    if (!sameReceiptScalarState(before, after))
+      changedKeys[key] = { before, after };
   }
   if (Object.keys(changedKeys).length === 0) return undefined;
 
@@ -9550,7 +12396,11 @@ function createModelsJsonFixReceipt(
   return parseModelsJsonFixReceipt(receipt);
 }
 
-function maskJsonSyntaxPreservingComments(text: string, start: number, end: number): string {
+function maskJsonSyntaxPreservingComments(
+  text: string,
+  start: number,
+  end: number,
+): string {
   // Replace only JSON syntax/value bytes. Comments are copied verbatim so a
   // user explanation attached to a receipt-owned key survives a surgical
   // rollback. Newlines are also retained to keep line structure unchanged.
@@ -9616,10 +12466,18 @@ function locateJsonPropertyValueSpan(
   objectBrace: number,
   objectEnd: number,
   key: string,
-): { keyStart: number; valueStart: number; valueEnd: number; removal: JsonPropertyEdit } | undefined {
+):
+  | {
+      keyStart: number;
+      valueStart: number;
+      valueEnd: number;
+      removal: JsonPropertyEdit;
+    }
+  | undefined {
   const clean = stripJsoncComments(text);
   const property = findJsonObjectKey(clean, objectBrace, key);
-  if (!property || property.keyStart >= objectEnd || property.count !== 1) return undefined;
+  if (!property || property.keyStart >= objectEnd || property.count !== 1)
+    return undefined;
   const valueStart = skipJsonWhitespace(clean, property.valueStart);
   const valueEnd = skipJsonValue(clean, valueStart);
   if (valueEnd === undefined || valueEnd > objectEnd) return undefined;
@@ -9633,13 +12491,18 @@ function locateJsonPropertyValueSpan(
       removal: {
         start: property.keyStart,
         end: next + 1,
-        text: maskJsonSyntaxPreservingComments(text, property.keyStart, next + 1),
+        text: maskJsonSyntaxPreservingComments(
+          text,
+          property.keyStart,
+          next + 1,
+        ),
       },
     };
   }
 
   let previous = property.keyStart - 1;
-  while (previous >= objectBrace && isJsonWhitespace(clean[previous])) previous--;
+  while (previous >= objectBrace && isJsonWhitespace(clean[previous]))
+    previous--;
   const removalStart = clean[previous] === "," ? previous : property.keyStart;
   return {
     keyStart: property.keyStart,
@@ -9658,25 +12521,49 @@ function composeModelsJsonReceiptRollback(
   receipt: ModelsJsonFixReceiptV1,
 ): { modifiedText: string; changed: boolean } | { error: string } {
   if (!receipt.targetExistedBefore) {
-    return { error: "the fix created a new target entry and the file changed; refusing to remove user changes automatically" };
+    return {
+      error:
+        "the fix created a new target entry and the file changed; refusing to remove user changes automatically",
+    };
   }
 
-  const target = locateReceiptCompatTarget(currentText, receipt.provider, receipt.modelId, receipt.placement);
+  const target = locateReceiptCompatTarget(
+    currentText,
+    receipt.provider,
+    receipt.modelId,
+    receipt.placement,
+  );
   if (!target?.targetExists) {
-    return { error: "the original target entry is missing or no longer safely locatable" };
+    return {
+      error:
+        "the original target entry is missing or no longer safely locatable",
+    };
   }
   if (target.compatBrace < 0 || target.compatEnd <= target.compatBrace) {
-    return { error: "the target compat object is missing or no longer safely locatable" };
+    return {
+      error:
+        "the target compat object is missing or no longer safely locatable",
+    };
   }
 
   const edits: JsonPropertyEdit[] = [];
   for (const [key, change] of Object.entries(receipt.changedKeys)) {
     const current = readReceiptCompatScalarState(currentText, target, key);
     if (!current || !sameReceiptScalarState(current, change.after)) {
-      return { error: `receipt-owned compat.${key} was changed after the fix; refusing to overwrite it` };
+      return {
+        error: `receipt-owned compat.${key} was changed after the fix; refusing to overwrite it`,
+      };
     }
-    const property = locateJsonPropertyValueSpan(currentText, target.compatBrace, target.compatEnd, key);
-    if (!property) return { error: `receipt-owned compat.${key} is no longer safely locatable` };
+    const property = locateJsonPropertyValueSpan(
+      currentText,
+      target.compatBrace,
+      target.compatEnd,
+      key,
+    );
+    if (!property)
+      return {
+        error: `receipt-owned compat.${key} is no longer safely locatable`,
+      };
     if (change.before.present) {
       edits.push({
         start: property.valueStart,
@@ -9690,7 +12577,11 @@ function composeModelsJsonReceiptRollback(
 
   const modifiedText = edits
     .sort((left, right) => right.start - left.start)
-    .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), currentText);
+    .reduce(
+      (text, edit) =>
+        text.slice(0, edit.start) + edit.text + text.slice(edit.end),
+      currentText,
+    );
   return { modifiedText, changed: modifiedText !== currentText };
 }
 
@@ -9711,11 +12602,18 @@ function validateModelsJsonRollback(
   // newly created target entry (which intentionally did not exist before).
   if (expectedHash !== undefined) return null;
 
-  const target = locateReceiptCompatTarget(writtenText, receipt.provider, receipt.modelId, receipt.placement);
-  if (!target?.targetExists) return "rollback result lost the original target entry";
+  const target = locateReceiptCompatTarget(
+    writtenText,
+    receipt.provider,
+    receipt.modelId,
+    receipt.placement,
+  );
+  if (!target?.targetExists)
+    return "rollback result lost the original target entry";
   for (const [key, change] of Object.entries(receipt.changedKeys)) {
     const state = readReceiptCompatScalarState(writtenText, target, key);
-    if (!state || !sameReceiptScalarState(state, change.before)) return `rollback result did not restore compat.${key}`;
+    if (!state || !sameReceiptScalarState(state, change.before))
+      return `rollback result did not restore compat.${key}`;
   }
   return null;
 }
@@ -9732,7 +12630,9 @@ type ModelsJsonRollbackPlan = {
   rollbackBackupPath: string;
 };
 
-async function readRegularTextFile(path: string): Promise<{ text: string; mode: number }> {
+async function readRegularTextFile(
+  path: string,
+): Promise<{ text: string; mode: number }> {
   const info = await lstat(path);
   if (info.isSymbolicLink() || !info.isFile()) {
     throw new Error("file is not a regular file");
@@ -9765,7 +12665,10 @@ async function prepareModelsJsonRollback(
   try {
     current = await readRegularTextFile(modelsPath);
   } catch {
-    return { error: "models.json is missing or is not a regular file; no changes were made." };
+    return {
+      error:
+        "models.json is missing or is not a regular file; no changes were made.",
+    };
   }
   const currentHash = hashText(current.text);
   const originalBackupPath = join(dirname(modelsPath), receipt.backupFile);
@@ -9776,15 +12679,24 @@ async function prepareModelsJsonRollback(
     try {
       backup = await readRegularTextFile(originalBackupPath);
     } catch {
-      return { error: "The receipt backup is missing or is not a regular file; refusing to overwrite models.json." };
+      return {
+        error:
+          "The receipt backup is missing or is not a regular file; refusing to overwrite models.json.",
+      };
     }
     if (hashText(backup.text) !== receipt.beforeHash) {
-      return { error: "The receipt backup hash does not match the recorded pre-fix file; refusing to overwrite models.json." };
+      return {
+        error:
+          "The receipt backup hash does not match the recorded pre-fix file; refusing to overwrite models.json.",
+      };
     }
     try {
       parseJsonc(backup.text);
     } catch {
-      return { error: "The receipt backup is not valid JSONC; refusing to overwrite models.json." };
+      return {
+        error:
+          "The receipt backup is not valid JSONC; refusing to overwrite models.json.",
+      };
     }
     return {
       receiptSnapshot,
@@ -9801,7 +12713,8 @@ async function prepareModelsJsonRollback(
 
   if (!receipt.targetExistedBefore) {
     return {
-      error: "models.json changed after the fix, and the fix created the target entry. Refusing to remove or overwrite unrelated user changes; use the recorded backup for manual guidance.",
+      error:
+        "models.json changed after the fix, and the fix created the target entry. Refusing to remove or overwrite unrelated user changes; use the recorded backup for manual guidance.",
     };
   }
 
@@ -9811,7 +12724,10 @@ async function prepareModelsJsonRollback(
   try {
     parseJsonc(current.text);
   } catch {
-    return { error: "models.json changed after the fix and is not valid JSONC; refusing to overwrite user changes. Use the recorded backup for manual guidance." };
+    return {
+      error:
+        "models.json changed after the fix and is not valid JSONC; refusing to overwrite user changes. Use the recorded backup for manual guidance.",
+    };
   }
 
   const surgical = composeModelsJsonReceiptRollback(current.text, receipt);
@@ -10108,6 +13024,32 @@ export const __internals_for_tests = {
   rollbackPromptCacheKeyConfig,
   configReceiptBackupPath,
   FOOTER_MODE_ENV,
+  // Configurable optimizations (fork divergence D1)
+  RETENTION_ENV,
+  NO_OPENAI_CACHE_KEY_ENV,
+  NO_SKILL_COMPRESSION_ENV,
+  NO_COMPAT_WARNINGS_ENV,
+  NO_FOOTER_STATS_ENV,
+  NO_ANTHROPIC_TTL_DOWNGRADE_ENV,
+  NO_SESSION_AFFINITY_ENV,
+  CACHE_OPTIMIZER_CONFIG_TOGGLE_KEYS,
+  CACHE_OPTIMIZER_RETENTION_MODES,
+  parseCacheRetentionMode,
+  resolveCacheRetentionMode,
+  resolveEffectiveCacheRetentionMode,
+  applyCacheRetentionMode,
+  resolveConfigToggle,
+  asV3CacheOptimizerConfig,
+  cacheOptimizerConfigHasV3Keys,
+  persistedConfigWriteShape,
+  isPromptRewriteEnabled,
+  isSkillCompressionEnabled,
+  isPromptCacheKeyFallbackEnabled,
+  isCompatWarningsEnabled,
+  isFooterStatsEnabled,
+  isAnthropicTtlDowngradeEnabled,
+  isSessionAffinityToggleEnabled,
+  writePersistedRetention,
   // Routing-provider protocol helpers
   PI_ROUTING_REGISTRY_SYMBOL,
   PI_CACHE_HINTS_SYMBOL,
@@ -10212,20 +13154,24 @@ export default function (pi: ExtensionAPI) {
   const warnedPromptCacheRetention400Models = new Set<string>();
   const anthropicTtlFallbackState = getAnthropicTtlFallbackState();
   const anthropicTtlOrderErrorModels = anthropicTtlFallbackState.modelKeys;
-  const warnedAnthropicTtlOrderErrorModels = anthropicTtlFallbackState.warnedModelKeys;
+  const warnedAnthropicTtlOrderErrorModels =
+    anthropicTtlFallbackState.warnedModelKeys;
   const sendSessionAffinityHeaders403Models = new Set<string>();
   const warnedSendSessionAffinityHeaders403Models = new Set<string>();
   const openAISdkHeader403Models = new Set<string>();
   const warnedOpenAISdkHeader403Models = new Set<string>();
   const reasoningProtocolFallbackState = getReasoningProtocolFallbackState();
-  const reasoningProtocolRejectedModels = reasoningProtocolFallbackState.modelKeys;
-  const warnedReasoningProtocolRejectedModels = reasoningProtocolFallbackState.warnedModelKeys;
+  const reasoningProtocolRejectedModels =
+    reasoningProtocolFallbackState.modelKeys;
+  const warnedReasoningProtocolRejectedModels =
+    reasoningProtocolFallbackState.warnedModelKeys;
   const promptCacheKeyRejectedModels = new Set<string>();
   const warnedPromptCacheKeyRejectedModels = new Set<string>();
   let cacheStatsByModel: Record<string, CacheStats> = {};
   let cacheStatsProcessByModel: Record<string, CacheStats> = {};
   let cacheStatsTotalsByModel: Record<string, CacheStats> = {};
-  let cacheStatsLegacyFamily: Partial<Record<CacheProviderId, CacheStats>> = emptyAllCacheStats();
+  let cacheStatsLegacyFamily: Partial<Record<CacheProviderId, CacheStats>> =
+    emptyAllCacheStats();
   let lastStatusText: string | undefined;
   let persistenceWarningShown = false;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -10260,14 +13206,17 @@ export default function (pi: ExtensionAPI) {
   const PERSIST_DEBOUNCE_MS = 2000;
   const SHARD_REFRESH_DEBOUNCE_MS = 250;
 
-  function buildObservedRuntimeFixSuggestion(model: PiModel): FixSuggestion | undefined {
+  function buildObservedRuntimeFixSuggestion(
+    model: PiModel,
+  ): FixSuggestion | undefined {
     const key = modelKey(model);
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
 
     if (
       anthropicTtlOrderErrorModels.has(key) ||
-      (isPromptCacheRetention400Applicable(model) && promptCacheRetention400Models.has(key))
+      (isPromptCacheRetention400Applicable(model) &&
+        promptCacheRetention400Models.has(key))
     ) {
       return {
         providerLabel,
@@ -10276,13 +13225,22 @@ export default function (pi: ExtensionAPI) {
         forceModelLevel: true,
       };
     }
-    if (isSessionAffinity403Applicable(model) && sendSessionAffinityHeaders403Models.has(key)) {
-      return { providerLabel, modelId: model.id, compatKeys: { sendSessionAffinityHeaders: false } };
+    if (
+      isSessionAffinity403Applicable(model) &&
+      sendSessionAffinityHeaders403Models.has(key)
+    ) {
+      return {
+        providerLabel,
+        modelId: model.id,
+        compatKeys: { sendSessionAffinityHeaders: false },
+      };
     }
     return undefined;
   }
 
-  function buildCommandFixSuggestion(model: PiModel): FixSuggestion | undefined {
+  function buildCommandFixSuggestion(
+    model: PiModel,
+  ): FixSuggestion | undefined {
     const regular = buildFixSuggestion(model);
     const observedReasoning = buildReasoningProtocolFixSuggestion(
       model,
@@ -10303,7 +13261,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function promptCacheKeyFixApplies(model: PiModel): boolean {
-    return isPromptCacheKeyUnsupportedApplicable(model) && promptCacheKeyRejectedModels.has(modelKey(model));
+    return (
+      isPromptCacheKeyUnsupportedApplicable(model) &&
+      promptCacheKeyRejectedModels.has(modelKey(model))
+    );
   }
 
   function buildPromptCacheKeyConfigPreview(model: PiModel): string[] {
@@ -10319,7 +13280,9 @@ export default function (pi: ExtensionAPI) {
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
 
-  function syncSessionHash(ctx: Pick<ExtensionContext, "sessionManager">): void {
+  function syncSessionHash(
+    ctx: Pick<ExtensionContext, "sessionManager">,
+  ): void {
     const sid = ctx.sessionManager.getSessionId();
     if (sid && (sid !== currentSessionId || !currentSessionHashSet)) {
       currentSessionId = sid;
@@ -10329,26 +13292,54 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  const uninstallCacheHintsService = installCacheHintsService(markOptimizerOwnedCacheHintsService({
-    version: 1,
-    getHints(input: PiCacheHintsInput): PiCacheHintsOutput | undefined {
-      if (!runtimeOptimizerEnabled || isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV])) return undefined;
-      const hint = latestCacheHint;
-      if (!hint) return undefined;
-      if (input.sessionIdHash && hint.sessionIdHash && input.sessionIdHash !== hint.sessionIdHash) return undefined;
-      if (input.virtualProvider && hint.virtualProvider && input.virtualProvider !== hint.virtualProvider) return undefined;
-      if (input.virtualModelId && hint.virtualModelId && input.virtualModelId !== hint.virtualModelId) return undefined;
-      if (input.upstreamProvider && hint.upstreamProvider && input.upstreamProvider !== hint.upstreamProvider) return undefined;
-      if (input.upstreamModelId && hint.upstreamModelId && input.upstreamModelId !== hint.upstreamModelId) return undefined;
-      if (input.api && hint.api && input.api !== hint.api) return undefined;
+  const uninstallCacheHintsService = installCacheHintsService(
+    markOptimizerOwnedCacheHintsService({
+      version: 1,
+      getHints(input: PiCacheHintsInput): PiCacheHintsOutput | undefined {
+        if (!isPromptRewriteEnabled()) return undefined;
+        const hint = latestCacheHint;
+        if (!hint) return undefined;
+        if (
+          input.sessionIdHash &&
+          hint.sessionIdHash &&
+          input.sessionIdHash !== hint.sessionIdHash
+        )
+          return undefined;
+        if (
+          input.virtualProvider &&
+          hint.virtualProvider &&
+          input.virtualProvider !== hint.virtualProvider
+        )
+          return undefined;
+        if (
+          input.virtualModelId &&
+          hint.virtualModelId &&
+          input.virtualModelId !== hint.virtualModelId
+        )
+          return undefined;
+        if (
+          input.upstreamProvider &&
+          hint.upstreamProvider &&
+          input.upstreamProvider !== hint.upstreamProvider
+        )
+          return undefined;
+        if (
+          input.upstreamModelId &&
+          hint.upstreamModelId &&
+          input.upstreamModelId !== hint.upstreamModelId
+        )
+          return undefined;
+        if (input.api && hint.api && input.api !== hint.api) return undefined;
 
-      return {
-        systemPrompt: hint.systemPrompt,
-        promptCacheKey: hint.promptCacheKey,
-        cacheRetention: hint.cacheRetention,
-      };
-    },
-  }), { discardPrevious: isOptimizerOwnedCacheHintsService });
+        return {
+          systemPrompt: hint.systemPrompt,
+          promptCacheKey: hint.promptCacheKey,
+          cacheRetention: hint.cacheRetention,
+        };
+      },
+    }),
+    { discardPrevious: isOptimizerOwnedCacheHintsService },
+  );
 
   /**
    * Build a session-scoped stats key from the current session hash + model key.
@@ -10368,7 +13359,11 @@ export default function (pi: ExtensionAPI) {
     return idx >= 0 ? sKey.slice(idx + 1) : sKey;
   }
 
-  function recordRecentSample(modelKeyStr: string, usage: UsageSnapshot, missingUsageFields: boolean): void {
+  function recordRecentSample(
+    modelKeyStr: string,
+    usage: UsageSnapshot,
+    missingUsageFields: boolean,
+  ): void {
     let samples = recentSamplesByModelKey.get(modelKeyStr);
     if (!samples) {
       samples = [];
@@ -10397,7 +13392,9 @@ export default function (pi: ExtensionAPI) {
 
   async function refreshShardAggregate(): Promise<ShardAggregate> {
     const persistedShards = await readValidStatsShardsV7();
-    const shards = persistedShards.filter((shard) => shard.instanceId !== instanceId);
+    const shards = persistedShards.filter(
+      (shard) => shard.instanceId !== instanceId,
+    );
     if (currentSessionHashSet) shards.push(buildCurrentStatsShard());
     const aggregate = await aggregateStatsShardsV7(shards);
 
@@ -10407,22 +13404,26 @@ export default function (pi: ExtensionAPI) {
     // process bucket visible in `process` mode or rewrite stale counters during
     // shutdown. Model-scoped resets clear only the affected local bucket.
     const latestGlobalEpoch = await readGlobalStatsEpoch();
-    if (currentGlobalEpoch !== latestGlobalEpoch) {
+    if (currentGlobalEpoch === latestGlobalEpoch) {
+      for (const key of Object.keys(cacheStatsProcessByModel)) {
+        const latestModelEpoch = await readModelStatsEpoch(key);
+        if (
+          (modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`)) ===
+          latestModelEpoch
+        )
+          continue;
+        delete cacheStatsProcessByModel[key];
+        modelEpochByKey.set(key, latestModelEpoch);
+        modelApiByKey.delete(key);
+        modelNameByKey.delete(key);
+      }
+    } else {
       currentGlobalEpoch = latestGlobalEpoch;
       cacheStatsProcessByModel = {};
       modelEpochByKey.clear();
       modelApiByKey.clear();
       modelNameByKey.clear();
       lastActualRoutedModel = undefined;
-    } else {
-      for (const key of Object.keys(cacheStatsProcessByModel)) {
-        const latestModelEpoch = await readModelStatsEpoch(key);
-        if ((modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`)) === latestModelEpoch) continue;
-        delete cacheStatsProcessByModel[key];
-        modelEpochByKey.set(key, latestModelEpoch);
-        modelApiByKey.delete(key);
-        modelNameByKey.delete(key);
-      }
     }
 
     cacheStatsByModel = {};
@@ -10433,7 +13434,8 @@ export default function (pi: ExtensionAPI) {
     }
     cacheStatsTotalsByModel = aggregate.totalsByModel;
     if (currentSessionHashSet) {
-      lastActualRoutedModel = aggregate.lastRoutedModelBySession[currentSessionHash];
+      lastActualRoutedModel =
+        aggregate.lastRoutedModelBySession[currentSessionHash];
     }
     lastStatusText = undefined;
     return aggregate;
@@ -10446,7 +13448,9 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function buildCurrentStatsShard(state: "active" | "closed" = "active"): PersistedStatsShardV7 {
+  function buildCurrentStatsShard(
+    state: "active" | "closed" = "active",
+  ): PersistedStatsShardV7 {
     const now = Date.now();
     const models: PersistedStatsShardV7["models"] = {};
     for (const [key, stats] of Object.entries(cacheStatsProcessByModel)) {
@@ -10456,7 +13460,9 @@ export default function (pi: ExtensionAPI) {
         modelEpoch: modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`),
         provider: key.slice(0, slash),
         modelId: key.slice(slash + 1),
-        ...(modelNameByKey.get(key) ? { modelName: modelNameByKey.get(key) } : {}),
+        ...(modelNameByKey.get(key)
+          ? { modelName: modelNameByKey.get(key) }
+          : {}),
         ...(modelApiByKey.get(key) ? { api: modelApiByKey.get(key) } : {}),
         stats: cloneCacheStats(stats),
       };
@@ -10476,7 +13482,9 @@ export default function (pi: ExtensionAPI) {
       day: currentLocalDay(),
       globalEpoch: currentGlobalEpoch,
       models,
-      ...(lastActualRoutedModel ? { lastRoutedModel: { ...lastActualRoutedModel } } : {}),
+      ...(lastActualRoutedModel
+        ? { lastRoutedModel: { ...lastActualRoutedModel } }
+        : {}),
     };
   }
 
@@ -10492,7 +13500,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Look up visible cumulative stats for a model, falling back to legacy family. */
-  function getStatsForModel(model: PiModel | undefined, adapter: CacheProviderAdapter): CacheStats {
+  function getStatsForModel(
+    model: PiModel | undefined,
+    adapter: CacheProviderAdapter,
+  ): CacheStats {
     if (model) {
       const key = modelKey(model);
       const existing = cacheStatsTotalsByModel[key];
@@ -10547,10 +13558,12 @@ export default function (pi: ExtensionAPI) {
     delete cacheStatsProcessByModel[displayKey];
     delete cacheStatsTotalsByModel[displayKey];
     for (const key of Object.keys(cacheStatsByModel)) {
-      if (modelKeyFromSessionScoped(key) === displayKey) delete cacheStatsByModel[key];
+      if (modelKeyFromSessionScoped(key) === displayKey)
+        delete cacheStatsByModel[key];
     }
     for (const key of Array.from(recentSamplesByModelKey.keys())) {
-      if (modelKeyFromSessionScoped(key) === displayKey) recentSamplesByModelKey.delete(key);
+      if (modelKeyFromSessionScoped(key) === displayKey)
+        recentSamplesByModelKey.delete(key);
     }
     lastStatusText = undefined;
   }
@@ -10568,13 +13581,19 @@ export default function (pi: ExtensionAPI) {
     lastStatusText = undefined;
   }
 
-  function persistCacheStats(ctx?: ExtensionContext, lifecycleState: "active" | "closed" = "active"): Promise<void> {
+  function persistCacheStats(
+    ctx?: ExtensionContext,
+    lifecycleState: "active" | "closed" = "active",
+  ): Promise<void> {
     const shard = buildCurrentStatsShard(lifecycleState);
     return enqueuePersist(async () => {
       try {
         await writeStatsShardV7(instanceShardPath, shard);
       } catch (error) {
-        console.warn(`${LOG_PREFIX}: failed to persist cache stats shard`, error);
+        console.warn(
+          `${LOG_PREFIX}: failed to persist cache stats shard`,
+          error,
+        );
         if (!persistenceWarningShown) {
           persistenceWarningShown = true;
           ctx?.ui.notify(
@@ -10590,12 +13609,17 @@ export default function (pi: ExtensionAPI) {
     if (persistTimer !== null) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       persistTimer = null;
-      void persistCacheStats(ctx).then(() => refreshShardAggregate()).catch(() => undefined);
+      void persistCacheStats(ctx)
+        .then(() => refreshShardAggregate())
+        .catch(() => undefined);
     }, PERSIST_DEBOUNCE_MS);
     persistTimer.unref?.();
   }
 
-  async function flushPersistCacheStats(ctx?: ExtensionContext, lifecycleState: "active" | "closed" = "active"): Promise<void> {
+  async function flushPersistCacheStats(
+    ctx?: ExtensionContext,
+    lifecycleState: "active" | "closed" = "active",
+  ): Promise<void> {
     if (persistTimer !== null) {
       clearTimeout(persistTimer);
       persistTimer = null;
@@ -10632,7 +13656,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function restoreCacheStats(reason: string, ctx: ExtensionContext): Promise<void> {
+  async function restoreCacheStats(
+    reason: string,
+    ctx: ExtensionContext,
+  ): Promise<void> {
     syncSessionHash(ctx);
     lastStatusText = undefined;
     cacheStatsProcessByModel = {};
@@ -10657,14 +13684,19 @@ export default function (pi: ExtensionAPI) {
     await refreshShardAggregate();
   }
 
-  async function publishStatus(ctx: ExtensionContext, model: PiModel | undefined = ctx.model): Promise<void> {
+  async function publishStatus(
+    ctx: ExtensionContext,
+    model: PiModel | undefined = ctx.model,
+  ): Promise<void> {
     syncSessionHash(ctx);
     await rollOverStatsIfNeeded(ctx);
+    if (!isFooterStatsEnabled()) return;
 
     const routedModel = resolveRouteModel(model, ctx);
     const displayModel = routedModel ?? model;
     const adapter = selectAdapterForModel(displayModel);
-    const activeIsVirtualRoute = !!routedModel || isVirtualRoutingModel(model, ctx);
+    const activeIsVirtualRoute =
+      !!routedModel || isVirtualRoutingModel(model, ctx);
     let statusText: string | undefined;
     const mode = footerStatsMode();
     const sessionHash = currentSessionHashSet ? currentSessionHash : undefined;
@@ -10676,20 +13708,22 @@ export default function (pi: ExtensionAPI) {
       // for this session when available; fall back to older best-effort
       // heuristics only when no exact metadata exists.
       if (lastStatusText !== undefined) return;
-      const realEntry = buildExactRouterStatusEntry(
-        sessionHash,
-        cacheStatsByModel,
-        lastActualRoutedModel,
-        cacheStatsTotalsByModel,
-        mode,
-        cacheStatsProcessByModel,
-      ) ?? findBestRouterModelStats(
-        mode,
-        sessionHash,
-        cacheStatsByModel,
-        cacheStatsTotalsByModel,
-        cacheStatsProcessByModel,
-      );
+      const realEntry =
+        buildExactRouterStatusEntry(
+          sessionHash,
+          cacheStatsByModel,
+          lastActualRoutedModel,
+          cacheStatsTotalsByModel,
+          mode,
+          cacheStatsProcessByModel,
+        ) ??
+        findBestRouterModelStats(
+          mode,
+          sessionHash,
+          cacheStatsByModel,
+          cacheStatsTotalsByModel,
+          cacheStatsProcessByModel,
+        );
       if (realEntry) {
         const statsText = formatCacheStats(realEntry.adapter, realEntry.stats);
         statusText = runtimeOptimizerEnabled
@@ -10703,10 +13737,19 @@ export default function (pi: ExtensionAPI) {
       // select all-current-day or current-process counters through persistent
       // command config or the environment variable.
       const stats = displayModel
-        ? selectFooterStatsForModel(mode, sessionHash, cacheStatsByModel, cacheStatsTotalsByModel, displayModel, cacheStatsProcessByModel)
+        ? selectFooterStatsForModel(
+            mode,
+            sessionHash,
+            cacheStatsByModel,
+            cacheStatsTotalsByModel,
+            displayModel,
+            cacheStatsProcessByModel,
+          )
         : undefined;
       const statsText = formatCacheStats(adapter, stats ?? emptyCacheStats());
-      statusText = runtimeOptimizerEnabled ? statsText : `Cache Optimizer disabled · ${statsText}`;
+      statusText = runtimeOptimizerEnabled
+        ? statsText
+        : `Cache Optimizer disabled · ${statsText}`;
     }
 
     // If optimizeSystemPrompt detected structural truncation on this or
@@ -10723,11 +13766,11 @@ export default function (pi: ExtensionAPI) {
         integrityNotificationShown = true;
         ctx.ui.notify(
           `⚠️ ${LOG_PREFIX}: A prompt structural marker was lost during reorder on this turn. ` +
-          `The original prompt was used instead to preserve integrity.\n\n` +
-          `Recovery steps:\n` +
-          `1. Run /reload to reset (may clear transient issues).\n` +
-          `2. Set PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 and /reload to disable reorder.\n` +
-          `3. If persistent, run /cache-optimizer doctor and file an issue (no API keys/prompts).`,
+            `The original prompt was used instead to preserve integrity.\n\n` +
+            `Recovery steps:\n` +
+            `1. Run /reload to reset (may clear transient issues).\n` +
+            `2. Set PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 and /reload to disable reorder.\n` +
+            `3. If persistent, run /cache-optimizer doctor and file an issue (no API keys/prompts).`,
           "warning",
         );
       }
@@ -10781,7 +13824,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (event, ctx) => {
-    if (runtimeOptimizerEnabled) requestLongCacheRetention();
+    if (runtimeOptimizerEnabled)
+      applyCacheRetentionMode(resolveEffectiveCacheRetentionMode().mode);
     await restoreCacheStats(event.reason, ctx);
     if (ctx.mode === "tui" && !shardWatcher) {
       try {
@@ -10821,7 +13865,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("model_select", async (event, ctx) => {
-    if (runtimeOptimizerEnabled) notifyCacheCompatIfNeeded(resolveRouteModel(event.model, ctx) ?? event.model, ctx, warnedModels);
+    if (runtimeOptimizerEnabled)
+      notifyCacheCompatIfNeeded(
+        resolveRouteModel(event.model, ctx) ?? event.model,
+        ctx,
+        warnedModels,
+      );
     await refreshShardAggregate();
     await publishStatus(ctx, event.model);
   });
@@ -10834,7 +13883,11 @@ export default function (pi: ExtensionAPI) {
     delete getProtocolGlobal().__piCacheOptimizerCacheKey__;
     const routeSnapshot = resolveActiveRouteSnapshot(_ctx.model, _ctx);
     const routedModel = routeSnapshot
-      ? findModelInRegistry(_ctx.modelRegistry, routeSnapshot.provider, routeSnapshot.modelId) ?? routeSnapshotToPiModel(routeSnapshot, _ctx.model)
+      ? (findModelInRegistry(
+          _ctx.modelRegistry,
+          routeSnapshot.provider,
+          routeSnapshot.modelId,
+        ) ?? routeSnapshotToPiModel(routeSnapshot, _ctx.model))
       : undefined;
 
     // ────────────────────────────────────────────────────────────────
@@ -10870,11 +13923,12 @@ export default function (pi: ExtensionAPI) {
 
     if (!runtimeOptimizerEnabled) return {};
 
-    // Global opt-out: PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 bypasses all
+    // Global opt-out: config "promptRewrite": false or
+    // PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 bypasses all
     // prompt mutations below (session-overview churn strip, skill compression,
     // and stable-prefix reordering). Footer stats and the OpenAI
     // prompt_cache_key fallback remain active.
-    if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV])) return {};
+    if (!isPromptRewriteEnabled()) return {};
 
     // Step 1: strip per-turn churn from <session-overview>.
     // Removing RECENT COMMITS, Working directory status, and
@@ -10897,13 +13951,21 @@ export default function (pi: ExtensionAPI) {
     // stability. Operates on the (stripped + compressed) prompt so the
     // cache key derived from `stablePrefix` reflects what actually
     // ships to the provider.
-    const optimized = optimizeSystemPrompt(compressedPrompt, event.systemPromptOptions);
+    const optimized = optimizeSystemPrompt(
+      compressedPrompt,
+      event.systemPromptOptions,
+    );
 
     const promptCacheKey = getSessionPromptCacheKey(_ctx);
-    const cacheRetention = process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
+    const cacheRetention =
+      process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE
+        ? LONG_CACHE_RETENTION_VALUE
+        : undefined;
     const publishHint = (systemPrompt: string): void => {
       latestCacheHint = {
-        sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
+        sessionIdHash: currentSessionHashSet
+          ? currentSessionHash
+          : sessionHashFromContext(_ctx),
         virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
         virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
         upstreamProvider: routeSnapshot?.provider ?? model?.provider,
@@ -10931,11 +13993,17 @@ export default function (pi: ExtensionAPI) {
     // compressed (or stripped) prompt directly so we still benefit from
     // the volume cut even when reorder is a no-op (e.g., short sessions
     // where no stable candidate is long enough).
-    if (compressedPrompt !== strippedPrompt && compressedPrompt.trim().length > 0) {
+    if (
+      compressedPrompt !== strippedPrompt &&
+      compressedPrompt.trim().length > 0
+    ) {
       publishHint(compressedPrompt);
       return { systemPrompt: compressedPrompt };
     }
-    if (strippedPrompt !== event.systemPrompt && strippedPrompt.trim().length > 0) {
+    if (
+      strippedPrompt !== event.systemPrompt &&
+      strippedPrompt.trim().length > 0
+    ) {
       publishHint(strippedPrompt);
       return { systemPrompt: strippedPrompt };
     }
@@ -10959,12 +14027,20 @@ export default function (pi: ExtensionAPI) {
     // validity repair, so retain the credential-blind snapshot even while the
     // optional runtime optimizer features are disabled.
     const snapshot = snapshotProviderRequestModel(requestModel);
-    if (snapshot) providerRequestStates.push({ model: snapshot, responseReceived: false, correlationAmbiguous: false });
+    if (snapshot)
+      providerRequestStates.push({
+        model: snapshot,
+        responseReceived: false,
+        correlationAmbiguous: false,
+      });
     let requestPayload: unknown = event.payload;
     let toolOrderChanged = false;
 
     if (isToolOrderEnabled() && isToolOrderingEligibleModel(requestModel)) {
-      const normalized = normalizeToolsInPayload(requestPayload, requestModel.api);
+      const normalized = normalizeToolsInPayload(
+        requestPayload,
+        requestModel.api,
+      );
       requestPayload = normalized.payload;
       toolOrderChanged = normalized.changed;
     }
@@ -10974,9 +14050,17 @@ export default function (pi: ExtensionAPI) {
     // conflict visible in Pi's final payload immediately. Some proxies inject
     // hidden short breakpoints after this hook; only models that have actually
     // returned the explicit TTL-order error receive the process-local 5m fallback.
-    if (requestModel && isAnthropicMessagesApi(requestModel.api)) {
-      const visibleConflictFixed = normalizeAnthropicCacheControlTtlOrder(requestPayload);
-      if (!visibleConflictFixed && anthropicTtlOrderErrorModels.has(modelKey(requestModel))) {
+    if (
+      requestModel &&
+      isAnthropicMessagesApi(requestModel.api) &&
+      isAnthropicTtlDowngradeEnabled()
+    ) {
+      const visibleConflictFixed =
+        normalizeAnthropicCacheControlTtlOrder(requestPayload);
+      if (
+        !visibleConflictFixed &&
+        anthropicTtlOrderErrorModels.has(modelKey(requestModel))
+      ) {
         downgradeAnthropicLongCacheControls(requestPayload);
       }
     }
@@ -10996,11 +14080,16 @@ export default function (pi: ExtensionAPI) {
     // the API returned 400, we must strip — otherwise the 400 repeats forever.
     if (runtimeOptimizerEnabled) {
       const payloadRecord = asRecord(requestPayload);
-      if (payloadRecord && typeof payloadRecord.prompt_cache_retention === "string") {
+      if (
+        payloadRecord &&
+        typeof payloadRecord.prompt_cache_retention === "string"
+      ) {
         if (requestModel) {
           if (isOfficialOpenAIBaseUrl(requestModel)) {
             // Gate 1: Official OpenAI → keep
-          } else if (promptCacheRetention400Models.has(modelKey(requestModel))) {
+          } else if (
+            promptCacheRetention400Models.has(modelKey(requestModel))
+          ) {
             // Gate 2: 400 history → strip (overrides user opt-in)
             delete payloadRecord.prompt_cache_retention;
           } else if (hasExplicitLongRetentionOptIn(requestModel)) {
@@ -11018,21 +14107,31 @@ export default function (pi: ExtensionAPI) {
       return omitted ?? (toolOrderChanged ? requestPayload : undefined);
     }
 
-    if (!shouldInjectOpenAIPromptCacheKey() || !shouldInjectOpenAIPromptCacheKeyForModel(requestModel)) {
+    if (
+      !shouldInjectOpenAIPromptCacheKey() ||
+      !shouldInjectOpenAIPromptCacheKeyForModel(requestModel)
+    ) {
       return toolOrderChanged ? requestPayload : undefined;
     }
 
-    const withCacheKey = addOpenAIPromptCacheKey(requestPayload, getSessionPromptCacheKey(ctx));
+    const withCacheKey = addOpenAIPromptCacheKey(
+      requestPayload,
+      getSessionPromptCacheKey(ctx),
+    );
     return withCacheKey ?? (toolOrderChanged ? requestPayload : undefined);
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
-    const pendingStates = providerRequestStates.filter((state) => !state.responseReceived);
+    const pendingStates = providerRequestStates.filter(
+      (state) => !state.responseReceived,
+    );
     let responseState: ProviderRequestState | undefined;
     if (pendingStates.length === 1) {
       responseState = pendingStates[0];
     } else if (pendingStates.length > 1) {
-      const pendingModelKeys = new Set(pendingStates.map((state) => modelKey(state.model)));
+      const pendingModelKeys = new Set(
+        pendingStates.map((state) => modelKey(state.model)),
+      );
       if (pendingModelKeys.size === 1) {
         // Identity is still exact when concurrent requests use the same model.
         responseState = pendingStates[0];
@@ -11045,7 +14144,11 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (responseState) responseState.responseReceived = true;
-    const model = responseState?.model ?? (pendingStates.length === 0 ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model) : undefined);
+    const model =
+      responseState?.model ??
+      (pendingStates.length === 0
+        ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model)
+        : undefined);
     if (!runtimeOptimizerEnabled || !model) return;
 
     // Keep only the category, never the provider's complete error text. This
@@ -11065,15 +14168,20 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── 400: prompt_cache_key unsupported ──
-    if (event.status === 400 && isPromptCacheKeyUnsupportedApplicable(model) && hasPromptCacheKeyUnsupportedSignal(event.headers)) {
+    if (
+      event.status === 400 &&
+      isPromptCacheKeyUnsupportedApplicable(model) &&
+      hasPromptCacheKeyUnsupportedSignal(event.headers)
+    ) {
       const key = modelKey(model);
       promptCacheKeyRejectedModels.add(key);
       if (!warnedPromptCacheKeyRejectedModels.has(key)) {
         warnedPromptCacheKeyRejectedModels.add(key);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
-          "warning",
-        );
+        if (isCompatWarningsEnabled())
+          ctx.ui.notify(
+            `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
+            "warning",
+          );
       }
     }
 
@@ -11087,12 +14195,13 @@ export default function (pi: ExtensionAPI) {
       promptCacheRetention400Models.add(key);
       if (!warnedPromptCacheRetention400Models.has(key)) {
         warnedPromptCacheRetention400Models.add(key);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongCacheRetention is enabled. ` +
-          getPromptCacheRetentionUnsupportedHint() +
-          ` Run /cache-optimizer doctor for the exact edit location.`,
-          "warning",
-        );
+        if (isCompatWarningsEnabled())
+          ctx.ui.notify(
+            `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongCacheRetention is enabled. ` +
+              getPromptCacheRetentionUnsupportedHint() +
+              ` Run /cache-optimizer doctor for the exact edit location.`,
+            "warning",
+          );
       }
     }
 
@@ -11106,12 +14215,13 @@ export default function (pi: ExtensionAPI) {
         sendSessionAffinityHeaders403Models.add(key403);
         if (warnedSendSessionAffinityHeaders403Models.has(key403)) return;
         warnedSendSessionAffinityHeaders403Models.add(key403);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key403} returned HTTP 403 while sendSessionAffinityHeaders is enabled. ` +
-          `The proxy/CDN may be blocking Pi's custom session-affinity headers (session_id, x-client-request-id, x-session-affinity). ` +
-          `Run /cache-optimizer doctor for details and /cache-optimizer fix to set sendSessionAffinityHeaders: false.`,
-          "warning",
-        );
+        if (isCompatWarningsEnabled())
+          ctx.ui.notify(
+            `⚠️ ${LOG_PREFIX}: ${key403} returned HTTP 403 while sendSessionAffinityHeaders is enabled. ` +
+              `The proxy/CDN may be blocking Pi's custom session-affinity headers (session_id, x-client-request-id, x-session-affinity). ` +
+              `Run /cache-optimizer doctor for details and /cache-optimizer fix to set sendSessionAffinityHeaders: false.`,
+            "warning",
+          );
         return;
       }
 
@@ -11124,12 +14234,13 @@ export default function (pi: ExtensionAPI) {
         openAISdkHeader403Models.add(key403);
         if (warnedOpenAISdkHeader403Models.has(key403)) return;
         warnedOpenAISdkHeader403Models.add(key403);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key403} returned HTTP 403 even though sendSessionAffinityHeaders is not enabled. ` +
-          `The proxy/CDN may be blocking the OpenAI JS SDK User-Agent / X-Stainless-* headers. ` +
-          `Run /cache-optimizer doctor for manual diagnostic guidance; /cache-optimizer fix will not auto-write User-Agent headers.`,
-          "warning",
-        );
+        if (isCompatWarningsEnabled())
+          ctx.ui.notify(
+            `⚠️ ${LOG_PREFIX}: ${key403} returned HTTP 403 even though sendSessionAffinityHeaders is not enabled. ` +
+              `The proxy/CDN may be blocking the OpenAI JS SDK User-Agent / X-Stainless-* headers. ` +
+              `Run /cache-optimizer doctor for manual diagnostic guidance; /cache-optimizer fix will not auto-write User-Agent headers.`,
+            "warning",
+          );
         return;
       }
     }
@@ -11138,28 +14249,48 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event, ctx) => {
     syncSessionHash(ctx);
     const msgRecord = asRecord(event.message);
-    const requestCorrelationForMessage = msgRecord?.role === "assistant"
-      ? (() => {
-        const explicitModel = modelFromAssistantMessage(event.message, undefined);
-        const explicitIndex = explicitModel
-          ? providerRequestStates.findIndex((state) => modelKey(state.model) === modelKey(explicitModel))
-          : -1;
-        const completedIndex = providerRequestStates.findIndex((state) => state.responseReceived);
-        const contextModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-        const contextIndex = contextModel && !providerRequestStates.some((state) => state.correlationAmbiguous)
-          ? providerRequestStates.findIndex((state) => modelKey(state.model) === modelKey(contextModel))
-          : -1;
-        const index = explicitIndex >= 0
-          ? explicitIndex
-          : (completedIndex >= 0 ? completedIndex : (contextIndex >= 0 ? contextIndex : 0));
-        const state = providerRequestStates.splice(index, 1)[0];
-        if (!state) return { model: undefined, ambiguous: false };
-        return {
-          model: state.correlationAmbiguous && explicitIndex < 0 ? undefined : state.model,
-          ambiguous: state.correlationAmbiguous && explicitIndex < 0,
-        };
-      })()
-      : { model: undefined, ambiguous: false };
+    const requestCorrelationForMessage =
+      msgRecord?.role === "assistant"
+        ? (() => {
+            const explicitModel = modelFromAssistantMessage(
+              event.message,
+              undefined,
+            );
+            const explicitIndex = explicitModel
+              ? providerRequestStates.findIndex(
+                  (state) => modelKey(state.model) === modelKey(explicitModel),
+                )
+              : -1;
+            const completedIndex = providerRequestStates.findIndex(
+              (state) => state.responseReceived,
+            );
+            const contextModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+            const contextIndex =
+              contextModel &&
+              !providerRequestStates.some((state) => state.correlationAmbiguous)
+                ? providerRequestStates.findIndex(
+                    (state) => modelKey(state.model) === modelKey(contextModel),
+                  )
+                : -1;
+            const index =
+              explicitIndex >= 0
+                ? explicitIndex
+                : completedIndex >= 0
+                  ? completedIndex
+                  : contextIndex >= 0
+                    ? contextIndex
+                    : 0;
+            const state = providerRequestStates.splice(index, 1)[0];
+            if (!state) return { model: undefined, ambiguous: false };
+            return {
+              model:
+                state.correlationAmbiguous && explicitIndex < 0
+                  ? undefined
+                  : state.model,
+              ambiguous: state.correlationAmbiguous && explicitIndex < 0,
+            };
+          })()
+        : { model: undefined, ambiguous: false };
     const requestModelForMessage = requestCorrelationForMessage.model;
     const contextualFallbackForMessage = requestCorrelationForMessage.ambiguous
       ? undefined
@@ -11169,11 +14300,21 @@ export default function (pi: ExtensionAPI) {
     // assistant error message; after_provider_response may contain the status
     // and no diagnostic response headers. Record only the model-scoped
     // reasoning-protocol category from that authoritative message identity.
-    if (runtimeOptimizerEnabled && hasReasoningProtocolRejectionErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+    if (
+      runtimeOptimizerEnabled &&
+      hasReasoningProtocolRejectionErrorMessage(event.message)
+    ) {
+      const fallbackModel =
+        requestModelForMessage ?? contextualFallbackForMessage;
+      const messageModel =
+        modelFromAssistantMessage(event.message, fallbackModel) ??
+        fallbackModel;
       const errorModel = messageModel
-        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
+        ? (findModelInRegistry(
+            ctx.modelRegistry,
+            messageModel.provider,
+            messageModel.id,
+          ) ?? messageModel)
         : undefined;
       if (isReasoningProtocolRejectionForModel(event.message, errorModel)) {
         await notifyReasoningProtocolObservation(
@@ -11184,41 +14325,66 @@ export default function (pi: ExtensionAPI) {
         );
       }
     }
-    if (runtimeOptimizerEnabled && hasPromptCacheKeyUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+    if (
+      runtimeOptimizerEnabled &&
+      hasPromptCacheKeyUnsupportedErrorMessage(event.message)
+    ) {
+      const fallbackModel =
+        requestModelForMessage ?? contextualFallbackForMessage;
+      const messageModel =
+        modelFromAssistantMessage(event.message, fallbackModel) ??
+        fallbackModel;
       const errorModel = messageModel
-        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
+        ? (findModelInRegistry(
+            ctx.modelRegistry,
+            messageModel.provider,
+            messageModel.id,
+          ) ?? messageModel)
         : undefined;
       if (errorModel && isPromptCacheKeyUnsupportedApplicable(errorModel)) {
         const key = modelKey(errorModel);
         promptCacheKeyRejectedModels.add(key);
         if (!warnedPromptCacheKeyRejectedModels.has(key)) {
           warnedPromptCacheKeyRejectedModels.add(key);
-          ctx.ui.notify(
-            `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
-            "warning",
-          );
+          if (isCompatWarningsEnabled())
+            ctx.ui.notify(
+              `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
+              "warning",
+            );
         }
       }
     }
-    if (runtimeOptimizerEnabled && hasPromptCacheRetentionUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+    if (
+      runtimeOptimizerEnabled &&
+      hasPromptCacheRetentionUnsupportedErrorMessage(event.message)
+    ) {
+      const fallbackModel =
+        requestModelForMessage ?? contextualFallbackForMessage;
+      const messageModel =
+        modelFromAssistantMessage(event.message, fallbackModel) ??
+        fallbackModel;
       const errorModel = messageModel
-        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
+        ? (findModelInRegistry(
+            ctx.modelRegistry,
+            messageModel.provider,
+            messageModel.id,
+          ) ?? messageModel)
         : undefined;
-      if (errorModel && isExplicitPromptCacheRetentionUnsupportedApplicable(errorModel)) {
+      if (
+        errorModel &&
+        isExplicitPromptCacheRetentionUnsupportedApplicable(errorModel)
+      ) {
         const key = modelKey(errorModel);
         promptCacheRetention400Models.add(key);
         if (!warnedPromptCacheRetention400Models.has(key)) {
           warnedPromptCacheRetention400Models.add(key);
-          ctx.ui.notify(
-            `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_retention. ` +
-            getPromptCacheRetentionUnsupportedHint() +
-            ` Run /cache-optimizer doctor for the exact edit location.`,
-            "warning",
-          );
+          if (isCompatWarningsEnabled())
+            ctx.ui.notify(
+              `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_retention. ` +
+                getPromptCacheRetentionUnsupportedHint() +
+                ` Run /cache-optimizer doctor for the exact edit location.`,
+              "warning",
+            );
         }
       }
     }
@@ -11227,19 +14393,23 @@ export default function (pi: ExtensionAPI) {
     // non-retryable 400 in Pi 0.82.1, so the fallback applies to the next
     // subsequent request (and to a retry only if another layer initiates one).
     if (hasAnthropicCacheTtlOrderError(event.message)) {
-      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const errorModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+      const fallbackModel =
+        requestModelForMessage ?? contextualFallbackForMessage;
+      const errorModel =
+        modelFromAssistantMessage(event.message, fallbackModel) ??
+        fallbackModel;
       if (errorModel && isAnthropicMessagesApi(errorModel.api)) {
         const key = modelKey(errorModel);
         anthropicTtlOrderErrorModels.add(key);
         if (!warnedAnthropicTtlOrderErrorModels.has(key)) {
           warnedAnthropicTtlOrderErrorModels.add(key);
-          ctx.ui.notify(
-            `⚠️ ${LOG_PREFIX}: ${key} returned an Anthropic cache-control TTL ordering error. ` +
-            `The next request will fall back to the default 5-minute cache TTL. ` +
-            `Run /cache-optimizer fix to set model-level supportsLongCacheRetention: false persistently.`,
-            "warning",
-          );
+          if (isCompatWarningsEnabled())
+            ctx.ui.notify(
+              `⚠️ ${LOG_PREFIX}: ${key} returned an Anthropic cache-control TTL ordering error. ` +
+                `The next request will fall back to the default 5-minute cache TTL. ` +
+                `Run /cache-optimizer fix to set model-level supportsLongCacheRetention: false persistently.`,
+              "warning",
+            );
         }
       }
     }
@@ -11254,7 +14424,10 @@ export default function (pi: ExtensionAPI) {
     // returns as a valid (non-undefined) snapshot, which would inflate
     // totalRequests and skew cache hit-rate accuracy. The final successful
     // response is emitted as a separate message_end with real usage data.
-    if (msgRecord?.stopReason === "error" || msgRecord?.stopReason === "aborted") {
+    if (
+      msgRecord?.stopReason === "error" ||
+      msgRecord?.stopReason === "aborted"
+    ) {
       return;
     }
 
@@ -11263,7 +14436,8 @@ export default function (pi: ExtensionAPI) {
     // Completed message metadata is request-local and authoritative for virtual
     // routing providers. Use it whenever it supplies provider/model identity;
     // fall back to the active context model for direct providers.
-    let statsModel = modelFromAssistantMessage(event.message, ctx.model) ?? ctx.model;
+    let statsModel =
+      modelFromAssistantMessage(event.message, ctx.model) ?? ctx.model;
     // For direct (non-virtual-routing) providers, the upstream API may echo a
     // normalized/renamed model id in its response (e.g. request
     // `zai-org/GLM-5.2-FP8` but the message carries `GLM5.2-FP8`). Writing
@@ -11273,9 +14447,17 @@ export default function (pi: ExtensionAPI) {
     // in name (same provider, same cache adapter), consolidate stats back to
     // the active model id. Virtual routing providers keep message-local
     // identity (router correctness).
-    statsModel = consolidateDirectProviderStatsModel(statsModel, ctx.model, ctx);
+    statsModel = consolidateDirectProviderStatsModel(
+      statsModel,
+      ctx.model,
+      ctx,
+    );
     let routedModelChanged = false;
-    if (isVirtualRoutingModel(ctx.model, ctx) && statsModel && !isVirtualRoutingModel(statsModel, ctx)) {
+    if (
+      isVirtualRoutingModel(ctx.model, ctx) &&
+      statsModel &&
+      !isVirtualRoutingModel(statsModel, ctx)
+    ) {
       const nextRoutedModel: PersistedRoutedModelRef = {
         provider: statsModel.provider,
         id: statsModel.id,
@@ -11285,7 +14467,8 @@ export default function (pi: ExtensionAPI) {
         !lastActualRoutedModel ||
         lastActualRoutedModel.provider !== nextRoutedModel.provider ||
         lastActualRoutedModel.id !== nextRoutedModel.id ||
-        (lastActualRoutedModel.name || lastActualRoutedModel.id) !== (nextRoutedModel.name || nextRoutedModel.id)
+        (lastActualRoutedModel.name || lastActualRoutedModel.id) !==
+          (nextRoutedModel.name || nextRoutedModel.id)
       ) {
         lastActualRoutedModel = nextRoutedModel;
         routedModelChanged = true;
@@ -11295,10 +14478,18 @@ export default function (pi: ExtensionAPI) {
     // Record recent sample (even when usage is missing, for trend diagnosis)
     if (statsModel) {
       const sk = sessionModelKey(statsModel);
-      const missingFields = usage === undefined || (usage.cacheRead === 0 && usage.cacheWrite === 0 && usage.totalInput === 0)
-        ? true
-        : hasMissingUsageFields(event.message, adapter);
-      recordRecentSample(sk, usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 }, missingFields);
+      const missingFields =
+        usage === undefined ||
+        (usage.cacheRead === 0 &&
+          usage.cacheWrite === 0 &&
+          usage.totalInput === 0)
+          ? true
+          : hasMissingUsageFields(event.message, adapter);
+      recordRecentSample(
+        sk,
+        usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 },
+        missingFields,
+      );
     }
 
     if (!usage) {
@@ -11348,6 +14539,7 @@ export default function (pi: ExtensionAPI) {
   //   stats   — show detailed current-session models; `stats all` shows all local shards
   //   compat  — show compat suggestion with file path
   //   config footer-mode total|session|process — persist footer mode override
+  //   config retention long|short|none|startup — persist cache retention steering mode
   //   fix     — auto-fix compat issues (writes models.json or extension config, requires UI)
   //   rollback — undo the latest confirmed fix for the active model
   //   reset   — reset current provider/model footer stats bucket (local only)
@@ -11363,417 +14555,590 @@ export default function (pi: ExtensionAPI) {
     const commandParts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const subcommand = commandParts[0] || "help";
 
-      if (subcommand === "enable") {
-        setRuntimeOptimizerEnabled(true);
-        await resetCurrentSessionStats();
-        await flushPersistCacheStats(cmdCtx);
-        await publishStatus(cmdCtx, model);
-        cmdCtx.ui.notify(`✅ Pi Cache Optimizer enabled for this Pi process. Local footer stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
-      } else if (subcommand === "disable") {
-        setRuntimeOptimizerEnabled(false);
-        providerRequestStates.length = 0;
-        await resetCurrentSessionStats();
-        await flushPersistCacheStats(cmdCtx);
-        await publishStatus(cmdCtx, model);
-        cmdCtx.ui.notify(`⏸️ Pi Cache Optimizer disabled for this Pi process. Local footer stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
-      } else if (subcommand === "doctor") {
-        await refreshShardAggregate();
-        if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
-          return;
-        }
-        const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)), promptCacheKey400: promptCacheKeyRejectedModels.has(modelKey(model)), anthropicTtlOrderError: anthropicTtlOrderErrorModels.has(modelKey(model)), sessionAffinity403: sendSessionAffinityHeaders403Models.has(modelKey(model)), openAISdkHeader403: openAISdkHeader403Models.has(modelKey(model)) });
-        const adapter = selectAdapterForModel(model);
-        const sk = model ? sessionModelKey(model) : undefined;
-        const statsState = model ? cacheStatsTotalsByModel[modelKey(model)] : undefined;
-        const samples = sk ? getRecentSamples(sk) : [];
-        const lowHitLines = buildLowHitDiagnosis(model, adapter, statsState, samples);
-        const fullDiagnosis = lowHitLines.length > 0
+    if (subcommand === "enable") {
+      setRuntimeOptimizerEnabled(true);
+      await resetCurrentSessionStats();
+      await flushPersistCacheStats(cmdCtx);
+      await publishStatus(cmdCtx, model);
+      cmdCtx.ui.notify(
+        `✅ Pi Cache Optimizer enabled for this Pi process. Local footer stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`,
+        "info",
+      );
+    } else if (subcommand === "disable") {
+      setRuntimeOptimizerEnabled(false);
+      providerRequestStates.length = 0;
+      await resetCurrentSessionStats();
+      await flushPersistCacheStats(cmdCtx);
+      await publishStatus(cmdCtx, model);
+      cmdCtx.ui.notify(
+        `⏸️ Pi Cache Optimizer disabled for this Pi process. Local footer stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`,
+        "warning",
+      );
+    } else if (subcommand === "doctor") {
+      await refreshShardAggregate();
+      if (!model) {
+        cmdCtx.ui.notify(
+          "No active model selected. Select a model first with /model or pi --model.",
+          "warning",
+        );
+        return;
+      }
+      const diagnosis = buildDoctorDiagnosis(model, {
+        promptCacheRetention400: promptCacheRetention400Models.has(
+          modelKey(model),
+        ),
+        promptCacheKey400: promptCacheKeyRejectedModels.has(modelKey(model)),
+        anthropicTtlOrderError: anthropicTtlOrderErrorModels.has(
+          modelKey(model),
+        ),
+        sessionAffinity403: sendSessionAffinityHeaders403Models.has(
+          modelKey(model),
+        ),
+        openAISdkHeader403: openAISdkHeader403Models.has(modelKey(model)),
+      });
+      const adapter = selectAdapterForModel(model);
+      const sk = model ? sessionModelKey(model) : undefined;
+      const statsState = model
+        ? cacheStatsTotalsByModel[modelKey(model)]
+        : undefined;
+      const samples = sk ? getRecentSamples(sk) : [];
+      const lowHitLines = buildLowHitDiagnosis(
+        model,
+        adapter,
+        statsState,
+        samples,
+      );
+      const fullDiagnosis =
+        lowHitLines.length > 0
           ? diagnosis + "\n" + lowHitLines.join("\n")
           : diagnosis;
-        cmdCtx.ui.notify(fullDiagnosis, "info");
-      } else if (subcommand === "stats") {
-        const aggregate = await refreshShardAggregate();
-        const statsMode = commandParts[1];
-        if (statsMode === "all") {
-          cmdCtx.ui.notify(buildAllStatsOutput(aggregate), "info");
-        } else if (statsMode === "contributors") {
-          cmdCtx.ui.notify(buildContributorsStatsOutput(aggregate, model, currentSessionHashSet ? currentSessionHash : undefined), "info");
-        } else if (statsMode) {
-          cmdCtx.ui.notify("Usage: /cache-optimizer stats [all|contributors]", "info");
-        } else {
-          const sessionModels = currentSessionHashSet ? aggregate.bySession[currentSessionHash] ?? {} : {};
-          cmdCtx.ui.notify(buildSessionStatsOutput(sessionModels, model, aggregate.modelRefsByKey), "info");
-        }
-      } else if (subcommand === "config") {
-        const configKey = commandParts[1];
-        const requestedMode = commandParts[2];
-        if (configKey !== "footer-mode" || !requestedMode || !["session", "total", "process"].includes(requestedMode)) {
-          const resolved = resolveFooterStatsMode(persistedFooterStatsMode);
+      cmdCtx.ui.notify(fullDiagnosis, "info");
+    } else if (subcommand === "stats") {
+      const aggregate = await refreshShardAggregate();
+      const statsMode = commandParts[1];
+      if (statsMode === "all") {
+        cmdCtx.ui.notify(buildAllStatsOutput(aggregate), "info");
+      } else if (statsMode === "contributors") {
+        cmdCtx.ui.notify(
+          buildContributorsStatsOutput(
+            aggregate,
+            model,
+            currentSessionHashSet ? currentSessionHash : undefined,
+          ),
+          "info",
+        );
+      } else if (statsMode) {
+        cmdCtx.ui.notify(
+          "Usage: /cache-optimizer stats [all|contributors]",
+          "info",
+        );
+      } else {
+        const sessionModels = currentSessionHashSet
+          ? (aggregate.bySession[currentSessionHash] ?? {})
+          : {};
+        cmdCtx.ui.notify(
+          buildSessionStatsOutput(
+            sessionModels,
+            model,
+            aggregate.modelRefsByKey,
+          ),
+          "info",
+        );
+      }
+    } else if (subcommand === "config") {
+      const configKey = commandParts[1];
+      const requestedMode = commandParts[2];
+      if (configKey === "retention") {
+        if (
+          !requestedMode ||
+          !(CACHE_OPTIMIZER_RETENTION_MODES as readonly string[]).includes(
+            requestedMode,
+          )
+        ) {
+          const resolved = resolveEffectiveCacheRetentionMode();
           cmdCtx.ui.notify(
-            `Usage: /cache-optimizer config footer-mode total|session|process\n` +
-            `Current footer mode: ${resolved.mode} (${resolved.source})`,
+            `Usage: /cache-optimizer config retention long|short|none|startup\n` +
+              `Current cache retention: ${resolved.mode} (${resolved.source})\n` +
+              `• ${PI_CACHE_RETENTION_ENV}=${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`,
             "info",
           );
           return;
         }
 
-        const nextMode = requestedMode as FooterStatsMode;
+        const nextRetention = requestedMode as CacheRetentionMode;
         try {
-          await writePersistedFooterMode(nextMode);
+          await writePersistedRetention(nextRetention);
           setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+          applyCacheRetentionMode(resolveEffectiveCacheRetentionMode().mode);
           lastStatusText = undefined;
           await publishStatus(cmdCtx, model);
-          const resolved = resolveFooterStatsMode(persistedFooterStatsMode);
+          const resolved = resolveEffectiveCacheRetentionMode();
           cmdCtx.ui.notify(
-            `✅ Footer mode set to ${resolved.mode}. Persistent config overrides ${FOOTER_MODE_ENV}.`,
+            `✅ Cache retention set to ${resolved.mode}. Persistent config overrides ${RETENTION_ENV}. Applies immediately and on next start.`,
             "info",
           );
         } catch (error) {
           cmdCtx.ui.notify(
-            `❌ Could not update footer mode config: ${error instanceof Error ? error.message : String(error)}`,
+            `❌ Could not update cache retention config: ${error instanceof Error ? error.message : String(error)}`,
             "error",
           );
         }
-      } else if (subcommand === "compat") {
-        if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+        return;
+      }
+      if (
+        configKey !== "footer-mode" ||
+        !requestedMode ||
+        !["session", "total", "process"].includes(requestedMode)
+      ) {
+        const resolved = resolveFooterStatsMode(persistedFooterStatsMode);
+        cmdCtx.ui.notify(
+          `Usage: /cache-optimizer config footer-mode total|session|process\n` +
+            `Current footer mode: ${resolved.mode} (${resolved.source})`,
+          "info",
+        );
+        return;
+      }
+
+      const nextMode = requestedMode as FooterStatsMode;
+      try {
+        await writePersistedFooterMode(nextMode);
+        setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+        lastStatusText = undefined;
+        await publishStatus(cmdCtx, model);
+        const resolved = resolveFooterStatsMode(persistedFooterStatsMode);
+        cmdCtx.ui.notify(
+          `✅ Footer mode set to ${resolved.mode}. Persistent config overrides ${FOOTER_MODE_ENV}.`,
+          "info",
+        );
+      } catch (error) {
+        cmdCtx.ui.notify(
+          `❌ Could not update footer mode config: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
+    } else if (subcommand === "compat") {
+      if (!model) {
+        cmdCtx.ui.notify(
+          "No active model selected. Select a model first with /model or pi --model.",
+          "warning",
+        );
+        return;
+      }
+      const compatResult = buildCompatDiagnosis(model);
+      if (compatResult) {
+        cmdCtx.ui.notify(compatResult, "warning");
+      } else {
+        cmdCtx.ui.notify(
+          isAdaptiveThinkingCompatApplicable(model) ||
+            isDeepSeekCompatCheckApplicable(model) ||
+            isCompatCheckApplicable(model)
+            ? "✅ Compat fully configured."
+            : getCompatCheckNotApplicableLines(model).join("\n"),
+          "info",
+        );
+      }
+    } else if (subcommand === "rollback") {
+      if (!model) {
+        cmdCtx.ui.notify(
+          "No active model selected. Select a model first with /model or pi --model.",
+          "warning",
+        );
+        return;
+      }
+      const configReceiptSnapshot =
+        await readPromptCacheKeyConfigReceiptSnapshot();
+      const configReceipt = configReceiptSnapshot?.receipt;
+      const modelsReceipt = await readModelsJsonFixReceipt();
+      const useConfigReceipt =
+        isActionablePromptCacheKeyConfigReceipt(configReceipt) &&
+        configReceipt.provider === model.provider &&
+        configReceipt.modelId === model.id &&
+        (!isActionableModelsJsonFixReceipt(modelsReceipt) ||
+          modelsReceipt.provider !== model.provider ||
+          modelsReceipt.modelId !== model.id ||
+          configReceipt.appliedAt >= modelsReceipt.appliedAt);
+      if (useConfigReceipt) {
+        if (!cmdCtx.hasUI) {
+          cmdCtx.ui.notify(
+            "❌ Rollback requires interactive confirmation. No changes were made.\nRun /cache-optimizer rollback in Pi's interactive UI to restore the prompt-cache-key setting.",
+            "warning",
+          );
           return;
         }
-        const compatResult = buildCompatDiagnosis(model);
-        if (compatResult) {
-          cmdCtx.ui.notify(compatResult, "warning");
-        } else {
+        const confirmed = await cmdCtx.ui.confirm(
+          "Cache Optimizer — Rollback prompt_cache_key opt-out",
+          `Model: ${modelKey(model)}\nAction: restore the extension config before the confirmed opt-out.\nFooter mode and unrelated configuration will be preserved.\nAfterward, run /reload or restart Pi.\n\nProceed with rollback?`,
+        );
+        if (!confirmed) {
           cmdCtx.ui.notify(
-            isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)
-              ? "✅ Compat fully configured."
-              : getCompatCheckNotApplicableLines(model).join("\n"),
+            "No changes were made. Rollback canceled by user.",
             "info",
           );
-        }
-      } else if (subcommand === "rollback") {
-        if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
           return;
         }
-        const configReceiptSnapshot = await readPromptCacheKeyConfigReceiptSnapshot();
-        const configReceipt = configReceiptSnapshot?.receipt;
-        const modelsReceipt = await readModelsJsonFixReceipt();
-        const useConfigReceipt = isActionablePromptCacheKeyConfigReceipt(configReceipt) &&
-          configReceipt.provider === model.provider &&
-          configReceipt.modelId === model.id &&
-          (!isActionableModelsJsonFixReceipt(modelsReceipt) || modelsReceipt.provider !== model.provider || modelsReceipt.modelId !== model.id || configReceipt.appliedAt >= modelsReceipt.appliedAt);
-        if (useConfigReceipt) {
-          if (!cmdCtx.hasUI) {
-            cmdCtx.ui.notify("❌ Rollback requires interactive confirmation. No changes were made.\nRun /cache-optimizer rollback in Pi's interactive UI to restore the prompt-cache-key setting.", "warning");
-            return;
-          }
-          const confirmed = await cmdCtx.ui.confirm(
-            "Cache Optimizer — Rollback prompt_cache_key opt-out",
-            `Model: ${modelKey(model)}\nAction: restore the extension config before the confirmed opt-out.\nFooter mode and unrelated configuration will be preserved.\nAfterward, run /reload or restart Pi.\n\nProceed with rollback?`,
+        try {
+          if (!configReceiptSnapshot)
+            throw new Error(
+              "prompt-cache-key receipt changed since the rollback preview",
+            );
+          await rollbackPromptCacheKeyConfig(configReceiptSnapshot);
+          setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+          cmdCtx.ui.notify(
+            `✅ Restored prompt_cache_key behavior for ${modelKey(model)}. Run /reload or restart Pi for the change to take effect.`,
+            "info",
           );
-          if (!confirmed) {
-            cmdCtx.ui.notify("No changes were made. Rollback canceled by user.", "info");
-            return;
-          }
-          try {
-            if (!configReceiptSnapshot) throw new Error("prompt-cache-key receipt changed since the rollback preview");
-            await rollbackPromptCacheKeyConfig(configReceiptSnapshot);
-            setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
-            cmdCtx.ui.notify(`✅ Restored prompt_cache_key behavior for ${modelKey(model)}. Run /reload or restart Pi for the change to take effect.`, "info");
-          } catch (error) {
-            cmdCtx.ui.notify(`❌ Prompt cache key rollback refused: ${error instanceof Error ? error.message : String(error)}. No changes were made.`, "error");
-          }
-          return;
+        } catch (error) {
+          cmdCtx.ui.notify(
+            `❌ Prompt cache key rollback refused: ${error instanceof Error ? error.message : String(error)}. No changes were made.`,
+            "error",
+          );
         }
-        if (!cmdCtx.hasUI) {
-          const receipt = await readModelsJsonFixReceipt();
-          const backupHint = receipt && isActionableModelsJsonFixReceipt(receipt)
+        return;
+      }
+      if (!cmdCtx.hasUI) {
+        const receipt = await readModelsJsonFixReceipt();
+        const backupHint =
+          receipt && isActionableModelsJsonFixReceipt(receipt)
             ? ` The recorded backup is ${receipt.backupFile} next to ${getModelsJsonDisplayPath()}.`
             : " Check the recorded models.json backup manually if a fix receipt exists.";
-          cmdCtx.ui.notify(
-            "❌ Rollback requires interactive confirmation. No changes were made.\n" +
+        cmdCtx.ui.notify(
+          "❌ Rollback requires interactive confirmation. No changes were made.\n" +
             `Run /cache-optimizer rollback in Pi's interactive UI.${backupHint} Then run /reload.`,
-            "warning",
-          );
-          return;
-        }
+          "warning",
+        );
+        return;
+      }
 
-        const receiptSnapshot = await readModelsJsonFixReceiptSnapshot();
-        const receipt = receiptSnapshot?.receipt;
-        if (!receiptSnapshot || !isActionableModelsJsonFixReceipt(receipt)) {
-          cmdCtx.ui.notify("ℹ️ No unapplied /cache-optimizer fix receipt was found.", "info");
-          return;
-        }
-        if (receipt.provider !== model.provider || receipt.modelId !== model.id) {
-          cmdCtx.ui.notify(
-            `ℹ️ The latest fix receipt is for ${receipt.provider}/${receipt.modelId}, not the active model ${model.provider}/${model.id}. ` +
+      const receiptSnapshot = await readModelsJsonFixReceiptSnapshot();
+      const receipt = receiptSnapshot?.receipt;
+      if (!receiptSnapshot || !isActionableModelsJsonFixReceipt(receipt)) {
+        cmdCtx.ui.notify(
+          "ℹ️ No unapplied /cache-optimizer fix receipt was found.",
+          "info",
+        );
+        return;
+      }
+      if (receipt.provider !== model.provider || receipt.modelId !== model.id) {
+        cmdCtx.ui.notify(
+          `ℹ️ The latest fix receipt is for ${receipt.provider}/${receipt.modelId}, not the active model ${model.provider}/${model.id}. ` +
             "Switch to the matching model before running rollback. No changes were made.",
-            "warning",
-          );
-          return;
-        }
+          "warning",
+        );
+        return;
+      }
 
-        const rollback = await prepareModelsJsonRollback(receiptSnapshot);
-        if ("error" in rollback) {
-          cmdCtx.ui.notify(`ℹ️ ${rollback.error}`, "info");
-          return;
-        }
+      const rollback = await prepareModelsJsonRollback(receiptSnapshot);
+      if ("error" in rollback) {
+        cmdCtx.ui.notify(`ℹ️ ${rollback.error}`, "info");
+        return;
+      }
 
-        const rollbackScope = rollback.mode === "exact"
+      const rollbackScope =
+        rollback.mode === "exact"
           ? "restore the exact pre-fix models.json because the file is unchanged since the fix"
           : "restore only the receipt-owned compat scalar keys and preserve subsequent user changes";
-        const rollbackPreview = [
-          `Rollback transaction ${rollback.receipt.transactionId}:`,
-          `Model: ${rollback.receipt.provider}/${rollback.receipt.modelId}`,
-          `Action: ${rollbackScope}.`,
-          `A new rollback backup will be written to: ${rollback.rollbackBackupPath}`,
-          "Comments, credentials, unrelated fields, and the existing access mode will be preserved.",
-          "Afterward, run /reload or restart Pi for the configuration change to take effect.",
-          "",
-          "Proceed with rollback?",
-        ].join("\n");
-        const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Rollback", rollbackPreview);
-        if (!confirmed) {
-          cmdCtx.ui.notify("No changes were made. Rollback canceled by user.", "info");
-          return;
-        }
+      const rollbackPreview = [
+        `Rollback transaction ${rollback.receipt.transactionId}:`,
+        `Model: ${rollback.receipt.provider}/${rollback.receipt.modelId}`,
+        `Action: ${rollbackScope}.`,
+        `A new rollback backup will be written to: ${rollback.rollbackBackupPath}`,
+        "Comments, credentials, unrelated fields, and the existing access mode will be preserved.",
+        "Afterward, run /reload or restart Pi for the configuration change to take effect.",
+        "",
+        "Proceed with rollback?",
+      ].join("\n");
+      const confirmed = await cmdCtx.ui.confirm(
+        "Cache Optimizer — Rollback",
+        rollbackPreview,
+      );
+      if (!confirmed) {
+        cmdCtx.ui.notify(
+          "No changes were made. Rollback canceled by user.",
+          "info",
+        );
+        return;
+      }
 
-        try {
-          const result = await applyModelsJsonFixTransaction(
-            rollback.modifiedText,
-            rollback.rollbackBackupPath,
-            (writtenText) => validateModelsJsonRollback(
+      try {
+        const result = await applyModelsJsonFixTransaction(
+          rollback.modifiedText,
+          rollback.rollbackBackupPath,
+          (writtenText) =>
+            validateModelsJsonRollback(
               writtenText,
               rollback.receipt,
               rollback.expectedResultHash,
             ),
-            {
-              expectedCurrentHash: rollback.currentHash,
-              expectedCurrentMode: rollback.fileMode,
-              receiptGuard: rollback.receiptSnapshot,
-              purpose: "rollback",
-              onCommitted: async () => {
-                await markModelsJsonFixReceiptRolledBack(rollback.receiptSnapshot);
-              },
+          {
+            expectedCurrentHash: rollback.currentHash,
+            expectedCurrentMode: rollback.fileMode,
+            receiptGuard: rollback.receiptSnapshot,
+            purpose: "rollback",
+            onCommitted: async () => {
+              await markModelsJsonFixReceiptRolledBack(
+                rollback.receiptSnapshot,
+              );
             },
-          );
-          if ("postCheckError" in result) {
-            cmdCtx.ui.notify(
-              `❌ Rollback self-check failed: ${result.postCheckError}\n` +
-              `The rollback backup at ${rollback.rollbackBackupPath} was restored. No changes applied.`,
-              "error",
-            );
-            return;
-          }
-          invalidateModelsConfigCache();
+          },
+        );
+        if ("postCheckError" in result) {
           cmdCtx.ui.notify(
-            `✅ Rollback completed for ${rollback.receipt.provider}/${rollback.receipt.modelId}.\n` +
+            `❌ Rollback self-check failed: ${result.postCheckError}\n` +
+              `The rollback backup at ${rollback.rollbackBackupPath} was restored. No changes applied.`,
+            "error",
+          );
+          return;
+        }
+        invalidateModelsConfigCache();
+        cmdCtx.ui.notify(
+          `✅ Rollback completed for ${rollback.receipt.provider}/${rollback.receipt.modelId}.\n` +
             `Rollback backup saved to: ${rollback.rollbackBackupPath}\n` +
             "The receipt was marked as rolled back. Run /reload or restart Pi for the change to take effect.",
+          "info",
+        );
+      } catch (rollbackError) {
+        cmdCtx.ui.notify(
+          `❌ Rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}\n` +
+            "No automatic overwrite was performed; use the recorded backup for manual guidance.",
+          "error",
+        );
+      }
+    } else if (subcommand === "reset") {
+      if (!model) {
+        cmdCtx.ui.notify(
+          "No active model selected. Select a model first with /model or pi --model.",
+          "warning",
+        );
+        return;
+      }
+      const adapter = selectAdapterForModel(model);
+      if (!adapter) {
+        cmdCtx.ui.notify(
+          "ℹ️ Active model does not match a cache adapter. No stats to reset.",
+          "info",
+        );
+        return;
+      }
+
+      const displayKey = modelKey(model);
+
+      // Reset local footer stats for the effective active model. If the
+      // selected model is a virtual router and the protocol exposes a live
+      // route, this clears the real upstream bucket, not the router shell.
+      await resetStatsForModel(model);
+
+      // Persist immediately.
+      await flushPersistCacheStats(cmdCtx);
+
+      // Update footer to show 0/0.
+      await publishStatus(cmdCtx, model);
+
+      cmdCtx.ui.notify(
+        `✅ Reset local footer cache stats for "${displayKey}". ` +
+          "Upstream provider prompt cache was not modified. " +
+          "New requests will start a fresh local stats bucket for this provider/model.",
+        "info",
+      );
+    } else if (subcommand === "fix") {
+      if (!model) {
+        cmdCtx.ui.notify(
+          "No active model selected. Select a model first with /model or pi --model.",
+          "warning",
+        );
+        return;
+      }
+
+      const promptCacheKeyRequested = commandParts[1] === "prompt-cache-key";
+      const promptCacheKeyFixRequested =
+        promptCacheKeyRequested || promptCacheKeyFixApplies(model);
+      if (
+        promptCacheKeyRequested &&
+        !isPromptCacheKeyUnsupportedApplicable(model)
+      ) {
+        cmdCtx.ui.notify(
+          "ℹ️ Prompt cache key opt-out applies only to a known OpenAI-compatible provider/model endpoint. No changes were made.",
+          "info",
+        );
+        return;
+      }
+      const suggestion = promptCacheKeyFixRequested
+        ? undefined
+        : buildCommandFixSuggestion(model);
+
+      if (promptCacheKeyFixRequested) {
+        if (isPromptCacheKeyOmittedForModel(model)) {
+          cmdCtx.ui.notify(
+            `✅ prompt_cache_key is already omitted for "${modelKey(model)}".`,
             "info",
           );
-        } catch (rollbackError) {
+          return;
+        }
+        if (!cmdCtx.hasUI) {
           cmdCtx.ui.notify(
-            `❌ Rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}\n` +
-            "No automatic overwrite was performed; use the recorded backup for manual guidance.",
+            "❌ Non-interactive terminal detected. Prompt cache key opt-out requires UI confirmation. No changes were made.\n" +
+              `Run /cache-optimizer fix prompt-cache-key in Pi's interactive UI for ${modelKey(model)}.`,
+            "warning",
+          );
+          return;
+        }
+        const preview = [
+          "📝 Preview of extension configuration change:",
+          ...buildPromptCacheKeyConfigPreview(model),
+          "",
+          "⚠️ Risk notice:",
+          "  1. This affects all sessions using this exact provider/model.",
+          "  2. Provider prompt-cache reuse may decrease because both key spellings are removed.",
+          "  3. This does not modify Pi's models.json, credentials, prompts, headers, or other models.",
+          "  4. The extension config will be backed up and Pi must be reloaded/restarted.",
+          "",
+          "Apply this persistent opt-out?",
+        ].join("\n");
+        const confirmed = await cmdCtx.ui.confirm(
+          "Cache Optimizer — Omit prompt_cache_key",
+          preview,
+        );
+        if (!confirmed) {
+          cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
+          return;
+        }
+        try {
+          const result = await applyPromptCacheKeyConfigFix(model);
+          setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+          cmdCtx.ui.notify(
+            `✅ Prompt cache key opt-out saved for ${modelKey(model)}.\n` +
+              `Config backup saved to: ${result.backupPath}\n` +
+              "Run /reload or restart Pi for the change to take effect. Use /cache-optimizer rollback to restore it.",
+            "info",
+          );
+        } catch (error) {
+          cmdCtx.ui.notify(
+            `❌ Could not save prompt cache key opt-out: ${error instanceof Error ? error.message : String(error)}. No changes were made.`,
             "error",
           );
         }
-      } else if (subcommand === "reset") {
-        if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
-          return;
-        }
-        const adapter = selectAdapterForModel(model);
-        if (!adapter) {
-          cmdCtx.ui.notify("ℹ️ Active model does not match a cache adapter. No stats to reset.", "info");
-          return;
-        }
+        return;
+      }
 
-        const displayKey = modelKey(model);
-
-        // Reset local footer stats for the effective active model. If the
-        // selected model is a virtual router and the protocol exposes a live
-        // route, this clears the real upstream bucket, not the router shell.
-        await resetStatsForModel(model);
-
-        // Persist immediately.
-        await flushPersistCacheStats(cmdCtx);
-
-        // Update footer to show 0/0.
-        await publishStatus(cmdCtx, model);
-
+      if (!suggestion) {
+        const key = modelKey(model);
         cmdCtx.ui.notify(
-          `✅ Reset local footer cache stats for "${displayKey}". ` +
-          "Upstream provider prompt cache was not modified. " +
-          "New requests will start a fresh local stats bucket for this provider/model.",
+          `✅ Nothing to fix for "${key}". Compat already configured.`,
           "info",
         );
-      } else if (subcommand === "fix") {
-        if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
-          return;
-        }
+        return;
+      }
 
-        const promptCacheKeyRequested = commandParts[1] === "prompt-cache-key";
-        const promptCacheKeyFixRequested = promptCacheKeyRequested || promptCacheKeyFixApplies(model);
-        if (promptCacheKeyRequested && !isPromptCacheKeyUnsupportedApplicable(model)) {
-          cmdCtx.ui.notify("ℹ️ Prompt cache key opt-out applies only to a known OpenAI-compatible provider/model endpoint. No changes were made.", "info");
-          return;
-        }
-        const suggestion = promptCacheKeyFixRequested ? undefined : buildCommandFixSuggestion(model);
-
-        if (promptCacheKeyFixRequested) {
-          if (isPromptCacheKeyOmittedForModel(model)) {
-            cmdCtx.ui.notify(`✅ prompt_cache_key is already omitted for "${modelKey(model)}".`, "info");
-            return;
-          }
-          if (!cmdCtx.hasUI) {
-            cmdCtx.ui.notify(
-              "❌ Non-interactive terminal detected. Prompt cache key opt-out requires UI confirmation. No changes were made.\n" +
-              `Run /cache-optimizer fix prompt-cache-key in Pi's interactive UI for ${modelKey(model)}.`,
-              "warning",
-            );
-            return;
-          }
-          const preview = [
-            "📝 Preview of extension configuration change:",
-            ...buildPromptCacheKeyConfigPreview(model),
-            "",
-            "⚠️ Risk notice:",
-            "  1. This affects all sessions using this exact provider/model.",
-            "  2. Provider prompt-cache reuse may decrease because both key spellings are removed.",
-            "  3. This does not modify Pi's models.json, credentials, prompts, headers, or other models.",
-            "  4. The extension config will be backed up and Pi must be reloaded/restarted.",
-            "",
-            "Apply this persistent opt-out?",
-          ].join("\n");
-          const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Omit prompt_cache_key", preview);
-          if (!confirmed) {
-            cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
-            return;
-          }
-          try {
-            const result = await applyPromptCacheKeyConfigFix(model);
-            setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
-            cmdCtx.ui.notify(
-              `✅ Prompt cache key opt-out saved for ${modelKey(model)}.\n` +
-              `Config backup saved to: ${result.backupPath}\n` +
-              "Run /reload or restart Pi for the change to take effect. Use /cache-optimizer rollback to restore it.",
-              "info",
-            );
-          } catch (error) {
-            cmdCtx.ui.notify(`❌ Could not save prompt cache key opt-out: ${error instanceof Error ? error.message : String(error)}. No changes were made.`, "error");
-          }
-          return;
-        }
-
-        if (!suggestion) {
-          const key = modelKey(model);
-          cmdCtx.ui.notify(`✅ Nothing to fix for "${key}". Compat already configured.`, "info");
-          return;
-        }
-
-        if (!cmdCtx.hasUI) {
-          // No UI — refuse to write, show manual guidance instead.
-          const compatResult = buildCompatDiagnosis(model);
-          const snippet = formatMissingEntryManualSnippet(
-            suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys,
-          );
-          const manualLines = [
-            `❌ Non-interactive terminal detected. Auto-fix requires UI confirmation.`,
-            "",
-            `Edit ${getModelsJsonDisplayPath()} and run /reload.`,
-          ];
-          if (promptCacheRetention400Models.has(modelKey(model))) {
-            manualLines.push(
-              "",
-              "💡 This model returned HTTP 400 for prompt_cache_retention.",
-              "Create or edit the entry below to override supportsLongCacheRetention to false.",
-            );
-          }
-          if (anthropicTtlOrderErrorModels.has(modelKey(model))) {
-            manualLines.push(
-              "",
-              "💡 This model returned an Anthropic cache-control TTL ordering error.",
-              "Create or edit the entry below to override supportsLongCacheRetention to false.",
-            );
-          }
-          if (sendSessionAffinityHeaders403Models.has(modelKey(model))) {
-            manualLines.push(
-              "",
-              "💡 This model returned HTTP 403 while sendSessionAffinityHeaders was enabled.",
-              "Create or edit the entry below to override sendSessionAffinityHeaders to false.",
-            );
-          }
+      if (!cmdCtx.hasUI) {
+        // No UI — refuse to write, show manual guidance instead.
+        const compatResult = buildCompatDiagnosis(model);
+        const snippet = formatMissingEntryManualSnippet(
+          suggestion.providerLabel,
+          suggestion.modelId,
+          suggestion.compatKeys,
+        );
+        const manualLines = [
+          `❌ Non-interactive terminal detected. Auto-fix requires UI confirmation.`,
+          "",
+          `Edit ${getModelsJsonDisplayPath()} and run /reload.`,
+        ];
+        if (promptCacheRetention400Models.has(modelKey(model))) {
           manualLines.push(
             "",
-            "Add these compat keys at Pi's highest-precedence model override path:",
-            `providers["${suggestion.providerLabel}"] -> modelOverrides -> "${suggestion.modelId}" -> compat:`,
-            formatCompatKeysForInsertion(suggestion.compatKeys),
+            "💡 This model returned HTTP 400 for prompt_cache_retention.",
+            "Create or edit the entry below to override supportsLongCacheRetention to false.",
           );
-          if (snippet.length > 0) {
-            manualLines.push(
-              "",
-              "If the provider/model is missing (common for API-logged-in channels such as",
-              `opencode go), add a minimal entry under "providers" (keep existing auth as-is):`,
-              "",
-              snippet,
-            );
-          }
-          if (compatResult) {
-            manualLines.push("", compatResult);
-          }
-          cmdCtx.ui.notify(manualLines.join("\n"), "warning");
-          return;
         }
-
-        // Read the models.json file
-        let originalText: string;
-        try {
-          originalText = await readFile(MODELS_JSON_PATH, "utf8");
-        } catch {
-          cmdCtx.ui.notify(`❌ Could not read ${MODELS_JSON_PATH}. File may not exist.`, "error");
-          return;
+        if (anthropicTtlOrderErrorModels.has(modelKey(model))) {
+          manualLines.push(
+            "",
+            "💡 This model returned an Anthropic cache-control TTL ordering error.",
+            "Create or edit the entry below to override supportsLongCacheRetention to false.",
+          );
         }
+        if (sendSessionAffinityHeaders403Models.has(modelKey(model))) {
+          manualLines.push(
+            "",
+            "💡 This model returned HTTP 403 while sendSessionAffinityHeaders was enabled.",
+            "Create or edit the entry below to override sendSessionAffinityHeaders to false.",
+          );
+        }
+        manualLines.push(
+          "",
+          "Add these compat keys at Pi's highest-precedence model override path:",
+          `providers["${suggestion.providerLabel}"] -> modelOverrides -> "${suggestion.modelId}" -> compat:`,
+          formatCompatKeysForInsertion(suggestion.compatKeys),
+        );
+        if (snippet.length > 0) {
+          manualLines.push(
+            "",
+            "If the provider/model is missing (common for API-logged-in channels such as",
+            `opencode go), add a minimal entry under "providers" (keep existing auth as-is):`,
+            "",
+            snippet,
+          );
+        }
+        if (compatResult) {
+          manualLines.push("", compatResult);
+        }
+        cmdCtx.ui.notify(manualLines.join("\n"), "warning");
+        return;
+      }
 
-        // Locate the model entry. API-logged-in providers (e.g. opencode go)
-        // may not appear in models.json at all.
-        const location = locateModelInJsonc(originalText, suggestion.providerLabel, suggestion.modelId);
-        if (!location) {
-          const diagnosis = analyzeModelsJsonForMissingEntry(originalText, suggestion.providerLabel, suggestion.modelId);
-          if (diagnosis && cmdCtx.hasUI) {
-            const overrideLocation = locateModelOverrideInJsonc(
-              originalText, suggestion.providerLabel, suggestion.modelId,
-            );
-            const repairsExistingOverride = (overrideLocation?.modelOverrideObjectBrace ?? -1) >= 0;
-            // Prefer a modelOverrides edit when models[] has no target entry.
-            const plan = composeModelOverrideInsertion(
-              originalText, suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys,
-            );
-            if (!plan) {
-              cmdCtx.ui.notify(
-                `❌ Could not safely locate a modelOverrides insertion point.\n` +
-                `Falling back to manual guidance. No changes were made.`,
-                "error",
-              );
-            } else {
+      // Read the models.json file
+      let originalText: string;
+      try {
+        originalText = await readFile(MODELS_JSON_PATH, "utf8");
+      } catch {
+        cmdCtx.ui.notify(
+          `❌ Could not read ${MODELS_JSON_PATH}. File may not exist.`,
+          "error",
+        );
+        return;
+      }
+
+      // Locate the model entry. API-logged-in providers (e.g. opencode go)
+      // may not appear in models.json at all.
+      const location = locateModelInJsonc(
+        originalText,
+        suggestion.providerLabel,
+        suggestion.modelId,
+      );
+      if (!location) {
+        const diagnosis = analyzeModelsJsonForMissingEntry(
+          originalText,
+          suggestion.providerLabel,
+          suggestion.modelId,
+        );
+        if (diagnosis && cmdCtx.hasUI) {
+          const overrideLocation = locateModelOverrideInJsonc(
+            originalText,
+            suggestion.providerLabel,
+            suggestion.modelId,
+          );
+          const repairsExistingOverride =
+            (overrideLocation?.modelOverrideObjectBrace ?? -1) >= 0;
+          // Prefer a modelOverrides edit when models[] has no target entry.
+          const plan = composeModelOverrideInsertion(
+            originalText,
+            suggestion.providerLabel,
+            suggestion.modelId,
+            suggestion.compatKeys,
+          );
+          if (plan) {
             const checkError = selfCheckMissingEntryInsertion(
-              originalText, plan.modifiedText,
-              suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys,
+              originalText,
+              plan.modifiedText,
+              suggestion.providerLabel,
+              suggestion.modelId,
+              suggestion.compatKeys,
               model,
             );
-            if (checkError !== null) {
-              // Fall through to manual guidance.
-              cmdCtx.ui.notify(
-                `❌ Self-check would fail for auto-created entry: ${checkError}\n` +
-                `Falling back to manual guidance. No changes were made.`,
-                "error",
+            if (checkError === null) {
+              const keysPreview = JSON.stringify(
+                suggestion.compatKeys,
+                null,
+                2,
               );
-              // Continue to manual guidance below.
-            } else {
-              const keysPreview = JSON.stringify(suggestion.compatKeys, null, 2);
               const ts = backupTimestamp();
               const backupPath = `${MODELS_JSON_PATH}.backup-cache-optimizer-${ts}`;
               const previewLines = [
@@ -11802,7 +15167,9 @@ export default function (pi: ExtensionAPI) {
               }
               previewLines.push("", `Apply these changes?`);
               const confirmed = await cmdCtx.ui.confirm(
-                repairsExistingOverride ? "Cache Optimizer — Fix (model override)" : "Cache Optimizer — Fix (new override)",
+                repairsExistingOverride
+                  ? "Cache Optimizer — Fix (model override)"
+                  : "Cache Optimizer — Fix (new override)",
                 previewLines.join("\n"),
               );
               if (confirmed) {
@@ -11818,30 +15185,35 @@ export default function (pi: ExtensionAPI) {
                     backupPath,
                   );
                   if (!receipt) {
-                    cmdCtx.ui.notify("❌ Could not create a privacy-safe fix receipt. No changes were made.", "error");
+                    cmdCtx.ui.notify(
+                      "❌ Could not create a privacy-safe fix receipt. No changes were made.",
+                      "error",
+                    );
                     return;
                   }
                   const result = await applyModelsJsonFixTransaction(
                     plan.modifiedText,
                     backupPath,
-                    (writtenText) => selfCheckMissingEntryInsertion(
-                      originalText,
-                      writtenText,
-                      suggestion.providerLabel,
-                      suggestion.modelId,
-                      suggestion.compatKeys,
-                      model,
-                    ),
+                    (writtenText) =>
+                      selfCheckMissingEntryInsertion(
+                        originalText,
+                        writtenText,
+                        suggestion.providerLabel,
+                        suggestion.modelId,
+                        suggestion.compatKeys,
+                        model,
+                      ),
                     {
                       expectedCurrentHash: hashText(originalText),
                       purpose: "fix",
-                      onCommitted: async () => writeModelsJsonFixReceipt(receipt),
+                      onCommitted: async () =>
+                        writeModelsJsonFixReceipt(receipt),
                     },
                   );
                   if ("postCheckError" in result) {
                     cmdCtx.ui.notify(
                       `❌ Post-write self-check failed: ${result.postCheckError}\n` +
-                      `The backup at ${backupPath} has been restored. No changes applied.`,
+                        `The backup at ${backupPath} has been restored. No changes applied.`,
                       "error",
                     );
                     return;
@@ -11849,202 +15221,243 @@ export default function (pi: ExtensionAPI) {
                   invalidateModelsConfigCache();
                   cmdCtx.ui.notify(
                     `✅ Fix applied to ${getModelsJsonDisplayPath()}.\n` +
-                    `Backup saved to: ${backupPath}\n` +
-                    `Run /reload or restart Pi for the change to take effect.`,
+                      `Backup saved to: ${backupPath}\n` +
+                      `Run /reload or restart Pi for the change to take effect.`,
                     "info",
                   );
                 } catch (e) {
                   cmdCtx.ui.notify(
                     `❌ Write failed: ${e instanceof Error ? e.message : String(e)}\n` +
-                    `Backup may be at: ${backupPath}`,
+                      `Backup may be at: ${backupPath}`,
                     "error",
                   );
                 }
                 return;
               }
-              cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
+              cmdCtx.ui.notify(
+                "No changes were made. Canceled by user.",
+                "info",
+              );
               return;
+            } else {
+              // Fall through to manual guidance.
+              cmdCtx.ui.notify(
+                `❌ Self-check would fail for auto-created entry: ${checkError}\n` +
+                  `Falling back to manual guidance. No changes were made.`,
+                "error",
+              );
+              // Continue to manual guidance below.
             }
-            }
-          }
-
-          // Non-interactive or no diagnosis: show manual guidance.
-          const snippet = diagnosis
-            ? formatMissingEntryManualSnippet(suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys)
-            : formatCompatKeysForInsertion(suggestion.compatKeys);
-          const adviceLines: string[] = [];
-          if (!diagnosis) {
-            adviceLines.push(
-              `❌ Could not locate model "${suggestion.modelId}" or provider "${suggestion.providerLabel}" in ${getModelsJsonDisplayPath()}.`,
-              "",
-              "Providers that were added via Pi /login API (e.g. opencode go) do not have",
-              "entries in models.json. You can create a minimal modelOverrides entry by hand:",
-            );
-          } else if (diagnosis.scenario === "provider_missing") {
-            adviceLines.push(
-              `ℹ️ Provider "${suggestion.providerLabel}" does not exist in ${getModelsJsonDisplayPath()}.`,
-              `This is common for API-logged-in providers (e.g. /login ...).`,
-              "",
-              "Add the following minimal block under the \"providers\" key (keep your",
-              "existing authentication as-is):",
-            );
           } else {
-            adviceLines.push(
-              `ℹ️ Model "${suggestion.modelId}" was not found in ${getModelsJsonDisplayPath()}`,
-              `under providers["${suggestion.providerLabel}"].`,
-              "",
-              "Add the following modelOverrides entry (keep existing auth):",
+            cmdCtx.ui.notify(
+              `❌ Could not safely locate a modelOverrides insertion point.\n` +
+                `Falling back to manual guidance. No changes were made.`,
+              "error",
             );
           }
-          adviceLines.push("", snippet, "", "Then save and run /reload.");
-          cmdCtx.ui.notify(adviceLines.join("\n"), "warning");
-          return;
         }
 
-        const duplicateTargetDefinitions = location.allModelIds.filter(
-          (configuredModelId) => configuredModelId === suggestion.modelId,
-        ).length;
-        if (duplicateTargetDefinitions > 1) {
-          cmdCtx.ui.notify(
-            `❌ ${getModelsJsonDisplayPath()} contains ${duplicateTargetDefinitions} custom model definitions ` +
+        // Non-interactive or no diagnosis: show manual guidance.
+        const snippet = diagnosis
+          ? formatMissingEntryManualSnippet(
+              suggestion.providerLabel,
+              suggestion.modelId,
+              suggestion.compatKeys,
+            )
+          : formatCompatKeysForInsertion(suggestion.compatKeys);
+        const adviceLines: string[] = [];
+        if (!diagnosis) {
+          adviceLines.push(
+            `❌ Could not locate model "${suggestion.modelId}" or provider "${suggestion.providerLabel}" in ${getModelsJsonDisplayPath()}.`,
+            "",
+            "Providers that were added via Pi /login API (e.g. opencode go) do not have",
+            "entries in models.json. You can create a minimal modelOverrides entry by hand:",
+          );
+        } else if (diagnosis.scenario === "provider_missing") {
+          adviceLines.push(
+            `ℹ️ Provider "${suggestion.providerLabel}" does not exist in ${getModelsJsonDisplayPath()}.`,
+            `This is common for API-logged-in providers (e.g. /login ...).`,
+            "",
+            'Add the following minimal block under the "providers" key (keep your',
+            "existing authentication as-is):",
+          );
+        } else {
+          adviceLines.push(
+            `ℹ️ Model "${suggestion.modelId}" was not found in ${getModelsJsonDisplayPath()}`,
+            `under providers["${suggestion.providerLabel}"].`,
+            "",
+            "Add the following modelOverrides entry (keep existing auth):",
+          );
+        }
+        adviceLines.push("", snippet, "", "Then save and run /reload.");
+        cmdCtx.ui.notify(adviceLines.join("\n"), "warning");
+        return;
+      }
+
+      const duplicateTargetDefinitions = location.allModelIds.filter(
+        (configuredModelId) => configuredModelId === suggestion.modelId,
+      ).length;
+      if (duplicateTargetDefinitions > 1) {
+        cmdCtx.ui.notify(
+          `❌ ${getModelsJsonDisplayPath()} contains ${duplicateTargetDefinitions} custom model definitions ` +
             `with the exact id "${suggestion.modelId}" under providers["${suggestion.providerLabel}"].\n` +
             `Pi uses the last definition, but /cache-optimizer fix refuses an ambiguous duplicate-id edit. ` +
             `Remove or consolidate the duplicates, then run the command again.`,
-            "error",
-          );
-          return;
-        }
+          "error",
+        );
+        return;
+      }
 
-        // Compose the modified text — observed runtime failures are always
-        // model-scoped; ordinary compat fixes use the safety-based placement.
-        const decision = chooseFixPlacement(
+      // Compose the modified text — observed runtime failures are always
+      // model-scoped; ordinary compat fixes use the safety-based placement.
+      const decision = chooseFixPlacement(
+        originalText,
+        location,
+        suggestion.compatKeys,
+        suggestion.providerLabel,
+        suggestion.forceModelLevel,
+      );
+      const createsModelOverride =
+        decision.placement === "modelOverride" &&
+        location.modelOverrideObjectBrace < 0;
+      const modelOverridePlan = createsModelOverride
+        ? composeModelOverrideInsertion(
+            originalText,
+            suggestion.providerLabel,
+            suggestion.modelId,
+            suggestion.compatKeys,
+          )
+        : undefined;
+      if (createsModelOverride && !modelOverridePlan) {
+        cmdCtx.ui.notify(
+          "❌ Could not safely create the highest-precedence model override. No changes were made.",
+          "error",
+        );
+        return;
+      }
+      const modifiedText =
+        modelOverridePlan?.modifiedText ??
+        composeFixInsertion(
           originalText,
           location,
           suggestion.compatKeys,
-          suggestion.providerLabel,
-          suggestion.forceModelLevel,
+          decision.placement,
         );
-        const createsModelOverride = decision.placement === "modelOverride" && location.modelOverrideObjectBrace < 0;
-        const modelOverridePlan = createsModelOverride
-          ? composeModelOverrideInsertion(
-              originalText,
-              suggestion.providerLabel,
-              suggestion.modelId,
-              suggestion.compatKeys,
-            )
-          : undefined;
-        if (createsModelOverride && !modelOverridePlan) {
-          cmdCtx.ui.notify(
-            "❌ Could not safely create the highest-precedence model override. No changes were made.",
-            "error",
-          );
-          return;
-        }
-        const modifiedText = modelOverridePlan?.modifiedText
-          ?? composeFixInsertion(originalText, location, suggestion.compatKeys, decision.placement);
 
-        // Self-check against the same provider → model → runtime →
-        // modelOverride precedence used by request hooks.
-        const checkError = createsModelOverride
-          ? selfCheckMissingEntryInsertion(
-              originalText,
-              modifiedText,
-              suggestion.providerLabel,
-              suggestion.modelId,
-              suggestion.compatKeys,
-              model,
-            )
-          : selfCheckFix(
-              originalText,
-              modifiedText,
-              suggestion.providerLabel,
-              suggestion.modelId,
-              suggestion.compatKeys,
-              decision.placement,
-              model,
-            );
-        if (checkError !== null) {
-          cmdCtx.ui.notify(
-            `❌ Self-check failed before write: ${checkError}\n` +
+      // Self-check against the same provider → model → runtime →
+      // modelOverride precedence used by request hooks.
+      const checkError = createsModelOverride
+        ? selfCheckMissingEntryInsertion(
+            originalText,
+            modifiedText,
+            suggestion.providerLabel,
+            suggestion.modelId,
+            suggestion.compatKeys,
+            model,
+          )
+        : selfCheckFix(
+            originalText,
+            modifiedText,
+            suggestion.providerLabel,
+            suggestion.modelId,
+            suggestion.compatKeys,
+            decision.placement,
+            model,
+          );
+      if (checkError !== null) {
+        cmdCtx.ui.notify(
+          `❌ Self-check failed before write: ${checkError}\n` +
             `No changes were made. Manual edit required.`,
-            "error",
-          );
-          return;
-        }
+          "error",
+        );
+        return;
+      }
 
-        // Build preview snippet as copyable JSON (the surgical editor will
-        // insert or repair these exact compat key/value pairs).
-        const keysPreview = JSON.stringify(suggestion.compatKeys, null, 2);
-        const targetHasCompat = decision.placement === "provider"
+      // Build preview snippet as copyable JSON (the surgical editor will
+      // insert or repair these exact compat key/value pairs).
+      const keysPreview = JSON.stringify(suggestion.compatKeys, null, 2);
+      const targetHasCompat =
+        decision.placement === "provider"
           ? location.providerCompatBrace >= 0
           : decision.placement === "modelOverride"
             ? location.modelOverrideCompatBrace >= 0
             : location.compatObjectBrace >= 0;
-        const placementDesc = targetHasCompat ? `existing "compat" object` : `new "compat" object`;
-        const locationDesc = decision.placement === "provider"
+      const placementDesc = targetHasCompat
+        ? `existing "compat" object`
+        : `new "compat" object`;
+      const locationDesc =
+        decision.placement === "provider"
           ? `providers["${suggestion.providerLabel}"] -> compat (provider level, ${placementDesc})`
           : decision.placement === "modelOverride"
             ? `providers["${suggestion.providerLabel}"] -> modelOverrides -> "${suggestion.modelId}" -> compat (${placementDesc})`
             : `providers["${suggestion.providerLabel}"] -> models -> "${suggestion.modelId}" -> compat (model level, ${placementDesc})`;
 
-        const ts = backupTimestamp();
-        const backupPath = `${MODELS_JSON_PATH}.backup-cache-optimizer-${ts}`;
+      const ts = backupTimestamp();
+      const backupPath = `${MODELS_JSON_PATH}.backup-cache-optimizer-${ts}`;
 
-        const scopeRiskLine = decision.placement === "provider"
+      const scopeRiskLine =
+        decision.placement === "provider"
           ? `  1. This change applies to ALL ${location.allModelIds.length || 1} model(s) in the "${suggestion.providerLabel}" provider, across all sessions.`
           : `  1. This change affects ALL sessions using the "${suggestion.providerLabel}" provider/channel (scoped to model "${suggestion.modelId}").`;
 
-        const previewLines = [
-          `📝 Preview of changes to ${getModelsJsonDisplayPath()}:`,
-          ``,
-          `Location: ${locationDesc}`,
-          `Placement: ${decision.placement} level — ${decision.reason}`,
-          `Compat JSON to write:`,
-          keysPreview,
-          ``,
-          `⚠️  Risk notice:`,
-          scopeRiskLine,
-          `  2. A timestamped backup will be written to: ${backupPath}`,
-          `  3. You must restart Pi / run /reload for the change to take effect.`,
-          `  4. If the file contains comments or unusual formatting, please verify the result after write.`,
-        ];
-        if (promptCacheRetention400Models.has(modelKey(model))) {
-          previewLines.push(
-            "",
-            "💡  This fix overrides supportsLongCacheRetention to false because",
-            "a 400 prompt_cache_retention error was observed for this model.",
-            "After applying and reloading, Pi will no longer send the",
-            "prompt_cache_retention parameter to this provider.",
-          );
-        }
-        previewLines.push("", `Apply these changes?`);
+      const previewLines = [
+        `📝 Preview of changes to ${getModelsJsonDisplayPath()}:`,
+        ``,
+        `Location: ${locationDesc}`,
+        `Placement: ${decision.placement} level — ${decision.reason}`,
+        `Compat JSON to write:`,
+        keysPreview,
+        ``,
+        `⚠️  Risk notice:`,
+        scopeRiskLine,
+        `  2. A timestamped backup will be written to: ${backupPath}`,
+        `  3. You must restart Pi / run /reload for the change to take effect.`,
+        `  4. If the file contains comments or unusual formatting, please verify the result after write.`,
+      ];
+      if (promptCacheRetention400Models.has(modelKey(model))) {
+        previewLines.push(
+          "",
+          "💡  This fix overrides supportsLongCacheRetention to false because",
+          "a 400 prompt_cache_retention error was observed for this model.",
+          "After applying and reloading, Pi will no longer send the",
+          "prompt_cache_retention parameter to this provider.",
+        );
+      }
+      previewLines.push("", `Apply these changes?`);
 
-        const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Fix", previewLines.join("\n"));
-        if (!confirmed) {
-          cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
+      const confirmed = await cmdCtx.ui.confirm(
+        "Cache Optimizer — Fix",
+        previewLines.join("\n"),
+      );
+      if (!confirmed) {
+        cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
+        return;
+      }
+
+      // Write: backup → temp + rename → self-check again
+      try {
+        const receipt = createModelsJsonFixReceipt(
+          originalText,
+          modifiedText,
+          suggestion.providerLabel,
+          suggestion.modelId,
+          decision.placement,
+          suggestion.compatKeys,
+          !createsModelOverride,
+          backupPath,
+        );
+        if (!receipt) {
+          cmdCtx.ui.notify(
+            "❌ Could not create a privacy-safe fix receipt. No changes were made.",
+            "error",
+          );
           return;
         }
-
-        // Write: backup → temp + rename → self-check again
-        try {
-          const receipt = createModelsJsonFixReceipt(
-            originalText,
-            modifiedText,
-            suggestion.providerLabel,
-            suggestion.modelId,
-            decision.placement,
-            suggestion.compatKeys,
-            !createsModelOverride,
-            backupPath,
-          );
-          if (!receipt) {
-            cmdCtx.ui.notify("❌ Could not create a privacy-safe fix receipt. No changes were made.", "error");
-            return;
-          }
-          const result = await applyModelsJsonFixTransaction(
-            modifiedText,
-            backupPath,
-            (writtenText) => createsModelOverride
+        const result = await applyModelsJsonFixTransaction(
+          modifiedText,
+          backupPath,
+          (writtenText) =>
+            createsModelOverride
               ? selfCheckMissingEntryInsertion(
                   originalText,
                   writtenText,
@@ -12062,124 +15475,206 @@ export default function (pi: ExtensionAPI) {
                   decision.placement,
                   model,
                 ),
-            {
-              expectedCurrentHash: hashText(originalText),
-              purpose: "fix",
-              onCommitted: async () => writeModelsJsonFixReceipt(receipt),
-            },
-          );
-          if ("postCheckError" in result) {
-            cmdCtx.ui.notify(
-              `❌ Post-write self-check failed: ${result.postCheckError}\n` +
+          {
+            expectedCurrentHash: hashText(originalText),
+            purpose: "fix",
+            onCommitted: async () => writeModelsJsonFixReceipt(receipt),
+          },
+        );
+        if ("postCheckError" in result) {
+          cmdCtx.ui.notify(
+            `❌ Post-write self-check failed: ${result.postCheckError}\n` +
               `The backup at ${backupPath} has been restored. No changes applied.`,
-              "error",
-            );
-            return;
-          }
-
-          invalidateModelsConfigCache();
-          cmdCtx.ui.notify(
-            `✅ Fix applied to ${getModelsJsonDisplayPath()}.\n` +
-            `Backup saved to: ${backupPath}\n` +
-            `Run /reload or restart Pi for the change to take effect.`,
-            "info",
-          );
-        } catch (writeError) {
-          cmdCtx.ui.notify(
-            `❌ Write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}\n` +
-            `Backup may be at: ${backupPath}`,
             "error",
           );
+          return;
         }
-      } else {
-        // Try interactive selection menu when UI supports it
-        if (cmdCtx.hasUI) {
-          const menuOptions = [
-            "Enable — Turn on runtime optimizations",
-            "Disable — Turn off runtime optimizations",
-            "Doctor — Show cache configuration",
-            "Stats — Show current-session model statistics",
-            "Compat — Show compat suggestion",
-            "Fix — Auto-fix compat issues (writes models.json or extension config)",
-            "Disable prompt_cache_key — Omit it for the active model",
-            "Rollback — Undo the latest confirmed fix",
-            "Footer mode — Choose total, session, or process stats",
-            "Reset — Reset local provider/model stats",
+
+        invalidateModelsConfigCache();
+        cmdCtx.ui.notify(
+          `✅ Fix applied to ${getModelsJsonDisplayPath()}.\n` +
+            `Backup saved to: ${backupPath}\n` +
+            `Run /reload or restart Pi for the change to take effect.`,
+          "info",
+        );
+      } catch (writeError) {
+        cmdCtx.ui.notify(
+          `❌ Write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}\n` +
+            `Backup may be at: ${backupPath}`,
+          "error",
+        );
+      }
+    } else {
+      // Try interactive selection menu when UI supports it
+      if (cmdCtx.hasUI) {
+        const menuOptions = [
+          "Enable — Turn on runtime optimizations",
+          "Disable — Turn off runtime optimizations",
+          "Doctor — Show cache configuration",
+          "Stats — Show current-session model statistics",
+          "Compat — Show compat suggestion",
+          "Fix — Auto-fix compat issues (writes models.json or extension config)",
+          "Disable prompt_cache_key — Omit it for the active model",
+          "Rollback — Undo the latest confirmed fix",
+          "Footer mode — Choose total, session, or process stats",
+          "Retention — Choose long, short, none, or startup steering",
+          "Reset — Reset local provider/model stats",
+          "Cancel",
+        ];
+        const choice = await cmdCtx.ui.select("Cache Optimizer", menuOptions);
+        if (choice === menuOptions[0]) {
+          await handleCacheOptimizerCommand("enable", cmdCtx);
+        } else if (choice === menuOptions[1]) {
+          await handleCacheOptimizerCommand("disable", cmdCtx);
+        } else if (choice === menuOptions[2]) {
+          await handleCacheOptimizerCommand("doctor", cmdCtx);
+        } else if (choice === menuOptions[3]) {
+          await handleCacheOptimizerCommand("stats", cmdCtx);
+        } else if (choice === menuOptions[4]) {
+          await handleCacheOptimizerCommand("compat", cmdCtx);
+        } else if (choice === menuOptions[5]) {
+          await handleCacheOptimizerCommand("fix", cmdCtx);
+        } else if (choice === menuOptions[6]) {
+          await handleCacheOptimizerCommand("fix prompt-cache-key", cmdCtx);
+        } else if (choice === menuOptions[7]) {
+          await handleCacheOptimizerCommand("rollback", cmdCtx);
+        } else if (choice === menuOptions[8]) {
+          const modeOptions = [
+            "session — Current Pi conversation session (default)",
+            "total — All local sessions today",
+            "process — Current extension instance only",
             "Cancel",
           ];
-          const choice = await cmdCtx.ui.select("Cache Optimizer", menuOptions);
-          if (choice === menuOptions[0]) {
-            await handleCacheOptimizerCommand("enable", cmdCtx);
-          } else if (choice === menuOptions[1]) {
-            await handleCacheOptimizerCommand("disable", cmdCtx);
-          } else if (choice === menuOptions[2]) {
-            await handleCacheOptimizerCommand("doctor", cmdCtx);
-          } else if (choice === menuOptions[3]) {
-            await handleCacheOptimizerCommand("stats", cmdCtx);
-          } else if (choice === menuOptions[4]) {
-            await handleCacheOptimizerCommand("compat", cmdCtx);
-          } else if (choice === menuOptions[5]) {
-            await handleCacheOptimizerCommand("fix", cmdCtx);
-          } else if (choice === menuOptions[6]) {
-            await handleCacheOptimizerCommand("fix prompt-cache-key", cmdCtx);
-          } else if (choice === menuOptions[7]) {
-            await handleCacheOptimizerCommand("rollback", cmdCtx);
-          } else if (choice === menuOptions[8]) {
-            const modeOptions = ["session — Current Pi conversation session (default)", "total — All local sessions today", "process — Current extension instance only", "Cancel"];
-            const modeChoice = await cmdCtx.ui.select("Footer cache stats mode", modeOptions);
-            const nextMode = modeChoice === modeOptions[0]
+          const modeChoice = await cmdCtx.ui.select(
+            "Footer cache stats mode",
+            modeOptions,
+          );
+          const nextMode =
+            modeChoice === modeOptions[0]
               ? "session"
               : modeChoice === modeOptions[1]
                 ? "total"
                 : modeChoice === modeOptions[2]
                   ? "process"
                   : undefined;
-            if (nextMode) await handleCacheOptimizerCommand(`config footer-mode ${nextMode}`, cmdCtx);
-          } else if (choice === menuOptions[9]) {
-            await handleCacheOptimizerCommand("reset", cmdCtx);
-          }
-          // choice === "cancel" or undefined → no action
-          return;
+          if (nextMode)
+            await handleCacheOptimizerCommand(
+              `config footer-mode ${nextMode}`,
+              cmdCtx,
+            );
+        } else if (choice === menuOptions[9]) {
+          const retentionOptions = [
+            "long — Force PI_CACHE_RETENTION=long (default, upstream behavior)",
+            "short — Force PI_CACHE_RETENTION=short (e.g. Bedrock 5m TTL)",
+            "none — Never steer; delete inherited PI_CACHE_RETENTION",
+            "startup — Leave the pre-session environment untouched",
+            "Cancel",
+          ];
+          const retentionChoice = await cmdCtx.ui.select(
+            "Cache retention steering",
+            retentionOptions,
+          );
+          const nextRetention =
+            retentionChoice === retentionOptions[0]
+              ? "long"
+              : retentionChoice === retentionOptions[1]
+                ? "short"
+                : retentionChoice === retentionOptions[2]
+                  ? "none"
+                  : retentionChoice === retentionOptions[3]
+                    ? "startup"
+                    : undefined;
+          if (nextRetention)
+            await handleCacheOptimizerCommand(
+              `config retention ${nextRetention}`,
+              cmdCtx,
+            );
+        } else if (choice === menuOptions[10]) {
+          await handleCacheOptimizerCommand("reset", cmdCtx);
         }
-
-        // Fallback: text help when no interactive UI
-        const diagnosis: string[] = [];
-        diagnosis.push("📋 /cache-optimizer commands:");
-        diagnosis.push("  enable  — Enable prompt/cache optimizations for this Pi process");
-        diagnosis.push("  disable — Disable prompt/cache optimizations for this Pi process");
-        diagnosis.push("  doctor  — Show current model/provider/api/baseUrl/compat and low-hit diagnosis");
-        diagnosis.push("  stats   — Show detailed statistics for every model in the current session");
-        diagnosis.push("  stats all — Show detailed totals for every model across all local sessions");
-        diagnosis.push("  stats contributors — Show per-session contributors for the active model");
-        diagnosis.push("  compat  — Show compat suggestion with edit location");
-        diagnosis.push("  config footer-mode total|session|process — Persist the footer stats mode");
-        diagnosis.push("  fix     — Auto-fix compat issues (writes models.json or extension config, requires UI)");
-        diagnosis.push("  fix prompt-cache-key — Explicitly omit prompt_cache_key for the active model");
-        diagnosis.push("  rollback — Undo the latest confirmed fix (requires UI confirmation)");
-        diagnosis.push("  reset   — Reset local provider/model stats for current model (does not affect upstream)");
-        diagnosis.push("");
-        diagnosis.push(formatOptimizerRuntimeMode());
-        const resolvedFooterMode = resolveFooterStatsMode(persistedFooterStatsMode);
-        diagnosis.push(`Footer stats mode: ${resolvedFooterMode.mode} (${resolvedFooterMode.source})`);
-        diagnosis.push("");
-        if (model) {
-          const displayKey = modelKey(model);
-          const missing = describeMissingCacheCompatForModel(model);
-          if (missing.length > 0) {
-            diagnosis.push(`⚠️  Active model "${displayKey}" missing compat: ${missing.join(", ")}`);
-            diagnosis.push('Run "/cache-optimizer compat" for edit instructions.');
-          } else if (isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)) {
-            diagnosis.push(`✅ Active model "${displayKey}": compat fully configured.`);
-          } else {
-            diagnosis.push(`ℹ️ Active model "${displayKey}": compat check not applicable.`);
-            const detailLines = getCompatCheckNotApplicableLines(model).slice(1);
-            for (const line of detailLines) diagnosis.push(line);
-          }
-        } else {
-          diagnosis.push("No active model selected.");
-        }
-        cmdCtx.ui.notify(diagnosis.join("\n"), "info");
+        // choice === "cancel" or undefined → no action
+        return;
       }
+
+      // Fallback: text help when no interactive UI
+      const diagnosis: string[] = [];
+      diagnosis.push("📋 /cache-optimizer commands:");
+      diagnosis.push(
+        "  enable  — Enable prompt/cache optimizations for this Pi process",
+      );
+      diagnosis.push(
+        "  disable — Disable prompt/cache optimizations for this Pi process",
+      );
+      diagnosis.push(
+        "  doctor  — Show current model/provider/api/baseUrl/compat and low-hit diagnosis",
+      );
+      diagnosis.push(
+        "  stats   — Show detailed statistics for every model in the current session",
+      );
+      diagnosis.push(
+        "  stats all — Show detailed totals for every model across all local sessions",
+      );
+      diagnosis.push(
+        "  stats contributors — Show per-session contributors for the active model",
+      );
+      diagnosis.push("  compat  — Show compat suggestion with edit location");
+      diagnosis.push(
+        "  config footer-mode total|session|process — Persist the footer stats mode",
+      );
+      diagnosis.push(
+        "  config retention long|short|none|startup — Persist the cache retention steering mode",
+      );
+      diagnosis.push(
+        "  fix     — Auto-fix compat issues (writes models.json or extension config, requires UI)",
+      );
+      diagnosis.push(
+        "  fix prompt-cache-key — Explicitly omit prompt_cache_key for the active model",
+      );
+      diagnosis.push(
+        "  rollback — Undo the latest confirmed fix (requires UI confirmation)",
+      );
+      diagnosis.push(
+        "  reset   — Reset local provider/model stats for current model (does not affect upstream)",
+      );
+      diagnosis.push("");
+      diagnosis.push(formatOptimizerRuntimeMode());
+      const resolvedFooterMode = resolveFooterStatsMode(
+        persistedFooterStatsMode,
+      );
+      diagnosis.push(
+        `Footer stats mode: ${resolvedFooterMode.mode} (${resolvedFooterMode.source})`,
+      );
+      diagnosis.push("");
+      if (model) {
+        const displayKey = modelKey(model);
+        const missing = describeMissingCacheCompatForModel(model);
+        if (missing.length > 0) {
+          diagnosis.push(
+            `⚠️  Active model "${displayKey}" missing compat: ${missing.join(", ")}`,
+          );
+          diagnosis.push(
+            'Run "/cache-optimizer compat" for edit instructions.',
+          );
+        } else if (
+          isAdaptiveThinkingCompatApplicable(model) ||
+          isDeepSeekCompatCheckApplicable(model) ||
+          isCompatCheckApplicable(model)
+        ) {
+          diagnosis.push(
+            `✅ Active model "${displayKey}": compat fully configured.`,
+          );
+        } else {
+          diagnosis.push(
+            `ℹ️ Active model "${displayKey}": compat check not applicable.`,
+          );
+          const detailLines = getCompatCheckNotApplicableLines(model).slice(1);
+          for (const line of detailLines) diagnosis.push(line);
+        }
+      } else {
+        diagnosis.push("No active model selected.");
+      }
+      cmdCtx.ui.notify(diagnosis.join("\n"), "info");
+    }
   }
 
   pi.registerCommand("cache-optimizer", {

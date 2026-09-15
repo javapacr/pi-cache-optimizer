@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { describe, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,7 +51,10 @@ describe("stable prompt reordering", () => {
       "",
       "Tail context",
     ].join("\n");
-    const options = { cwd: process.cwd(), promptGuidelines: [guideline.slice(2)] };
+    const options = {
+      cwd: process.cwd(),
+      promptGuidelines: [guideline.slice(2)],
+    };
 
     const first = internals.optimizeSystemPrompt(original, options);
     const second = internals.optimizeSystemPrompt(original, options);
@@ -80,10 +94,15 @@ describe("footer status separation and command completion", () => {
       "· OpenAI cache 0/0·0M/0M 0.0%",
     );
     assert.equal(
-      internals.prefixFooterStatus("Cache Optimizer disabled · OpenAI cache 0/0·0M/0M 0.0% ⚠️ compat"),
+      internals.prefixFooterStatus(
+        "Cache Optimizer disabled · OpenAI cache 0/0·0M/0M 0.0% ⚠️ compat",
+      ),
       "· Cache Optimizer disabled · OpenAI cache 0/0·0M/0M 0.0% ⚠️ compat",
     );
-    assert.equal(internals.prefixFooterStatus("· OpenAI cache 0/0·0M/0M 0.0%"), "· OpenAI cache 0/0·0M/0M 0.0%");
+    assert.equal(
+      internals.prefixFooterStatus("· OpenAI cache 0/0·0M/0M 0.0%"),
+      "· OpenAI cache 0/0·0M/0M 0.0%",
+    );
     assert.equal(internals.prefixFooterStatus(undefined), undefined);
   });
 
@@ -105,16 +124,21 @@ describe("footer status separation and command completion", () => {
   });
 
   test("publishes the ownership prefix through setStatus", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-footer-status-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-footer-status-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
@@ -143,7 +167,11 @@ describe("footer status separation and command completion", () => {
       const context = {
         model,
         sessionManager: { getSessionId: () => "footer-status-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
           notify() {},
           setStatus(key: string, value: string | undefined) {
@@ -159,9 +187,11 @@ describe("footer status separation and command completion", () => {
       assert.equal(statuses.at(-1)?.key, "pi-cache-stats");
       assert.match(statuses.at(-1)?.value ?? "", /^· OpenAI cache /);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -170,19 +200,58 @@ describe("footer status separation and command completion", () => {
   test("completes top-level and nested cache-optimizer arguments by prefix", () => {
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions(""),
-      ["enable", "disable", "doctor", "stats", "config", "compat", "reset", "fix", "rollback"].map((value) => ({ value, label: value })),
+      [
+        "enable",
+        "disable",
+        "doctor",
+        "stats",
+        "config",
+        "compat",
+        "reset",
+        "fix",
+        "rollback",
+      ].map((value) => ({ value, label: value })),
     );
-    assert.deepEqual(
-      internals.getCacheOptimizerArgumentCompletions(" c "),
-      [{ value: "config", label: "config" }],
-    );
+    assert.deepEqual(internals.getCacheOptimizerArgumentCompletions(" c "), [
+      { value: "config", label: "config" },
+    ]);
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config "),
-      [{ value: "config footer-mode", label: "footer-mode" }],
+      [
+        { value: "config footer-mode", label: "footer-mode" },
+        { value: "config retention", label: "retention" },
+      ],
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config r"),
+      [{ value: "config retention", label: "retention" }],
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config retention "),
+      ["long", "short", "none", "startup"].map((value) => ({
+        value: `config retention ${value}`,
+        label: value,
+      })),
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config retention s"),
+      [
+        { value: "config retention short", label: "short" },
+        { value: "config retention startup", label: "startup" },
+      ],
+    );
+    assert.equal(
+      internals.getCacheOptimizerArgumentCompletions(
+        "config retention long extra",
+      ),
+      null,
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("stats "),
-      ["all", "contributors"].map((value) => ({ value: `stats ${value}`, label: value })),
+      ["all", "contributors"].map((value) => ({
+        value: `stats ${value}`,
+        label: value,
+      })),
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("stats a"),
@@ -190,20 +259,38 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config footer-mode "),
-      ["total", "session", "process"].map((value) => ({ value: `config footer-mode ${value}`, label: value })),
+      ["total", "session", "process"].map((value) => ({
+        value: `config footer-mode ${value}`,
+        label: value,
+      })),
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config footer-mode s"),
       [{ value: "config footer-mode session", label: "session" }],
     );
-    assert.deepEqual(
-      internals.getCacheOptimizerArgumentCompletions("fix p"),
-      [{ value: "fix prompt-cache-key", label: "prompt-cache-key" }],
+    assert.deepEqual(internals.getCacheOptimizerArgumentCompletions("fix p"), [
+      { value: "fix prompt-cache-key", label: "prompt-cache-key" },
+    ]);
+    assert.equal(
+      internals.getCacheOptimizerArgumentCompletions("unknown "),
+      null,
     );
-    assert.equal(internals.getCacheOptimizerArgumentCompletions("unknown "), null);
-    assert.equal(internals.getCacheOptimizerArgumentCompletions("config unknown "), null);
-    assert.equal(internals.getCacheOptimizerArgumentCompletions("config footer-mode session extra"), null);
-    assert.equal(internals.getCacheOptimizerArgumentCompletions(undefined as unknown as string), null);
+    assert.equal(
+      internals.getCacheOptimizerArgumentCompletions("config unknown "),
+      null,
+    );
+    assert.equal(
+      internals.getCacheOptimizerArgumentCompletions(
+        "config footer-mode session extra",
+      ),
+      null,
+    );
+    assert.equal(
+      internals.getCacheOptimizerArgumentCompletions(
+        undefined as unknown as string,
+      ),
+      null,
+    );
   });
 });
 
@@ -231,7 +318,8 @@ describe("footer stats modes", () => {
     totalInputTokens: 8000,
   };
   const statsByModel = {
-    [internals.makeSessionModelKey(sessionHash, model.provider, model.id)]: sessionStats,
+    [internals.makeSessionModelKey(sessionHash, model.provider, model.id)]:
+      sessionStats,
   };
   const totalsByModel = { [`${model.provider}/${model.id}`]: totalStats };
 
@@ -241,34 +329,49 @@ describe("footer stats modes", () => {
       source: "default",
     });
     assert.deepEqual(
-      internals.resolveFooterStatsMode(undefined, { PI_CACHE_OPTIMIZER_FOOTER_MODE: " SeSsIoN " }),
+      internals.resolveFooterStatsMode(undefined, {
+        PI_CACHE_OPTIMIZER_FOOTER_MODE: " SeSsIoN ",
+      }),
       { mode: "session", source: "env" },
     );
     assert.deepEqual(
-      internals.resolveFooterStatsMode(undefined, { PI_CACHE_OPTIMIZER_FOOTER_MODE: "TOTAL" }),
+      internals.resolveFooterStatsMode(undefined, {
+        PI_CACHE_OPTIMIZER_FOOTER_MODE: "TOTAL",
+      }),
       { mode: "total", source: "env" },
     );
     assert.deepEqual(
-      internals.resolveFooterStatsMode(undefined, { PI_CACHE_OPTIMIZER_FOOTER_MODE: "process" }),
+      internals.resolveFooterStatsMode(undefined, {
+        PI_CACHE_OPTIMIZER_FOOTER_MODE: "process",
+      }),
       { mode: "process", source: "env" },
     );
     assert.deepEqual(
-      internals.resolveFooterStatsMode(undefined, { PI_CACHE_OPTIMIZER_FOOTER_MODE: "daily" }),
+      internals.resolveFooterStatsMode(undefined, {
+        PI_CACHE_OPTIMIZER_FOOTER_MODE: "daily",
+      }),
       { mode: "session", source: "default" },
     );
     assert.equal(
-      internals.parsePersistedCacheOptimizerConfig({ version: 1, footerMode: "daily" }),
+      internals.parsePersistedCacheOptimizerConfig({
+        version: 1,
+        footerMode: "daily",
+      }),
       undefined,
     );
   });
 
   test("persistent configuration overrides the environment mode", () => {
     assert.deepEqual(
-      internals.resolveFooterStatsMode("total", { PI_CACHE_OPTIMIZER_FOOTER_MODE: "session" }),
+      internals.resolveFooterStatsMode("total", {
+        PI_CACHE_OPTIMIZER_FOOTER_MODE: "session",
+      }),
       { mode: "total", source: "config" },
     );
     assert.deepEqual(
-      internals.resolveFooterStatsMode("session", { PI_CACHE_OPTIMIZER_FOOTER_MODE: "total" }),
+      internals.resolveFooterStatsMode("session", {
+        PI_CACHE_OPTIMIZER_FOOTER_MODE: "total",
+      }),
       { mode: "session", source: "config" },
     );
   });
@@ -277,23 +380,57 @@ describe("footer stats modes", () => {
     const processStats = { ...sessionStats, totalRequests: 3, hitRequests: 2 };
     const processByModel = { [`${model.provider}/${model.id}`]: processStats };
     assert.equal(
-      internals.selectFooterStatsForModel("session", sessionHash, statsByModel, totalsByModel, model, processByModel),
+      internals.selectFooterStatsForModel(
+        "session",
+        sessionHash,
+        statsByModel,
+        totalsByModel,
+        model,
+        processByModel,
+      ),
       sessionStats,
     );
     assert.equal(
-      internals.selectFooterStatsForModel("total", sessionHash, statsByModel, totalsByModel, model, processByModel),
+      internals.selectFooterStatsForModel(
+        "total",
+        sessionHash,
+        statsByModel,
+        totalsByModel,
+        model,
+        processByModel,
+      ),
       totalStats,
     );
     assert.equal(
-      internals.selectFooterStatsForModel("process", sessionHash, statsByModel, totalsByModel, model, processByModel),
+      internals.selectFooterStatsForModel(
+        "process",
+        sessionHash,
+        statsByModel,
+        totalsByModel,
+        model,
+        processByModel,
+      ),
       processStats,
     );
     assert.equal(
-      internals.selectFooterStatsForModel("session", "fresh-session", statsByModel, totalsByModel, model, processByModel),
+      internals.selectFooterStatsForModel(
+        "session",
+        "fresh-session",
+        statsByModel,
+        totalsByModel,
+        model,
+        processByModel,
+      ),
       undefined,
     );
     assert.equal(
-      internals.selectFooterStatsForModel("process", "fresh-session", statsByModel, totalsByModel, model),
+      internals.selectFooterStatsForModel(
+        "process",
+        "fresh-session",
+        statsByModel,
+        totalsByModel,
+        model,
+      ),
       undefined,
     );
   });
@@ -341,14 +478,24 @@ describe("footer stats modes", () => {
     const persisted = {
       statsByModel: {
         ...statsByModel,
-        [internals.makeSessionModelKey("other-session", model.provider, model.id)]: totalStats,
+        [internals.makeSessionModelKey(
+          "other-session",
+          model.provider,
+          model.id,
+        )]: totalStats,
       },
       totalsByModel,
       legacyFamily: {},
     };
 
-    assert.deepEqual(internals.filterRestorableStatsForSession(persisted, sessionHash), statsByModel);
-    assert.deepEqual(internals.filterRestorableStatsForSession(persisted, "fresh-session"), {});
+    assert.deepEqual(
+      internals.filterRestorableStatsForSession(persisted, sessionHash),
+      statsByModel,
+    );
+    assert.deepEqual(
+      internals.filterRestorableStatsForSession(persisted, "fresh-session"),
+      {},
+    );
   });
 
   test("keeps router fallback inside the requested scope", () => {
@@ -364,7 +511,11 @@ describe("footer stats modes", () => {
     };
     const routedSessionStats = {
       ...statsByModel,
-      [internals.makeSessionModelKey(sessionHash, "anthropic", "claude-opus-5")]: otherSession,
+      [internals.makeSessionModelKey(
+        sessionHash,
+        "anthropic",
+        "claude-opus-5",
+      )]: otherSession,
     };
     const routedTotals = {
       ...totalsByModel,
@@ -398,40 +549,55 @@ describe("footer stats modes", () => {
       await internals.writePersistedFooterMode("session", configPath);
       assert.equal(internals.readPersistedFooterMode(configPath), "session");
       assert.deepEqual(
-        internals.parsePersistedCacheOptimizerConfig(JSON.parse(await readFile(configPath, "utf8"))),
+        internals.parsePersistedCacheOptimizerConfig(
+          JSON.parse(await readFile(configPath, "utf8")),
+        ),
         { version: 1, footerMode: "session" },
       );
-      assert.deepEqual(await readdir(tempDir), ["pi-cache-optimizer-config.json"]);
+      assert.deepEqual(await readdir(tempDir), [
+        "pi-cache-optimizer-config.json",
+      ]);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test("config command overrides the environment mode", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-footer-command-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-footer-command-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousFooterMode = process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE = "session";
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
-      const commands = new Map<string, {
-        handler: (args: string, context: any) => unknown;
-        getArgumentCompletions?: (argumentPrefix: string) => unknown;
-      }>();
-      freshModule.default({
-        on() {},
-        registerCommand(name: string, command: {
+      const commands = new Map<
+        string,
+        {
           handler: (args: string, context: any) => unknown;
           getArgumentCompletions?: (argumentPrefix: string) => unknown;
-        }) {
+        }
+      >();
+      freshModule.default({
+        on() {},
+        registerCommand(
+          name: string,
+          command: {
+            handler: (args: string, context: any) => unknown;
+            getArgumentCompletions?: (argumentPrefix: string) => unknown;
+          },
+        ) {
           commands.set(name, command);
         },
       } as any);
@@ -439,54 +605,79 @@ describe("footer stats modes", () => {
       const command = commands.get("cache-optimizer");
       assert.ok(command);
       assert.equal(typeof command.getArgumentCompletions, "function");
-      assert.deepEqual(command.getArgumentCompletions?.("config footer-mode s"), [
-        { value: "config footer-mode session", label: "session" },
-      ]);
+      assert.deepEqual(
+        command.getArgumentCompletions?.("config footer-mode s"),
+        [{ value: "config footer-mode session", label: "session" }],
+      );
       const notifications: Array<{ message: string; level: string }> = [];
       const commandContext = {
         model: undefined,
         hasUI: false,
         sessionManager: { getSessionId: () => "footer-command-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
-          notify: (message: string, level: string) => notifications.push({ message, level }),
+          notify: (message: string, level: string) =>
+            notifications.push({ message, level }),
           setStatus() {},
         },
       };
       const configPath = join(tempAgentDir, "pi-cache-optimizer-config.json");
 
       await command.handler("config footer-mode total", commandContext);
-      assert.equal(freshModule.__internals_for_tests.readPersistedFooterMode(configPath), "total");
-      assert.equal(freshModule.__internals_for_tests.footerStatsMode(), "total");
+      assert.equal(
+        freshModule.__internals_for_tests.readPersistedFooterMode(configPath),
+        "total",
+      );
+      assert.equal(
+        freshModule.__internals_for_tests.footerStatsMode(),
+        "total",
+      );
       assert.match(notifications.at(-1)?.message ?? "", /set to total/);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousFooterMode === undefined) delete process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
+      if (previousFooterMode === undefined)
+        delete process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
       else process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE = previousFooterMode;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("interactive menu exposes and applies footer mode", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-footer-menu-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-footer-menu-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousFooterMode = process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       delete process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
-      const commands = new Map<string, { handler: (args: string, context: any) => unknown }>();
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => unknown }
+      >();
       freshModule.default({
         on() {},
-        registerCommand(name: string, command: { handler: (args: string, context: any) => unknown }) {
+        registerCommand(
+          name: string,
+          command: { handler: (args: string, context: any) => unknown },
+        ) {
           commands.set(name, command);
         },
       } as any);
@@ -499,13 +690,18 @@ describe("footer stats modes", () => {
         model: undefined,
         hasUI: true,
         sessionManager: { getSessionId: () => "footer-menu-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
           notify: (message: string) => notifications.push(message),
           setStatus() {},
           select: async (title: string, options: string[]) => {
             selectCalls.push(title);
-            if (title === "Cache Optimizer") return options.find((option) => option.startsWith("Footer mode"));
+            if (title === "Cache Optimizer")
+              return options.find((option) => option.startsWith("Footer mode"));
             return options.find((option) => option.startsWith("process"));
           },
         },
@@ -514,14 +710,25 @@ describe("footer stats modes", () => {
 
       await command.handler("", commandContext);
 
-      assert.deepEqual(selectCalls, ["Cache Optimizer", "Footer cache stats mode"]);
-      assert.equal(freshModule.__internals_for_tests.readPersistedFooterMode(configPath), "process");
-      assert.equal(freshModule.__internals_for_tests.footerStatsMode(), "process");
+      assert.deepEqual(selectCalls, [
+        "Cache Optimizer",
+        "Footer cache stats mode",
+      ]);
+      assert.equal(
+        freshModule.__internals_for_tests.readPersistedFooterMode(configPath),
+        "process",
+      );
+      assert.equal(
+        freshModule.__internals_for_tests.footerStatsMode(),
+        "process",
+      );
       assert.match(notifications.at(-1) ?? "", /set to process/);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousFooterMode === undefined) delete process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
+      if (previousFooterMode === undefined)
+        delete process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE;
       else process.env.PI_CACHE_OPTIMIZER_FOOTER_MODE = previousFooterMode;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -552,10 +759,9 @@ describe("Pi 0.83 adaptive-thinking compatibility", () => {
     const model = claudeModel("claude-opus-5");
 
     assert.equal(internals.isAdaptiveThinkingCompatApplicable(model), true);
-    assert.deepEqual(
-      internals.describeMissingCacheCompatForModel(model),
-      ["forceAdaptiveThinking"],
-    );
+    assert.deepEqual(internals.describeMissingCacheCompatForModel(model), [
+      "forceAdaptiveThinking",
+    ]);
     assert.match(
       internals.buildAdaptiveThinkingCompatWarningText(
         "anthropic/claude-opus-5",
@@ -569,7 +775,10 @@ describe("Pi 0.83 adaptive-thinking compatibility", () => {
     const model = claudeModel("claude-opus-5", { forceAdaptiveThinking: true });
 
     assert.equal(internals.isAdaptiveThinkingCompatApplicable(model), true);
-    assert.deepEqual(internals.describeMissingAdaptiveThinkingCompat(model), []);
+    assert.deepEqual(
+      internals.describeMissingAdaptiveThinkingCompat(model),
+      [],
+    );
     assert.deepEqual(internals.describeMissingCacheCompatForModel(model), []);
   });
 
@@ -586,20 +795,31 @@ describe("explicit compat precedence", () => {
   const modelId = "builtin-model";
   const compatKey = "supportsLongCacheRetention";
 
-  function config(values: { provider?: boolean; model?: boolean; modelOverride?: boolean }) {
+  function config(values: {
+    provider?: boolean;
+    model?: boolean;
+    modelOverride?: boolean;
+  }) {
     return {
       providers: {
         [provider]: {
-          compat: values.provider === undefined ? {} : { [compatKey]: values.provider },
-          models: [{
-            id: modelId,
-            compat: values.model === undefined ? {} : { [compatKey]: values.model },
-          }],
+          compat:
+            values.provider === undefined
+              ? {}
+              : { [compatKey]: values.provider },
+          models: [
+            {
+              id: modelId,
+              compat:
+                values.model === undefined ? {} : { [compatKey]: values.model },
+            },
+          ],
           modelOverrides: {
             [modelId]: {
-              compat: values.modelOverride === undefined
-                ? {}
-                : { [compatKey]: values.modelOverride },
+              compat:
+                values.modelOverride === undefined
+                  ? {}
+                  : { [compatKey]: values.modelOverride },
             },
           },
         },
@@ -608,14 +828,22 @@ describe("explicit compat precedence", () => {
   }
 
   test("modelOverrides true wins over false model and provider values", () => {
-    const input = config({ provider: false, model: false, modelOverride: true });
+    const input = config({
+      provider: false,
+      model: false,
+      modelOverride: true,
+    });
 
     assert.deepEqual(
       internals.resolveExplicitCompatValue(input, provider, modelId, compatKey),
       { source: "modelOverride", value: true },
     );
     assert.equal(
-      internals.hasExplicitLongRetentionOptInFromConfig(input, provider, modelId),
+      internals.hasExplicitLongRetentionOptInFromConfig(
+        input,
+        provider,
+        modelId,
+      ),
       true,
     );
   });
@@ -628,7 +856,11 @@ describe("explicit compat precedence", () => {
       { source: "modelOverride", value: false },
     );
     assert.equal(
-      internals.hasExplicitLongRetentionOptInFromConfig(input, provider, modelId),
+      internals.hasExplicitLongRetentionOptInFromConfig(
+        input,
+        provider,
+        modelId,
+      ),
       false,
     );
   });
@@ -658,16 +890,27 @@ describe("explicit compat precedence", () => {
     const runtimeModel = {
       provider,
       id: modelId,
-      compat: { sendSessionAffinityHeaders: true, supportsLongCacheRetention: true },
+      compat: {
+        sendSessionAffinityHeaders: true,
+        supportsLongCacheRetention: true,
+      },
     } as any;
     const input = {
       providers: {
         [provider]: {
-          compat: { sendSessionAffinityHeaders: true, supportsLongCacheRetention: false },
-          models: [{
-            id: modelId,
-            compat: { sendSessionAffinityHeaders: false, supportsDeveloperRole: false },
-          }],
+          compat: {
+            sendSessionAffinityHeaders: true,
+            supportsLongCacheRetention: false,
+          },
+          models: [
+            {
+              id: modelId,
+              compat: {
+                sendSessionAffinityHeaders: false,
+                supportsDeveloperRole: false,
+              },
+            },
+          ],
           modelOverrides: {
             [modelId]: { compat: { supportsLongCacheRetention: false } },
           },
@@ -689,20 +932,37 @@ describe("explicit compat precedence", () => {
         {
           providers: {
             [provider]: {
-              compat: { openRouterRouting: { allow_fallbacks: false, only: ["openai"] } },
-              models: [{ id: modelId, compat: { openRouterRouting: { order: ["openai", "anthropic"] } } }],
+              compat: {
+                openRouterRouting: { allow_fallbacks: false, only: ["openai"] },
+              },
+              models: [
+                {
+                  id: modelId,
+                  compat: {
+                    openRouterRouting: { order: ["openai", "anthropic"] },
+                  },
+                },
+              ],
             },
           },
         },
       ).openRouterRouting,
-      { allow_fallbacks: false, only: ["openai"], order: ["openai", "anthropic"] },
+      {
+        allow_fallbacks: false,
+        only: ["openai"],
+        order: ["openai", "anthropic"],
+      },
     );
     const overrideInput = {
       providers: {
         [provider]: {
           compat: { sendSessionAffinityHeaders: true },
-          models: [{ id: modelId, compat: { sendSessionAffinityHeaders: false } }],
-          modelOverrides: { [modelId]: { compat: { sendSessionAffinityHeaders: true } } },
+          models: [
+            { id: modelId, compat: { sendSessionAffinityHeaders: false } },
+          ],
+          modelOverrides: {
+            [modelId]: { compat: { sendSessionAffinityHeaders: true } },
+          },
         },
       },
     };
@@ -751,11 +1011,17 @@ describe("explicit compat precedence", () => {
     };
 
     assert.equal(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, input).sendSessionAffinityHeaders,
+      internals.resolveEffectiveCompatFromConfig(runtimeModel, input)
+        .sendSessionAffinityHeaders,
       true,
     );
     assert.deepEqual(
-      internals.resolveExplicitCompatValue(input, provider, modelId, "sendSessionAffinityHeaders"),
+      internals.resolveExplicitCompatValue(
+        input,
+        provider,
+        modelId,
+        "sendSessionAffinityHeaders",
+      ),
       { source: "model", value: true },
     );
     assert.deepEqual(
@@ -763,7 +1029,11 @@ describe("explicit compat precedence", () => {
         { ...runtimeModel, api: "", baseUrl: "" },
         input,
       ),
-      { ...runtimeModel, api: "openai-completions", baseUrl: "https://last.example/v1" },
+      {
+        ...runtimeModel,
+        api: "openai-completions",
+        baseUrl: "https://last.example/v1",
+      },
     );
   });
 
@@ -774,11 +1044,14 @@ describe("explicit compat precedence", () => {
       compat: { sendSessionAffinityHeaders: true },
     } as any;
     assert.equal(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, undefined).sendSessionAffinityHeaders,
+      internals.resolveEffectiveCompatFromConfig(runtimeModel, undefined)
+        .sendSessionAffinityHeaders,
       true,
     );
     assert.equal(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, { providers: "invalid" }).sendSessionAffinityHeaders,
+      internals.resolveEffectiveCompatFromConfig(runtimeModel, {
+        providers: "invalid",
+      }).sendSessionAffinityHeaders,
       true,
     );
   });
@@ -827,10 +1100,13 @@ describe("explicit compat precedence", () => {
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
@@ -858,23 +1134,35 @@ describe("explicit compat precedence", () => {
           maxTokens: 4096,
         },
         sessionManager: { getSessionId: () => "review-test-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: { notify() {}, setStatus() {} },
       };
 
       await writeFile(
         join(tempAgentDir, "models.json"),
-        JSON.stringify(config({ provider: true, model: true, modelOverride: false })),
+        JSON.stringify(
+          config({ provider: true, model: true, modelOverride: false }),
+        ),
       );
-      const deniedPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+      const deniedPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
       hook({ payload: deniedPayload }, context);
       assert.equal("prompt_cache_retention" in deniedPayload, false);
 
       await writeFile(
         join(tempAgentDir, "models.json"),
-        JSON.stringify(config({ provider: false, model: false, modelOverride: true })),
+        JSON.stringify(
+          config({ provider: false, model: false, modelOverride: true }),
+        ),
       );
-      const allowedPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+      const allowedPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
       hook({ payload: allowedPayload }, context);
       assert.equal(allowedPayload.prompt_cache_retention, "24h");
 
@@ -889,13 +1177,17 @@ describe("explicit compat precedence", () => {
           },
         }),
       );
-      const invalidConfigPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+      const invalidConfigPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
       hook({ payload: invalidConfigPayload }, context);
       assert.equal("prompt_cache_retention" in invalidConfigPayload, false);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -904,7 +1196,9 @@ describe("explicit compat precedence", () => {
 
 describe("provider response recovery", () => {
   test("body-only prompt_cache_retention errors disable the field on the next request", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-retention-recovery-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-retention-recovery-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
 
@@ -915,23 +1209,28 @@ describe("provider response recovery", () => {
         JSON.stringify({
           providers: {
             proxy: {
-              models: [{
-                id: "gpt-5.5",
-                compat: {
-                  supportsLongCacheRetention: true,
-                  sendSessionAffinityHeaders: true,
+              models: [
+                {
+                  id: "gpt-5.5",
+                  compat: {
+                    supportsLongCacheRetention: true,
+                    sendSessionAffinityHeaders: true,
+                  },
                 },
-              }],
+              ],
             },
           },
         }),
         "utf8",
       );
 
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
@@ -963,9 +1262,15 @@ describe("provider response recovery", () => {
       const context = {
         model,
         sessionManager: { getSessionId: () => "retention-recovery-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
-          notify(message: string) { notifications.push(message); },
+          notify(message: string) {
+            notifications.push(message);
+          },
           setStatus() {},
         },
       };
@@ -974,53 +1279,74 @@ describe("provider response recovery", () => {
       assert.ok(requestHook);
       assert.ok(messageEndHook);
 
-      const firstPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+      const firstPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
       requestHook({ payload: firstPayload }, context);
       assert.equal(firstPayload.prompt_cache_retention, "24h");
 
-      await messageEndHook({
-        message: {
-          role: "assistant",
-          provider: "proxy",
-          model: "gpt-5.5",
-          api: "openai-completions",
-          stopReason: "error",
-          errorMessage: "400 Bad request: prompt_cache_retention must be one of 24h or in-memory",
-          usage: { input: 0, cacheRead: 0, cacheWrite: 0 },
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            provider: "proxy",
+            model: "gpt-5.5",
+            api: "openai-completions",
+            stopReason: "error",
+            errorMessage:
+              "400 Bad request: prompt_cache_retention must be one of 24h or in-memory",
+            usage: { input: 0, cacheRead: 0, cacheWrite: 0 },
+          },
         },
-      }, context);
+        context,
+      );
 
-      const valueErrorPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+      const valueErrorPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
       requestHook({ payload: valueErrorPayload }, context);
       assert.equal(valueErrorPayload.prompt_cache_retention, "24h");
 
-      await messageEndHook({
-        message: {
-          role: "assistant",
-          provider: "proxy",
-          model: "gpt-5.5",
-          api: "openai-completions",
-          stopReason: "error",
-          errorMessage: "400 Unsupported parameter: prompt_cache_retention",
-          usage: { input: 0, cacheRead: 0, cacheWrite: 0 },
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            provider: "proxy",
+            model: "gpt-5.5",
+            api: "openai-completions",
+            stopReason: "error",
+            errorMessage: "400 Unsupported parameter: prompt_cache_retention",
+            usage: { input: 0, cacheRead: 0, cacheWrite: 0 },
+          },
         },
-      }, context);
+        context,
+      );
 
-      const unsupportedPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+      const unsupportedPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
       requestHook({ payload: unsupportedPayload }, context);
       assert.equal("prompt_cache_retention" in unsupportedPayload, false);
-      assert.ok(notifications.some((message) => message.includes("prompt_cache_retention")));
+      assert.ok(
+        notifications.some((message) =>
+          message.includes("prompt_cache_retention"),
+        ),
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("routed body-only errors use assistant provider/model identity without a live registry", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-routed-retention-recovery-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-routed-retention-recovery-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
 
@@ -1031,20 +1357,25 @@ describe("provider response recovery", () => {
         JSON.stringify({
           providers: {
             proxy: {
-              models: [{
-                id: "gpt-5.5",
-                compat: { supportsLongCacheRetention: true },
-              }],
+              models: [
+                {
+                  id: "gpt-5.5",
+                  compat: { supportsLongCacheRetention: true },
+                },
+              ],
             },
           },
         }),
         "utf8",
       );
 
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
@@ -1079,8 +1410,14 @@ describe("provider response recovery", () => {
         compat: { supportsLongCacheRetention: true },
       };
       const baseContext = {
-        sessionManager: { getSessionId: () => "routed-retention-recovery-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        sessionManager: {
+          getSessionId: () => "routed-retention-recovery-session",
+        },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: { notify() {}, setStatus() {} },
       };
       const requestHook = handlers.get("before_provider_request");
@@ -1088,25 +1425,35 @@ describe("provider response recovery", () => {
       assert.ok(requestHook);
       assert.ok(messageEndHook);
 
-      await messageEndHook({
-        message: {
-          role: "assistant",
-          provider: "proxy",
-          model: "gpt-5.5",
-          api: "openai-completions",
-          stopReason: "error",
-          errorMessage: "400 Unsupported parameter: prompt_cache_retention",
-          usage: { input: 0, cacheRead: 0, cacheWrite: 0 },
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            provider: "proxy",
+            model: "gpt-5.5",
+            api: "openai-completions",
+            stopReason: "error",
+            errorMessage: "400 Unsupported parameter: prompt_cache_retention",
+            usage: { input: 0, cacheRead: 0, cacheWrite: 0 },
+          },
         },
-      }, { ...baseContext, model: routerModel });
+        { ...baseContext, model: routerModel },
+      );
 
-      const nextPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
-      requestHook({ payload: nextPayload }, { ...baseContext, model: upstreamModel });
+      const nextPayload: Record<string, unknown> = {
+        prompt_cache_retention: "24h",
+      };
+      requestHook(
+        { payload: nextPayload },
+        { ...baseContext, model: upstreamModel },
+      );
       assert.equal("prompt_cache_retention" in nextPayload, false);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -1142,14 +1489,30 @@ describe("modelOverrides JSONC fixes", () => {
     const location = internals.locateModelInJsonc(original, provider, modelId);
 
     assert.ok(location);
-    assert.deepEqual(internals.chooseFixPlacement(original, location, compatKeys, provider), {
-      placement: "modelOverride",
-      reason: "an existing modelOverrides entry has Pi's highest precedence — repairing it directly",
-    });
+    assert.deepEqual(
+      internals.chooseFixPlacement(original, location, compatKeys, provider),
+      {
+        placement: "modelOverride",
+        reason:
+          "an existing modelOverrides entry has Pi's highest precedence — repairing it directly",
+      },
+    );
 
-    const modified = internals.composeFixInsertion(original, location, compatKeys, "modelOverride");
+    const modified = internals.composeFixInsertion(
+      original,
+      location,
+      compatKeys,
+      "modelOverride",
+    );
     assert.equal(
-      internals.selfCheckFix(original, modified, provider, modelId, compatKeys, "modelOverride"),
+      internals.selfCheckFix(
+        original,
+        modified,
+        provider,
+        modelId,
+        compatKeys,
+        "modelOverride",
+      ),
       null,
     );
     assert.match(modified, /\/\/ Keep this explanation\./);
@@ -1182,9 +1545,21 @@ describe("modelOverrides JSONC fixes", () => {
     const location = internals.locateModelInJsonc(original, provider, modelId);
     assert.ok(location);
 
-    const wronglyModified = internals.composeFixInsertion(original, location, compatKeys, "provider");
+    const wronglyModified = internals.composeFixInsertion(
+      original,
+      location,
+      compatKeys,
+      "provider",
+    );
     assert.match(
-      internals.selfCheckFix(original, wronglyModified, provider, modelId, compatKeys, "provider") ?? "",
+      internals.selfCheckFix(
+        original,
+        wronglyModified,
+        provider,
+        modelId,
+        compatKeys,
+        "provider",
+      ) ?? "",
       /effective compat\.supportsLongCacheRetention has wrong value/,
     );
   });
@@ -1317,8 +1692,14 @@ describe("modelOverrides JSONC fixes", () => {
     ];
 
     for (const text of cases) {
-      assert.equal(internals.locateModelInJsonc(text, provider, modelId), undefined);
-      assert.equal(internals.analyzeModelsJsonForMissingEntry(text, provider, modelId), undefined);
+      assert.equal(
+        internals.locateModelInJsonc(text, provider, modelId),
+        undefined,
+      );
+      assert.equal(
+        internals.analyzeModelsJsonForMissingEntry(text, provider, modelId),
+        undefined,
+      );
     }
   });
 
@@ -1383,7 +1764,10 @@ describe("modelOverrides JSONC fixes", () => {
       ),
       null,
     );
-    assert.match(result.modifiedText, /\/\/ Authentication and endpoint configuration stay untouched\./);
+    assert.match(
+      result.modifiedText,
+      /\/\/ Authentication and endpoint configuration stay untouched\./,
+    );
     assert.doesNotMatch(result.modifiedText, /"models"\s*:/);
     assert.match(result.modifiedText, /"modelOverrides"\s*:/);
     assert.match(result.modifiedText, /"apiKey": "env:PROXY_API_KEY"/);
@@ -1413,7 +1797,10 @@ describe("modelOverrides JSONC fixes", () => {
       ),
       null,
     );
-    assert.match(result.modifiedText, /\/\/ Other provider entries may be added here\./);
+    assert.match(
+      result.modifiedText,
+      /\/\/ Other provider entries may be added here\./,
+    );
     assert.doesNotMatch(result.modifiedText, /"models"\s*:/);
     assert.deepEqual(
       internals.resolveExplicitCompatValue(
@@ -1428,50 +1815,81 @@ describe("modelOverrides JSONC fixes", () => {
 });
 
 describe("DeepSeek protocol-first compatibility", () => {
-  const model = (compat: Record<string, unknown> = {}, overrides: Partial<Record<string, unknown>> = {}) => ({
-    provider: "amd-radeon",
-    id: "DeepSeek-V4-Flash",
-    name: "DeepSeek V4 Flash",
-    api: "openai-completions",
-    baseUrl: "https://developer.amd.com.cn/radeon/api/v1",
-    compat,
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128_000,
-    maxTokens: 8192,
-    ...overrides,
-  }) as any;
+  const model = (
+    compat: Record<string, unknown> = {},
+    overrides: Partial<Record<string, unknown>> = {},
+  ) =>
+    ({
+      provider: "amd-radeon",
+      id: "DeepSeek-V4-Flash",
+      name: "DeepSeek V4 Flash",
+      api: "openai-completions",
+      baseUrl: "https://developer.amd.com.cn/radeon/api/v1",
+      compat,
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 8192,
+      ...overrides,
+    }) as any;
 
   test("does not infer DeepSeek wire protocol from the family name or reasoning effort support", () => {
     const current = model({ supportsReasoningEffort: true });
     assert.equal(internals.isDeepSeekWireCompatApplicable(current), false);
     assert.deepEqual(internals.describeMissingDeepSeekCompat(current), []);
-    assert.deepEqual(internals.buildDeepSeekCompatSuggestion(["sendSessionAffinityHeaders"]), {
-      sendSessionAffinityHeaders: true,
-    });
+    assert.deepEqual(
+      internals.buildDeepSeekCompatSuggestion(["sendSessionAffinityHeaders"]),
+      {
+        sendSessionAffinityHeaders: true,
+      },
+    );
     assert.doesNotMatch(
-      internals.buildOpenAIProxyCompatWarningText("amd-radeon/DeepSeek-V4-Flash", ["sendSessionAffinityHeaders"]),
+      internals.buildOpenAIProxyCompatWarningText(
+        "amd-radeon/DeepSeek-V4-Flash",
+        ["sendSessionAffinityHeaders"],
+      ),
       /thinkingFormat|requiresReasoningContent/,
     );
   });
 
   test("keeps generic proxy diagnostics for absent and explicit non-DeepSeek formats", () => {
-    for (const thinkingFormat of [undefined, "openai", "qwen", "openrouter", "together"]) {
-      const current = model({ supportsReasoningEffort: true, ...(thinkingFormat ? { thinkingFormat } : {}) });
+    for (const thinkingFormat of [
+      undefined,
+      "openai",
+      "qwen",
+      "openrouter",
+      "together",
+    ]) {
+      const current = model({
+        supportsReasoningEffort: true,
+        ...(thinkingFormat ? { thinkingFormat } : {}),
+      });
       assert.equal(internals.isDeepSeekWireCompatApplicable(current), false);
       assert.deepEqual(internals.describeMissingDeepSeekCompat(current), []);
-      assert.deepEqual(internals.describeMissingCacheCompatForModel(current), ["sendSessionAffinityHeaders"]);
+      assert.deepEqual(internals.describeMissingCacheCompatForModel(current), [
+        "sendSessionAffinityHeaders",
+      ]);
       const suggestion = internals.buildFixSuggestion(current);
-      assert.deepEqual(suggestion?.compatKeys, { sendSessionAffinityHeaders: true });
-      assert.doesNotMatch(JSON.stringify(suggestion), /thinkingFormat|requiresReasoningContent/);
+      assert.deepEqual(suggestion?.compatKeys, {
+        sendSessionAffinityHeaders: true,
+      });
+      assert.doesNotMatch(
+        JSON.stringify(suggestion),
+        /thinkingFormat|requiresReasoningContent/,
+      );
     }
   });
 
   test("uses explicit DeepSeek format only for replay diagnostics and never lists the format itself", () => {
-    const current = model({ thinkingFormat: "deepseek", supportsReasoningEffort: true });
+    const current = model({
+      thinkingFormat: "deepseek",
+      supportsReasoningEffort: true,
+    });
     assert.equal(internals.isDeepSeekWireCompatApplicable(current), true);
-    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), ["requiresReasoningContentOnAssistantMessages"]);
+    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), [
+      "requiresReasoningContentOnAssistantMessages",
+    ]);
     assert.deepEqual(internals.describeMissingCacheCompatForModel(current), [
       "sendSessionAffinityHeaders",
       "requiresReasoningContentOnAssistantMessages",
@@ -1485,66 +1903,108 @@ describe("DeepSeek protocol-first compatibility", () => {
   });
 
   test("requires explicit error evidence before proposing a model-scoped protocol repair", () => {
-    const current = model({ thinkingFormat: "deepseek", supportsReasoningEffort: true });
-    assert.equal(internals.buildReasoningProtocolFixSuggestion(current), undefined);
-    assert.deepEqual(internals.buildReasoningProtocolFixSuggestion(
-      model({
-        thinkingFormat: "deepseek",
-        supportsReasoningEffort: true,
-        requiresReasoningContentOnAssistantMessages: true,
+    const current = model({
+      thinkingFormat: "deepseek",
+      supportsReasoningEffort: true,
+    });
+    assert.equal(
+      internals.buildReasoningProtocolFixSuggestion(current),
+      undefined,
+    );
+    assert.deepEqual(
+      internals.buildReasoningProtocolFixSuggestion(
+        model({
+          thinkingFormat: "deepseek",
+          supportsReasoningEffort: true,
+          requiresReasoningContentOnAssistantMessages: true,
+        }),
+        true,
+      )?.compatKeys,
+      {
+        thinkingFormat: "openai",
+        requiresReasoningContentOnAssistantMessages: false,
+      },
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionText(
+        "400 Unsupported parameter: thinking. Use reasoning_effort instead.",
+      ),
+      true,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionText(
+        "400 Unsupported parameter: reasoning_effort. Use thinking instead.",
+      ),
+      false,
+    );
+    for (const message of [
+      "400 Invalid parameter: thinking. Use reasoning_effort instead.",
+      "thinking is not accepted; reasoning_effort is required.",
+      "thinking is disallowed; please use reasoning_effort.",
+      "thinking is not a valid field; set reasoning_effort.",
+      "thinking is rejected; replace thinking with reasoning_effort.",
+    ]) {
+      assert.equal(
+        internals.hasReasoningProtocolRejectionText(message),
+        true,
+        message,
+      );
+    }
+    for (const message of [
+      "400 Invalid parameter: reasoning_effort. Use thinking instead.",
+      "reasoning_effort is not accepted; use thinking instead.",
+      "thinking is unsupported; reasoning_effort should not be used either.",
+      "thinking is unsupported; reasoning_effort is supported but disabled for this account.",
+      "thinking is unsupported; reasoning_effort must not be sent.",
+      "thinking is unsupported; do not use reasoning_effort.",
+      "thinking is unsupported; reasoning_effort is not required.",
+      "thinking is unsupported! do not use reasoning_effort.",
+      "The docs mention thinking and reasoning_effort, but no parameter was rejected.",
+    ]) {
+      assert.equal(
+        internals.hasReasoningProtocolRejectionText(message),
+        false,
+        message,
+      );
+    }
+    assert.equal(
+      internals.hasReasoningProtocolRejectionSignal({
+        "x-provider-error": "thinking is unsupported",
+        "x-provider-doc": "use reasoning_effort for a different endpoint",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionSignal({
+        "x-provider-error":
+          "thinking is unsupported; use reasoning_effort instead",
       }),
       true,
-    )?.compatKeys, {
-      thinkingFormat: "openai",
-      requiresReasoningContentOnAssistantMessages: false,
-    });
-    assert.equal(internals.hasReasoningProtocolRejectionText(
-      '400 Unsupported parameter: thinking. Use reasoning_effort instead.',
-    ), true);
-    assert.equal(internals.hasReasoningProtocolRejectionText(
-      '400 Unsupported parameter: reasoning_effort. Use thinking instead.',
-    ), false);
-    for (const message of [
-      '400 Invalid parameter: thinking. Use reasoning_effort instead.',
-      'thinking is not accepted; reasoning_effort is required.',
-      'thinking is disallowed; please use reasoning_effort.',
-      'thinking is not a valid field; set reasoning_effort.',
-      'thinking is rejected; replace thinking with reasoning_effort.',
-    ]) {
-      assert.equal(internals.hasReasoningProtocolRejectionText(message), true, message);
-    }
-    for (const message of [
-      '400 Invalid parameter: reasoning_effort. Use thinking instead.',
-      'reasoning_effort is not accepted; use thinking instead.',
-      'thinking is unsupported; reasoning_effort should not be used either.',
-      'thinking is unsupported; reasoning_effort is supported but disabled for this account.',
-      'thinking is unsupported; reasoning_effort must not be sent.',
-      'thinking is unsupported; do not use reasoning_effort.',
-      'thinking is unsupported; reasoning_effort is not required.',
-      'thinking is unsupported! do not use reasoning_effort.',
-      'The docs mention thinking and reasoning_effort, but no parameter was rejected.',
-    ]) {
-      assert.equal(internals.hasReasoningProtocolRejectionText(message), false, message);
-    }
-    assert.equal(internals.hasReasoningProtocolRejectionSignal({
-      "x-provider-error": "thinking is unsupported",
-      "x-provider-doc": "use reasoning_effort for a different endpoint",
-    }), false);
-    assert.equal(internals.hasReasoningProtocolRejectionSignal({
-      "x-provider-error": "thinking is unsupported; use reasoning_effort instead",
-    }), true);
+    );
 
     const protocolFix = internals.buildReasoningProtocolFixSuggestion(current);
     assert.equal(protocolFix, undefined);
     for (const thinkingFormat of ["qwen", "openrouter", "together"]) {
       assert.equal(
-        internals.buildReasoningProtocolFixSuggestion(model({ thinkingFormat }), true),
+        internals.buildReasoningProtocolFixSuggestion(
+          model({ thinkingFormat }),
+          true,
+        ),
         undefined,
         thinkingFormat,
       );
     }
-    assert.equal(internals.buildReasoningProtocolFixSuggestion(model({ thinkingFormat: "openai" }), true)?.compatKeys.thinkingFormat, undefined);
-    assert.equal(internals.isReasoningProtocolRejectionSignalApplicable(current), true);
+    assert.equal(
+      internals.buildReasoningProtocolFixSuggestion(
+        model({ thinkingFormat: "openai" }),
+        true,
+      )?.compatKeys.thinkingFormat,
+      undefined,
+    );
+    assert.equal(
+      internals.isReasoningProtocolRejectionSignalApplicable(current),
+      true,
+    );
   });
 
   test("matches only the exact model identity for finalized assistant evidence", () => {
@@ -1555,53 +2015,106 @@ describe("DeepSeek protocol-first compatibility", () => {
       model: current.id,
       status: 400,
       stopReason: "error",
-      errorMessage: 'Unsupported parameter: thinking; use reasoning_effort instead.',
+      errorMessage:
+        "Unsupported parameter: thinking; use reasoning_effort instead.",
     };
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage(matching), true);
-    assert.equal(internals.isReasoningProtocolRejectionForModel(matching, current), true);
     assert.equal(
-      internals.hasReasoningProtocolRejectionErrorMessage({ ...matching, status: 422 }),
+      internals.hasReasoningProtocolRejectionErrorMessage(matching),
+      true,
+    );
+    assert.equal(
+      internals.isReasoningProtocolRejectionForModel(matching, current),
+      true,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: 422,
+      }),
       false,
     );
     assert.equal(
-      internals.hasReasoningProtocolRejectionErrorMessage({ ...matching, status: undefined }),
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: undefined,
+      }),
       false,
     );
-    assert.equal(internals.isReasoningProtocolRejectionForModel({ ...matching, model: "DeepSeek-V4-Other" }, current), false);
-    assert.equal(internals.isReasoningProtocolRejectionForModel({ ...matching, provider: "other" }, current), false);
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({ ...matching, stopReason: "stop" }), false);
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
-      ...matching,
-      status: undefined,
-      errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
-    }), true);
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
-      ...matching,
-      status: undefined,
-      diagnostics: [{ details: { statusCode: 400 } }],
-    }), true);
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
-      ...matching,
-      status: undefined,
-      details: { error: { httpStatus: 400 } },
-    }), true);
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
-      ...matching,
-      status: undefined,
-      diagnostics: [{ details: { statusCode: 422 } }],
-    }), false);
-    assert.equal(internals.hasReasoningProtocolRejectionErrorMessage({
-      ...matching,
-      status: undefined,
-      errorMessage: "DeepSeek model: 422 Unsupported parameter: thinking. Use reasoning_effort instead.",
-    }), false);
-    assert.equal(internals.hasReasoningProtocolRejectionText(
-      "Unsupported parameter: thinking. reasoning_effort is unsupported.",
-    ), false);
+    assert.equal(
+      internals.isReasoningProtocolRejectionForModel(
+        { ...matching, model: "DeepSeek-V4-Other" },
+        current,
+      ),
+      false,
+    );
+    assert.equal(
+      internals.isReasoningProtocolRejectionForModel(
+        { ...matching, provider: "other" },
+        current,
+      ),
+      false,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        stopReason: "stop",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: undefined,
+        errorMessage:
+          "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
+      }),
+      true,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: undefined,
+        diagnostics: [{ details: { statusCode: 400 } }],
+      }),
+      true,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: undefined,
+        details: { error: { httpStatus: 400 } },
+      }),
+      true,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: undefined,
+        diagnostics: [{ details: { statusCode: 422 } }],
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionErrorMessage({
+        ...matching,
+        status: undefined,
+        errorMessage:
+          "DeepSeek model: 422 Unsupported parameter: thinking. Use reasoning_effort instead.",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasReasoningProtocolRejectionText(
+        "Unsupported parameter: thinking. reasoning_effort is unsupported.",
+      ),
+      false,
+    );
   });
 
   test("correlates response-header evidence with the request model, not a later selection", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-reasoning-correlation-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-reasoning-correlation-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     const modelsPath = join(tempAgentDir, "models.json");
@@ -1621,20 +2134,29 @@ describe("DeepSeek protocol-first compatibility", () => {
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       await writeFile(modelsPath, JSON.stringify(config), "utf8");
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
       const handlers = new Map<string, (event: any, context: any) => unknown>();
-      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => Promise<void> }
+      >();
       freshModule.default({
         on(name: string, handler: (event: any, context: any) => unknown) {
           handlers.set(name, handler);
         },
-        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
+        registerCommand(
+          name: string,
+          command: { handler: (args: string, context: any) => Promise<void> },
+        ) {
           commands.set(name, command);
         },
       } as any);
@@ -1657,7 +2179,11 @@ describe("DeepSeek protocol-first compatibility", () => {
       const notifications: string[] = [];
       const baseContext = {
         sessionManager: { getSessionId: () => "reasoning-correlation-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
           notify: (message: string) => notifications.push(message),
           setStatus() {},
@@ -1673,24 +2199,38 @@ describe("DeepSeek protocol-first compatibility", () => {
       assert.ok(messageEndHook);
       assert.ok(command);
 
-      requestHook(
-        { payload: {} },
-        { ...baseContext, model: modelA },
-      );
+      requestHook({ payload: {} }, { ...baseContext, model: modelA });
       await responseHook(
         {
           status: 400,
-          headers: { "x-provider-error": "Unsupported parameter: thinking. Use reasoning_effort instead." },
+          headers: {
+            "x-provider-error":
+              "Unsupported parameter: thinking. Use reasoning_effort instead.",
+          },
         },
         { ...baseContext, model: modelB },
       );
 
-      assert.ok(notifications.some((message) => message.includes("proxy-a/deepseek-a")));
-      assert.equal(notifications.some((message) => message.includes("Unsupported parameter")), false);
+      assert.ok(
+        notifications.some((message) => message.includes("proxy-a/deepseek-a")),
+      );
+      assert.equal(
+        notifications.some((message) =>
+          message.includes("Unsupported parameter"),
+        ),
+        false,
+      );
       // Complete request A so its response record cannot be mistaken for a
       // later request that fails before after_provider_response.
       await messageEndHook(
-        { message: { role: "assistant", stopReason: "error", errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead." } },
+        {
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage:
+              "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
+          },
+        },
         { ...baseContext, model: modelB },
       );
 
@@ -1698,7 +2238,10 @@ describe("DeepSeek protocol-first compatibility", () => {
         ...baseContext,
         model: modelA,
         hasUI: false,
-        ui: { ...baseContext.ui, notify: (message: string) => notifications.push(message) },
+        ui: {
+          ...baseContext.ui,
+          notify: (message: string) => notifications.push(message),
+        },
       });
       const modelAFixGuidance = notifications.at(-1) ?? "";
       assert.match(modelAFixGuidance, /thinkingFormat/);
@@ -1707,7 +2250,10 @@ describe("DeepSeek protocol-first compatibility", () => {
         ...baseContext,
         model: modelB,
         hasUI: false,
-        ui: { ...baseContext.ui, notify: (message: string) => notifications.push(message) },
+        ui: {
+          ...baseContext.ui,
+          notify: (message: string) => notifications.push(message),
+        },
       });
       const modelBFixGuidance = notifications.at(-1) ?? "";
       assert.doesNotMatch(modelBFixGuidance, /thinkingFormat/);
@@ -1716,23 +2262,32 @@ describe("DeepSeek protocol-first compatibility", () => {
       // Keep its request-local identity even when the active model has changed.
       const modelC = makeModel("proxy-c", "deepseek-c", "DeepSeek C");
       const notificationCountBeforeMessage = notifications.length;
-      requestHook(
-        { payload: {} },
-        { ...baseContext, model: modelC },
-      );
+      requestHook({ payload: {} }, { ...baseContext, model: modelC });
       await messageEndHook(
         {
           message: {
             role: "assistant",
             stopReason: "error",
-            errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
+            errorMessage:
+              "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
           },
         },
         { ...baseContext, model: modelB },
       );
-      const newNotifications = notifications.slice(notificationCountBeforeMessage);
-      assert.ok(newNotifications.some((message) => message.includes("proxy-c/deepseek-c")));
-      assert.equal(newNotifications.some((message) => message.includes("proxy-b/deepseek-b")), false);
+      const newNotifications = notifications.slice(
+        notificationCountBeforeMessage,
+      );
+      assert.ok(
+        newNotifications.some((message) =>
+          message.includes("proxy-c/deepseek-c"),
+        ),
+      );
+      assert.equal(
+        newNotifications.some((message) =>
+          message.includes("proxy-b/deepseek-b"),
+        ),
+        false,
+      );
 
       // A completed response must keep its own identity even if a later request
       // starts before its finalized assistant message is emitted.
@@ -1740,17 +2295,37 @@ describe("DeepSeek protocol-first compatibility", () => {
       const modelE = makeModel("proxy-e", "deepseek-e", "DeepSeek E");
       requestHook({ payload: {} }, { ...baseContext, model: modelD });
       await responseHook(
-        { status: 400, headers: { "x-provider-error": "Unsupported parameter: thinking. Use reasoning_effort instead." } },
+        {
+          status: 400,
+          headers: {
+            "x-provider-error":
+              "Unsupported parameter: thinking. Use reasoning_effort instead.",
+          },
+        },
         { ...baseContext, model: modelD },
       );
       requestHook({ payload: {} }, { ...baseContext, model: modelE });
       const beforeInterleavedMessage = notifications.length;
       await messageEndHook(
-        { message: { role: "assistant", stopReason: "error", errorMessage: "400: Unsupported parameter: thinking. Use reasoning_effort instead." } },
+        {
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage:
+              "400: Unsupported parameter: thinking. Use reasoning_effort instead.",
+          },
+        },
         { ...baseContext, model: modelE },
       );
-      const interleavedNotifications = notifications.slice(beforeInterleavedMessage);
-      assert.equal(interleavedNotifications.some((message) => message.includes("proxy-e/deepseek-e")), false);
+      const interleavedNotifications = notifications.slice(
+        beforeInterleavedMessage,
+      );
+      assert.equal(
+        interleavedNotifications.some((message) =>
+          message.includes("proxy-e/deepseek-e"),
+        ),
+        false,
+      );
 
       const keyModel = makeModel("proxy-key", "gpt-key", "GPT Key");
       requestHook({ payload: {} }, { ...baseContext, model: keyModel });
@@ -1769,28 +2344,45 @@ describe("DeepSeek protocol-first compatibility", () => {
         ...baseContext,
         model: keyModel,
         hasUI: false,
-        ui: { ...baseContext.ui, notify: (message: string) => notifications.push(message) },
+        ui: {
+          ...baseContext.ui,
+          notify: (message: string) => notifications.push(message),
+        },
       });
-      assert.match(notifications.at(-1) ?? "", /prompt(?:[_ ]?cache){1,2}[_ ]?key/i);
+      assert.match(
+        notifications.at(-1) ?? "",
+        /prompt(?:[_ ]?cache){1,2}[_ ]?key/i,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("concurrent cross-model responses do not turn ambiguous headers into model-scoped evidence", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-response-ambiguity-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-response-ambiguity-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        { interopDefault: false, moduleCache: false },
+      );
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
       const handlers = new Map<string, (event: any, context: any) => unknown>();
       freshModule.default({
-        on(name: string, handler: (event: any, context: any) => unknown) { handlers.set(name, handler); },
+        on(name: string, handler: (event: any, context: any) => unknown) {
+          handlers.set(name, handler);
+        },
         registerCommand() {},
       } as any);
       const makeModel = (provider: string, id: string) => ({
@@ -1812,8 +2404,15 @@ describe("DeepSeek protocol-first compatibility", () => {
       const context = (model: any) => ({
         model,
         sessionManager: { getSessionId: () => "ambiguity-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
-        ui: { notify: (message: string) => notifications.push(message), setStatus() {} },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
+        ui: {
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+        },
       });
       const requestHook = handlers.get("before_provider_request");
       const responseHook = handlers.get("after_provider_response");
@@ -1823,42 +2422,73 @@ describe("DeepSeek protocol-first compatibility", () => {
       requestHook({ payload: {} }, context(modelA));
       requestHook({ payload: {} }, context(modelB));
       await responseHook(
-        { status: 400, headers: { "x-error": "Unsupported parameter: prompt_cache_key" } },
+        {
+          status: 400,
+          headers: { "x-error": "Unsupported parameter: prompt_cache_key" },
+        },
         context(modelB),
       );
-      assert.equal(notifications.some((message) => message.includes("rejected prompt_cache_key")), false);
+      assert.equal(
+        notifications.some((message) =>
+          message.includes("rejected prompt_cache_key"),
+        ),
+        false,
+      );
 
-      await messageEndHook({
-        message: {
-          role: "assistant",
-          provider: modelB.provider,
-          model: modelB.id,
-          api: modelB.api,
-          stopReason: "error",
-          status: 400,
-          errorMessage: "Unsupported parameter: prompt_cache_key",
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            provider: modelB.provider,
+            model: modelB.id,
+            api: modelB.api,
+            stopReason: "error",
+            status: 400,
+            errorMessage: "Unsupported parameter: prompt_cache_key",
+          },
         },
-      }, context(modelA));
-      assert.equal(notifications.some((message) => message.includes("proxy-a/gpt-a rejected prompt_cache_key")), false);
-      assert.equal(notifications.some((message) => message.includes("proxy-b/gpt-b rejected prompt_cache_key")), true);
+        context(modelA),
+      );
+      assert.equal(
+        notifications.some((message) =>
+          message.includes("proxy-a/gpt-a rejected prompt_cache_key"),
+        ),
+        false,
+      );
+      assert.equal(
+        notifications.some((message) =>
+          message.includes("proxy-b/gpt-b rejected prompt_cache_key"),
+        ),
+        true,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("runtime disable retains request-local identity for always-on Anthropic TTL repair", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-ttl-disabled-correlation-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-ttl-disabled-correlation-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        { interopDefault: false, moduleCache: false },
+      );
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
       const handlers = new Map<string, (event: any, context: any) => unknown>();
       freshModule.default({
-        on(name: string, handler: (event: any, context: any) => unknown) { handlers.set(name, handler); },
+        on(name: string, handler: (event: any, context: any) => unknown) {
+          handlers.set(name, handler);
+        },
         registerCommand() {},
       } as any);
       const makeModel = (provider: string, id: string) => ({
@@ -1880,64 +2510,120 @@ describe("DeepSeek protocol-first compatibility", () => {
       const context = (model: any) => ({
         model,
         sessionManager: { getSessionId: () => "ttl-disabled-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
-        ui: { notify: (message: string) => notifications.push(message), setStatus() {} },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
+        ui: {
+          notify: (message: string) => notifications.push(message),
+          setStatus() {},
+        },
       });
       freshModule.__internals_for_tests.setRuntimeOptimizerEnabled(false);
-      handlers.get("before_provider_request")?.({ payload: {} }, context(requestModel));
-      await handlers.get("message_end")?.({
-        message: {
-          role: "assistant",
-          stopReason: "error",
-          errorMessage: "cache_control ttl='1h' must not come after ttl='5m'",
+      handlers.get("before_provider_request")?.(
+        { payload: {} },
+        context(requestModel),
+      );
+      await handlers.get("message_end")?.(
+        {
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: "cache_control ttl='1h' must not come after ttl='5m'",
+          },
         },
-      }, context(activeModel));
-      assert.equal(notifications.some((message) => message.includes("anthropic-proxy-a/claude-a")), true);
-      assert.equal(notifications.some((message) => message.includes("anthropic-proxy-b/claude-b")), false);
+        context(activeModel),
+      );
+      assert.equal(
+        notifications.some((message) =>
+          message.includes("anthropic-proxy-a/claude-a"),
+        ),
+        true,
+      );
+      assert.equal(
+        notifications.some((message) =>
+          message.includes("anthropic-proxy-b/claude-b"),
+        ),
+        false,
+      );
       freshModule.__internals_for_tests.setRuntimeOptimizerEnabled(true);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("ordinary fix does not configure prompt_cache_key without evidence", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-no-evidence-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-no-evidence-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
-      freshModule.default({ on() {}, registerCommand(name: string, command: any) { commands.set(name, command); } } as any);
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        { interopDefault: false, moduleCache: false },
+      );
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => Promise<void> }
+      >();
+      freshModule.default({
+        on() {},
+        registerCommand(name: string, command: any) {
+          commands.set(name, command);
+        },
+      } as any);
       const notifications: string[] = [];
       let confirmations = 0;
       await commands.get("cache-optimizer")?.handler("fix", {
         model,
         hasUI: true,
         sessionManager: { getSessionId: () => "no-evidence-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
-          confirm: async () => { confirmations++; return true; },
+          confirm: async () => {
+            confirmations++;
+            return true;
+          },
           notify: (message: string) => notifications.push(message),
           setStatus() {},
         },
       });
       assert.equal(confirmations, 0);
-      assert.equal(notifications.some((message) => /prompt.?cache.?key/i.test(message)), false);
-      assert.equal((await readdir(tempAgentDir)).some((name) => name.includes("config")), false);
+      assert.equal(
+        notifications.some((message) => /prompt.?cache.?key/i.test(message)),
+        false,
+      );
+      assert.equal(
+        (await readdir(tempAgentDir)).some((name) => name.includes("config")),
+        false,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("evidence-driven command fix overrides extension runtime compat at modelOverrides", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-runtime-compat-fix-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-runtime-compat-fix-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     const modelsPath = join(tempAgentDir, "models.json");
@@ -1956,18 +2642,29 @@ describe("DeepSeek protocol-first compatibility", () => {
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       await writeFile(modelsPath, original, { encoding: "utf8", mode: 0o600 });
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
       const handlers = new Map<string, (event: any, context: any) => unknown>();
-      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => Promise<void> }
+      >();
       freshModule.default({
         on(name: string, handler: (event: any, context: any) => unknown) {
           handlers.set(name, handler);
         },
-        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
+        registerCommand(
+          name: string,
+          command: { handler: (args: string, context: any) => Promise<void> },
+        ) {
           commands.set(name, command);
         },
       } as any);
@@ -1989,7 +2686,11 @@ describe("DeepSeek protocol-first compatibility", () => {
         model: modelWithRuntimeCompat,
         hasUI: true,
         sessionManager: { getSessionId: () => "runtime-shadow-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
           confirm: async () => true,
           notify: (message: string) => notifications.push(message),
@@ -1997,26 +2698,43 @@ describe("DeepSeek protocol-first compatibility", () => {
         },
       };
       handlers.get("before_provider_request")?.({ payload: {} }, context);
-      await handlers.get("after_provider_response")?.({
-        status: 400,
-        headers: { "x-provider-error": "thinking is unsupported; use reasoning_effort instead" },
-      }, context);
+      await handlers.get("after_provider_response")?.(
+        {
+          status: 400,
+          headers: {
+            "x-provider-error":
+              "thinking is unsupported; use reasoning_effort instead",
+          },
+        },
+        context,
+      );
       await commands.get("cache-optimizer")?.handler("fix", context);
 
-      const parsed = freshModule.__internals_for_tests.parseJsonc(await readFile(modelsPath, "utf8")) as any;
+      const parsed = freshModule.__internals_for_tests.parseJsonc(
+        await readFile(modelsPath, "utf8"),
+      ) as any;
       assert.equal(
-        parsed.providers[modelWithRuntimeCompat.provider].modelOverrides[modelWithRuntimeCompat.id].compat.thinkingFormat,
+        parsed.providers[modelWithRuntimeCompat.provider].modelOverrides[
+          modelWithRuntimeCompat.id
+        ].compat.thinkingFormat,
         "openai",
       );
       assert.equal(
-        freshModule.__internals_for_tests.resolveEffectiveCompatFromConfig(modelWithRuntimeCompat, parsed).thinkingFormat,
+        freshModule.__internals_for_tests.resolveEffectiveCompatFromConfig(
+          modelWithRuntimeCompat,
+          parsed,
+        ).thinkingFormat,
         "openai",
       );
-      assert.ok(notifications.some((message) => message.includes("Fix applied")));
+      assert.ok(
+        notifications.some((message) => message.includes("Fix applied")),
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -2025,7 +2743,9 @@ describe("DeepSeek protocol-first compatibility", () => {
 
 describe("/cache-optimizer fix command", () => {
   test("direct and menu paths repair the effective modelOverride", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-command-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-fix-command-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     const modelsPath = join(tempAgentDir, "models.json");
@@ -2067,17 +2787,26 @@ describe("/cache-optimizer fix command", () => {
       await writeFile(modelsPath, original, "utf8");
       await chmod(modelsPath, 0o600);
 
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
-      const commands = new Map<string, { handler: (args: string, context: any) => unknown }>();
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => unknown }
+      >();
       freshModule.default({
         on() {},
-        registerCommand(name: string, command: { handler: (args: string, context: any) => unknown }) {
+        registerCommand(
+          name: string,
+          command: { handler: (args: string, context: any) => unknown },
+        ) {
           commands.set(name, command);
         },
       } as any);
@@ -2105,13 +2834,18 @@ describe("/cache-optimizer fix command", () => {
         model,
         hasUI: true,
         sessionManager: { getSessionId: () => "fix-command-test-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
           confirm: async (title: string, message: string) => {
             confirmations.push({ title, message });
             return true;
           },
-          notify: (message: string, level: string) => notifications.push({ message, level }),
+          notify: (message: string, level: string) =>
+            notifications.push({ message, level }),
           setStatus() {},
           select: async (title: string, options: string[]) => {
             menuPrompts.push({ title, options });
@@ -2124,18 +2858,28 @@ describe("/cache-optimizer fix command", () => {
         assert.equal(confirmations.length, 1);
         assert.match(confirmations[0].title, /Fix/);
         assert.match(confirmations[0].message, /modelOverrides/);
-        assert.ok(notifications.some(({ message }) => message.includes("Fix applied")));
+        assert.ok(
+          notifications.some(({ message }) => message.includes("Fix applied")),
+        );
 
         const backupNames = (await readdir(tempAgentDir)).filter((name) =>
-          name.startsWith("models.json.backup-cache-optimizer-")
+          name.startsWith("models.json.backup-cache-optimizer-"),
         );
         assert.equal(backupNames.length, 1);
-        assert.equal(await readFile(join(tempAgentDir, backupNames[0]), "utf8"), original);
-        assert.equal((await stat(join(tempAgentDir, backupNames[0]))).mode & 0o7777, expectedMode);
+        assert.equal(
+          await readFile(join(tempAgentDir, backupNames[0]), "utf8"),
+          original,
+        );
+        assert.equal(
+          (await stat(join(tempAgentDir, backupNames[0]))).mode & 0o7777,
+          expectedMode,
+        );
         assert.equal((await stat(modelsPath)).mode & 0o7777, expectedMode);
 
         const written = await readFile(modelsPath, "utf8");
-        const parsed = freshModule.__internals_for_tests.parseJsonc(written) as any;
+        const parsed = freshModule.__internals_for_tests.parseJsonc(
+          written,
+        ) as any;
         assert.ok(parsed);
         assert.deepEqual(
           freshModule.__internals_for_tests.resolveExplicitCompatValue(
@@ -2164,13 +2908,26 @@ describe("/cache-optimizer fix command", () => {
           ),
           undefined,
         );
-        assert.match(written, /\/\/ Credential and endpoint configuration must survive the fix\./);
+        assert.match(
+          written,
+          /\/\/ Credential and endpoint configuration must survive the fix\./,
+        );
         assert.equal(parsed.providers.proxy.apiKey, "env:PROXY_API_KEY");
         assert.equal(parsed.providers.proxy.unrelatedProviderField, 42);
         assert.equal(parsed.providers.proxy.compat.providerOnly, "preserved");
-        assert.equal(parsed.providers.proxy.models[0].compat.modelOnly, "preserved");
-        assert.equal(parsed.providers.proxy.modelOverrides["deepseek-v4"].compat.overrideOnly, "preserved");
-        assert.equal(parsed.providers.proxy.modelOverrides["deepseek-v4"].metadata, "keep-me");
+        assert.equal(
+          parsed.providers.proxy.models[0].compat.modelOnly,
+          "preserved",
+        );
+        assert.equal(
+          parsed.providers.proxy.modelOverrides["deepseek-v4"].compat
+            .overrideOnly,
+          "preserved",
+        );
+        assert.equal(
+          parsed.providers.proxy.modelOverrides["deepseek-v4"].metadata,
+          "keep-me",
+        );
         return backupNames[0];
       };
 
@@ -2183,33 +2940,52 @@ describe("/cache-optimizer fix command", () => {
       await chmod(modelsPath, 0o644);
       confirmations.length = 0;
       notifications.length = 0;
-      menuChoice = "Fix — Auto-fix compat issues (writes models.json or extension config)";
+      menuChoice =
+        "Fix — Auto-fix compat issues (writes models.json or extension config)";
 
       await command.handler("", commandContext);
       assert.equal(menuPrompts.length, 1);
       assert.ok(menuPrompts[0].options.includes(menuChoice));
-      assert.ok(menuPrompts[0].options.includes("Rollback — Undo the latest confirmed fix"));
+      assert.ok(
+        menuPrompts[0].options.includes(
+          "Rollback — Undo the latest confirmed fix",
+        ),
+      );
       const menuBackup = await assertApplied(0o644);
-      assert.equal((await stat(join(tempAgentDir, menuBackup))).mode & 0o7777, 0o644);
+      assert.equal(
+        (await stat(join(tempAgentDir, menuBackup))).mode & 0o7777,
+        0o644,
+      );
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o644);
 
       confirmations.length = 0;
       menuChoice = "Rollback — Undo the latest confirmed fix";
       await command.handler("", commandContext);
-      assert.equal(confirmations.filter(({ title }) => /Rollback/.test(title)).length, 1);
+      assert.equal(
+        confirmations.filter(({ title }) => /Rollback/.test(title)).length,
+        1,
+      );
       assert.equal(await readFile(modelsPath, "utf8"), original);
 
       const helpMessages: string[] = [];
       await command.handler("", {
         ...commandContext,
         hasUI: false,
-        ui: { ...commandContext.ui, notify: (message: string) => helpMessages.push(message) },
+        ui: {
+          ...commandContext.ui,
+          notify: (message: string) => helpMessages.push(message),
+        },
       });
-      assert.match(helpMessages.at(-1) ?? "", /rollback.*requires UI confirmation/i);
+      assert.match(
+        helpMessages.at(-1) ?? "",
+        /rollback.*requires UI confirmation/i,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -2224,7 +3000,10 @@ describe("/cache-optimizer fix command", () => {
     }
   }
 }`;
-    const modified = original.replace('"sendSessionAffinityHeaders": false', '"sendSessionAffinityHeaders": true');
+    const modified = original.replace(
+      '"sendSessionAffinityHeaders": false',
+      '"sendSessionAffinityHeaders": true',
+    );
     const receipt = internals.createModelsJsonFixReceipt(
       original,
       modified,
@@ -2264,7 +3043,9 @@ describe("/cache-optimizer fix command", () => {
   });
 
   test("transaction rollback restores original content and access mode", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-rollback-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-fix-rollback-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const modelsPath = join(tempAgentDir, "models.json");
     const original = `{"providers": {}}\n`;
@@ -2274,19 +3055,23 @@ describe("/cache-optimizer fix command", () => {
       await writeFile(modelsPath, original, "utf8");
       await chmod(modelsPath, 0o604);
 
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
       const backupPath = `${modelsPath}.backup-cache-optimizer-${freshModule.__internals_for_tests.backupTimestamp()}`;
-      const result = await freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-        `{"providers": {"proxy": {}}}\n`,
-        backupPath,
-        () => "forced post-write validation failure",
-      );
+      const result =
+        await freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          `{"providers": {"proxy": {}}}\n`,
+          backupPath,
+          () => "forced post-write validation failure",
+        );
 
       assert.deepEqual(result, {
         ok: false,
@@ -2297,7 +3082,8 @@ describe("/cache-optimizer fix command", () => {
       assert.equal(await readFile(backupPath, "utf8"), original);
       assert.equal((await stat(backupPath)).mode & 0o7777, 0o604);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -2311,7 +3097,10 @@ describe("/cache-optimizer fix command", () => {
     }
   }
 }`;
-    const fixed = original.replace('"sendSessionAffinityHeaders": false', '"sendSessionAffinityHeaders": true');
+    const fixed = original.replace(
+      '"sendSessionAffinityHeaders": false',
+      '"sendSessionAffinityHeaders": true',
+    );
     const receipt = internals.createModelsJsonFixReceipt(
       original,
       fixed,
@@ -2324,27 +3113,51 @@ describe("/cache-optimizer fix command", () => {
       1_700_000_000_000,
     );
     assert.ok(receipt);
-    const later = fixed.replace('"sendSessionAffinityHeaders": true', '"sendSessionAffinityHeaders": true,\n      "later": "keep"');
+    const later = fixed.replace(
+      '"sendSessionAffinityHeaders": true',
+      '"sendSessionAffinityHeaders": true,\n      "later": "keep"',
+    );
     const rollback = internals.composeModelsJsonReceiptRollback(later, receipt);
     assert.equal("error" in rollback, false);
     if (!("error" in rollback)) {
-      assert.match(rollback.modifiedText, /"sendSessionAffinityHeaders": false/);
+      assert.match(
+        rollback.modifiedText,
+        /"sendSessionAffinityHeaders": false/,
+      );
       assert.match(rollback.modifiedText, /"later": "keep"/);
-      assert.equal(internals.validateModelsJsonRollback(rollback.modifiedText, receipt), null);
+      assert.equal(
+        internals.validateModelsJsonRollback(rollback.modifiedText, receipt),
+        null,
+      );
     }
 
-    const changedOwnedKey = later.replace('"sendSessionAffinityHeaders": true', '"sendSessionAffinityHeaders": false');
+    const changedOwnedKey = later.replace(
+      '"sendSessionAffinityHeaders": true',
+      '"sendSessionAffinityHeaders": false',
+    );
     assert.match(
-      "error" in internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt)
-        ? (internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt) as { error: string }).error
+      "error" in
+        internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt)
+        ? (
+            internals.composeModelsJsonReceiptRollback(
+              changedOwnedKey,
+              receipt,
+            ) as { error: string }
+          ).error
         : "",
       /changed after the fix/,
     );
 
     const removedTarget = later.replace('"deepseek-v4"', '"renamed-after-fix"');
     assert.match(
-      "error" in internals.composeModelsJsonReceiptRollback(removedTarget, receipt)
-        ? (internals.composeModelsJsonReceiptRollback(removedTarget, receipt) as { error: string }).error
+      "error" in
+        internals.composeModelsJsonReceiptRollback(removedTarget, receipt)
+        ? (
+            internals.composeModelsJsonReceiptRollback(
+              removedTarget,
+              receipt,
+            ) as { error: string }
+          ).error
         : "",
       /(?:could not locate receipt target|target entry is missing)/i,
     );
@@ -2376,20 +3189,37 @@ describe("/cache-optimizer fix command", () => {
       1_700_000_000_000,
     );
     assert.ok(createdTargetReceipt);
-    const createdTargetChanged = createdTargetFixed.replace('"models":', '"later": "keep",\n      "models":');
+    const createdTargetChanged = createdTargetFixed.replace(
+      '"models":',
+      '"later": "keep",\n      "models":',
+    );
     assert.match(
-      "error" in internals.composeModelsJsonReceiptRollback(createdTargetChanged, createdTargetReceipt)
-        ? (internals.composeModelsJsonReceiptRollback(createdTargetChanged, createdTargetReceipt) as { error: string }).error
+      "error" in
+        internals.composeModelsJsonReceiptRollback(
+          createdTargetChanged,
+          createdTargetReceipt,
+        )
+        ? (
+            internals.composeModelsJsonReceiptRollback(
+              createdTargetChanged,
+              createdTargetReceipt,
+            ) as { error: string }
+          ).error
         : "",
       /created (?:a )?new target entry/,
     );
   });
 
   test("refuses to overwrite an existing backup or modify models.json", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-exclusive-backup-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-fix-exclusive-backup-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const modelsPath = join(tempAgentDir, "models.json");
-    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-existing");
+    const backupPath = join(
+      tempAgentDir,
+      "models.json.backup-cache-optimizer-existing",
+    );
     const original = `{"providers": {}}\n`;
 
     try {
@@ -2398,10 +3228,13 @@ describe("/cache-optimizer fix command", () => {
       await chmod(modelsPath, 0o600);
       await writeFile(backupPath, "do-not-overwrite", "utf8");
 
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
@@ -2417,28 +3250,37 @@ describe("/cache-optimizer fix command", () => {
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o600);
       assert.equal(await readFile(backupPath, "utf8"), "do-not-overwrite");
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("refuses symlinked transaction paths and expected-hash races", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-symlink-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-fix-symlink-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const modelsPath = join(tempAgentDir, "models.json");
     const targetPath = join(tempAgentDir, "models-target.json");
-    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-symlink");
+    const backupPath = join(
+      tempAgentDir,
+      "models.json.backup-cache-optimizer-symlink",
+    );
     const original = `{"providers": {}}\n`;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       await writeFile(targetPath, original, "utf8");
       await symlink(targetPath, modelsPath);
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
@@ -2449,7 +3291,10 @@ describe("/cache-optimizer fix command", () => {
           `{"providers": {"proxy": {}}}\n`,
           backupPath,
           () => null,
-          { expectedCurrentHash: freshModule.__internals_for_tests.hashText(original) },
+          {
+            expectedCurrentHash:
+              freshModule.__internals_for_tests.hashText(original),
+          },
         ),
         /not a regular file/,
       );
@@ -2461,7 +3306,11 @@ describe("/cache-optimizer fix command", () => {
       await writeFile(backupTarget, original, "utf8");
       await symlink(backupTarget, backupPath);
       await assert.rejects(
-        freshModule.__internals_for_tests.atomicRestoreFileFromBackup(backupPath, modelsPath, 0o600),
+        freshModule.__internals_for_tests.atomicRestoreFileFromBackup(
+          backupPath,
+          modelsPath,
+          0o600,
+        ),
         /backup is not a regular file/,
       );
       assert.equal(await readFile(modelsPath, "utf8"), original);
@@ -2472,7 +3321,10 @@ describe("/cache-optimizer fix command", () => {
           `{"providers": {"proxy": {}}}\n`,
           backupPath,
           () => null,
-          { expectedCurrentHash: freshModule.__internals_for_tests.hashText("different") },
+          {
+            expectedCurrentHash:
+              freshModule.__internals_for_tests.hashText("different"),
+          },
         ),
         /changed since the fix preview/,
       );
@@ -2485,7 +3337,8 @@ describe("/cache-optimizer fix command", () => {
           join(tempAgentDir, "models.json.backup-cache-optimizer-mode-race"),
           () => null,
           {
-            expectedCurrentHash: freshModule.__internals_for_tests.hashText(original),
+            expectedCurrentHash:
+              freshModule.__internals_for_tests.hashText(original),
             expectedCurrentMode: 0o600,
           },
         ),
@@ -2494,14 +3347,17 @@ describe("/cache-optimizer fix command", () => {
       assert.equal(await readFile(modelsPath, "utf8"), original);
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("rejects real target swaps at the final atomic rename boundary", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-final-rename-race-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-final-rename-race-test-"),
+    );
     const targetPath = join(tempDir, "models.json");
     const backupPath = join(tempDir, "models.json.backup-cache-optimizer-race");
     const original = '{"providers":{"a":{}}}\n';
@@ -2518,22 +3374,35 @@ describe("/cache-optimizer fix command", () => {
           "fix-race-test",
           { hash: internals.hashText(original), mode: 0o600 },
           async () => {
-            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
+            await writeFile(targetPath, external, {
+              encoding: "utf8",
+              mode: 0o600,
+            });
           },
         ),
         /target content changed during atomic replacement/,
       );
       assert.equal(await readFile(targetPath, "utf8"), external);
 
-      await writeFile(targetPath, replacement, { encoding: "utf8", mode: 0o600 });
+      await writeFile(targetPath, replacement, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
       await assert.rejects(
         internals.atomicRestoreFileFromBackup(
           backupPath,
           targetPath,
           0o600,
-          { hash: internals.hashText(replacement), mode: 0o600, backupHash: internals.hashText(original) },
+          {
+            hash: internals.hashText(replacement),
+            mode: 0o600,
+            backupHash: internals.hashText(original),
+          },
           async () => {
-            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
+            await writeFile(targetPath, external, {
+              encoding: "utf8",
+              mode: 0o600,
+            });
           },
         ),
         /target content changed during atomic replacement/,
@@ -2545,7 +3414,9 @@ describe("/cache-optimizer fix command", () => {
   });
 
   test("models.json transactions serialize across concurrent Pi instances", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-transaction-lock-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-transaction-lock-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const modelsPath = join(tempAgentDir, "models.json");
     const original = `{"providers":{}}\n`;
@@ -2553,50 +3424,74 @@ describe("/cache-optimizer fix command", () => {
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       await writeFile(modelsPath, original, { encoding: "utf8", mode: 0o600 });
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      let releaseFirst!: () => void;
-      const firstCommitted = new Promise<void>((resolve) => { releaseFirst = resolve; });
-      let firstEntered!: () => void;
-      const firstStarted = new Promise<void>((resolve) => { firstEntered = resolve; });
-      const hash = freshModule.__internals_for_tests.hashText(original);
-      const first = freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-        `{"providers":{"first":{}}}\n`,
-        join(tempAgentDir, "models.json.backup-cache-optimizer-lock-first"),
-        () => null,
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
         {
-          expectedCurrentHash: hash,
-          onCommitted: async () => {
-            firstEntered();
-            await firstCommitted;
-          },
+          interopDefault: false,
+          moduleCache: false,
         },
       );
-      await firstStarted;
-      const second = freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-        `{"providers":{"second":{}}}\n`,
-        join(tempAgentDir, "models.json.backup-cache-optimizer-lock-second"),
-        () => null,
-        { expectedCurrentHash: hash },
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
       );
+      let releaseFirst!: () => void;
+      const firstCommitted = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let firstEntered!: () => void;
+      const firstStarted = new Promise<void>((resolve) => {
+        firstEntered = resolve;
+      });
+      const hash = freshModule.__internals_for_tests.hashText(original);
+      const first =
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          `{"providers":{"first":{}}}\n`,
+          join(tempAgentDir, "models.json.backup-cache-optimizer-lock-first"),
+          () => null,
+          {
+            expectedCurrentHash: hash,
+            onCommitted: async () => {
+              firstEntered();
+              await firstCommitted;
+            },
+          },
+        );
+      await firstStarted;
+      const second =
+        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
+          `{"providers":{"second":{}}}\n`,
+          join(tempAgentDir, "models.json.backup-cache-optimizer-lock-second"),
+          () => null,
+          { expectedCurrentHash: hash },
+        );
       releaseFirst();
-      assert.deepEqual((await Promise.allSettled([first, second])).map((result) => result.status), ["fulfilled", "rejected"]);
-      assert.equal(await readFile(modelsPath, "utf8"), `{"providers":{"first":{}}}\n`);
+      assert.deepEqual(
+        (await Promise.allSettled([first, second])).map(
+          (result) => result.status,
+        ),
+        ["fulfilled", "rejected"],
+      );
+      assert.equal(
+        await readFile(modelsPath, "utf8"),
+        `{"providers":{"first":{}}}\n`,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("receipt atomic write rejects a replacement at the final rename boundary", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-receipt-final-race-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-receipt-final-race-test-"),
+    );
     const receiptPath = join(tempDir, "receipt.json");
-    const originalText = '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{}}]}}}';
-    const modifiedText = '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{"sendSessionAffinityHeaders":true}}]}}}';
+    const originalText =
+      '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{}}]}}}';
+    const modifiedText =
+      '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{"sendSessionAffinityHeaders":true}}]}}}';
     const originalReceipt = internals.createModelsJsonFixReceipt(
       originalText,
       modifiedText,
@@ -2622,7 +3517,8 @@ describe("/cache-optimizer fix command", () => {
     assert.ok(originalReceipt && replacementReceipt);
     try {
       await internals.writeModelsJsonFixReceipt(originalReceipt, receiptPath);
-      const snapshot = await internals.readModelsJsonFixReceiptSnapshot(receiptPath);
+      const snapshot =
+        await internals.readModelsJsonFixReceiptSnapshot(receiptPath);
       assert.ok(snapshot);
       await assert.rejects(
         internals.writeModelsJsonFixReceipt(
@@ -2630,64 +3526,104 @@ describe("/cache-optimizer fix command", () => {
           receiptPath,
           snapshot,
           async () => {
-            await writeFile(receiptPath, JSON.stringify(replacementReceipt, null, 2) + "\n", "utf8");
+            await writeFile(
+              receiptPath,
+              JSON.stringify(replacementReceipt, null, 2) + "\n",
+              "utf8",
+            );
           },
         ),
         /fix receipt changed/,
       );
-      assert.equal((await internals.readModelsJsonFixReceipt(receiptPath))?.transactionId, replacementReceipt.transactionId);
+      assert.equal(
+        (await internals.readModelsJsonFixReceipt(receiptPath))?.transactionId,
+        replacementReceipt.transactionId,
+      );
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test("receipt replacement after preview aborts rollback without changing models.json", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-receipt-cas-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-receipt-cas-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const modelsPath = join(tempAgentDir, "models.json");
-    const receiptPath = join(tempAgentDir, "pi-cache-optimizer-fix-receipt.json");
+    const receiptPath = join(
+      tempAgentDir,
+      "pi-cache-optimizer-fix-receipt.json",
+    );
     const original = `{"providers":{"proxy":{"models":[{"id":"deepseek-v4","compat":{"sendSessionAffinityHeaders":false}}]}}}\n`;
     const fixed = original.replace("false", "true");
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       await writeFile(modelsPath, fixed, { encoding: "utf8", mode: 0o600 });
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      const receiptA = freshModule.__internals_for_tests.createModelsJsonFixReceipt(
-        original,
-        fixed,
-        "proxy",
-        "deepseek-v4",
-        "model",
-        { sendSessionAffinityHeaders: true },
-        true,
-        join(tempAgentDir, "models.json.backup-cache-optimizer-a"),
-        1,
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
       );
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
+      const receiptA =
+        freshModule.__internals_for_tests.createModelsJsonFixReceipt(
+          original,
+          fixed,
+          "proxy",
+          "deepseek-v4",
+          "model",
+          { sendSessionAffinityHeaders: true },
+          true,
+          join(tempAgentDir, "models.json.backup-cache-optimizer-a"),
+          1,
+        );
       assert.ok(receiptA);
-      await writeFile(join(tempAgentDir, receiptA.backupFile), original, "utf8");
-      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(receiptA, receiptPath);
-      const snapshot = await freshModule.__internals_for_tests.readModelsJsonFixReceiptSnapshot(receiptPath);
+      await writeFile(
+        join(tempAgentDir, receiptA.backupFile),
+        original,
+        "utf8",
+      );
+      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(
+        receiptA,
+        receiptPath,
+      );
+      const snapshot =
+        await freshModule.__internals_for_tests.readModelsJsonFixReceiptSnapshot(
+          receiptPath,
+        );
       assert.ok(snapshot);
-      const plan = await freshModule.__internals_for_tests.prepareModelsJsonRollback(snapshot, modelsPath);
+      const plan =
+        await freshModule.__internals_for_tests.prepareModelsJsonRollback(
+          snapshot,
+          modelsPath,
+        );
       assert.equal("error" in plan, false);
       if ("error" in plan) return;
 
-      const receiptB = { ...receiptA, transactionId: "replacement", modelId: "other-model" };
-      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(receiptB, receiptPath);
+      const receiptB = {
+        ...receiptA,
+        transactionId: "replacement",
+        modelId: "other-model",
+      };
+      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(
+        receiptB,
+        receiptPath,
+      );
       await assert.rejects(
         freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
           plan.modifiedText,
           plan.rollbackBackupPath,
-          (writtenText: string) => freshModule.__internals_for_tests.validateModelsJsonRollback(
-            writtenText,
-            plan.receipt,
-            plan.expectedResultHash,
-          ),
+          (writtenText: string) =>
+            freshModule.__internals_for_tests.validateModelsJsonRollback(
+              writtenText,
+              plan.receipt,
+              plan.expectedResultHash,
+            ),
           {
             expectedCurrentHash: plan.currentHash,
             expectedCurrentMode: plan.fileMode,
@@ -2698,16 +3634,24 @@ describe("/cache-optimizer fix command", () => {
         /fix receipt changed since the rollback preview/,
       );
       assert.equal(await readFile(modelsPath, "utf8"), fixed);
-      assert.equal((await readdir(tempAgentDir)).some((name) => name.startsWith("models.json.backup-cache-optimizer-rollback-")), false);
+      assert.equal(
+        (await readdir(tempAgentDir)).some((name) =>
+          name.startsWith("models.json.backup-cache-optimizer-rollback-"),
+        ),
+        false,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("direct rollback command restores an unchanged fix and marks the receipt", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-command-rollback-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-fix-command-rollback-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     const modelsPath = join(tempAgentDir, "models.json");
@@ -2727,17 +3671,26 @@ describe("/cache-optimizer fix command", () => {
       await writeFile(modelsPath, original, "utf8");
       await chmod(modelsPath, 0o640);
 
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
-      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => Promise<void> }
+      >();
       freshModule.default({
         on() {},
-        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
+        registerCommand(
+          name: string,
+          command: { handler: (args: string, context: any) => Promise<void> },
+        ) {
           commands.set(name, command);
         },
       } as any);
@@ -2763,7 +3716,11 @@ describe("/cache-optimizer fix command", () => {
         model,
         hasUI: true,
         sessionManager: { getSessionId: () => "rollback-command-test-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
           confirm: async (title: string) => {
             confirmations.push(title);
@@ -2779,77 +3736,124 @@ describe("/cache-optimizer fix command", () => {
       const fixed = await readFile(modelsPath, "utf8");
       assert.notEqual(fixed, original);
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
-      const receiptPath = join(tempAgentDir, freshModule.__internals_for_tests.FIX_RECEIPT_FILE_NAME);
-      const receiptBeforeRollback = freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
-        JSON.parse(await readFile(receiptPath, "utf8")),
+      const receiptPath = join(
+        tempAgentDir,
+        freshModule.__internals_for_tests.FIX_RECEIPT_FILE_NAME,
       );
+      const receiptBeforeRollback =
+        freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
+          JSON.parse(await readFile(receiptPath, "utf8")),
+        );
       assert.ok(receiptBeforeRollback);
       assert.equal(receiptBeforeRollback.status, undefined);
-      assert.equal(receiptBeforeRollback.afterHash, freshModule.__internals_for_tests.hashText(fixed));
+      assert.equal(
+        receiptBeforeRollback.afterHash,
+        freshModule.__internals_for_tests.hashText(fixed),
+      );
       assert.equal((await stat(receiptPath)).mode & 0o7777, 0o600);
 
       await command.handler("rollback", { ...context, hasUI: false });
       assert.equal(await readFile(modelsPath, "utf8"), fixed);
-      assert.ok(notifications.some((message) => message.includes(receiptBeforeRollback.backupFile)));
-      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 0);
+      assert.ok(
+        notifications.some((message) =>
+          message.includes(receiptBeforeRollback.backupFile),
+        ),
+      );
+      assert.equal(
+        confirmations.filter((title) => /Rollback/.test(title)).length,
+        0,
+      );
 
       await command.handler("rollback", context);
-      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 1);
+      assert.equal(
+        confirmations.filter((title) => /Rollback/.test(title)).length,
+        1,
+      );
       assert.equal(await readFile(modelsPath, "utf8"), original);
       assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
-      assert.ok(notifications.some((message) => message.includes("Rollback completed")));
-      assert.ok(notifications.some((message) => /run \/reload/i.test(message)));
-      const receiptAfterRollback = freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
-        JSON.parse(await readFile(receiptPath, "utf8")),
+      assert.ok(
+        notifications.some((message) => message.includes("Rollback completed")),
       );
+      assert.ok(notifications.some((message) => /run \/reload/i.test(message)));
+      const receiptAfterRollback =
+        freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
+          JSON.parse(await readFile(receiptPath, "utf8")),
+        );
       assert.equal(receiptAfterRollback?.status, "rolled_back");
       assert.equal(receiptAfterRollback?.rolledBackAt !== undefined, true);
       const rollbackBackups = (await readdir(tempAgentDir)).filter((name) =>
         name.startsWith("models.json.backup-cache-optimizer-rollback-"),
       );
       assert.equal(rollbackBackups.length, 1);
-      assert.equal(await readFile(join(tempAgentDir, rollbackBackups[0]), "utf8"), fixed);
-      assert.equal((await stat(join(tempAgentDir, rollbackBackups[0]))).mode & 0o7777, 0o640);
+      assert.equal(
+        await readFile(join(tempAgentDir, rollbackBackups[0]), "utf8"),
+        fixed,
+      );
+      assert.equal(
+        (await stat(join(tempAgentDir, rollbackBackups[0]))).mode & 0o7777,
+        0o640,
+      );
 
       const notificationCount = notifications.length;
       await command.handler("rollback", context);
       assert.equal(notifications.length, notificationCount + 1);
-      assert.match(notifications.at(-1) ?? "", /No unapplied \/cache-optimizer fix receipt was found/);
-      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 1);
+      assert.match(
+        notifications.at(-1) ?? "",
+        /No unapplied \/cache-optimizer fix receipt was found/,
+      );
+      assert.equal(
+        confirmations.filter((title) => /Rollback/.test(title)).length,
+        1,
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 
   test("restores models.json atomically when receipt commit fails", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-receipt-failure-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-fix-receipt-failure-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const modelsPath = join(tempAgentDir, "models.json");
-    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-receipt-failure");
-    const original = '{\n  "providers": { "proxy": { "models": [{ "id": "model" }] } }\n}\n';
+    const backupPath = join(
+      tempAgentDir,
+      "models.json.backup-cache-optimizer-receipt-failure",
+    );
+    const original =
+      '{\n  "providers": { "proxy": { "models": [{ "id": "model" }] } }\n}\n';
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       await writeFile(modelsPath, original, "utf8");
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        {
+          interopDefault: false,
+          moduleCache: false,
+        },
+      );
       const freshModule = await jiti.import<typeof import("../index.ts")>(
         join(process.cwd(), "index.ts"),
       );
-      const modified = original.replace('"models"', '"compat": { "sendSessionAffinityHeaders": true }, "models"');
+      const modified = original.replace(
+        '"models"',
+        '"compat": { "sendSessionAffinityHeaders": true }, "models"',
+      );
       await assert.rejects(
         freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
           modified,
           backupPath,
           () => null,
           {
-            expectedCurrentHash: freshModule.__internals_for_tests.hashText(original),
+            expectedCurrentHash:
+              freshModule.__internals_for_tests.hashText(original),
             onCommitted: async () => {
               throw new Error("simulated receipt write failure");
             },
@@ -2860,7 +3864,8 @@ describe("/cache-optimizer fix command", () => {
       assert.equal(await readFile(modelsPath, "utf8"), original);
       assert.equal(await readFile(backupPath, "utf8"), original);
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
@@ -2890,32 +3895,126 @@ describe("prompt_cache_key model opt-out", () => {
   } as any;
 
   test("parses v1 and v2 config without accepting malformed or private data", () => {
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unsupported parameter: prompt_cache_key" }), true);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unknown field promptCacheKey" }), true);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key is not supported" }), true);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Invalid parameter value for prompt_cache_key" }), false);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "Unsupported parameter value for prompt_cache_key" }), false);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "The prompt_cache_key value is not supported" }), false);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key must be omitted when temperature is set" }), false);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "prompt_cache_key is not allowed when temperature is set" }), false);
-    assert.equal(internals.hasPromptCacheKeyUnsupportedSignal({ "x-error": "promptCacheKey is not permitted with stream=true" }), false);
-    assert.deepEqual(internals.parsePersistedCacheOptimizerConfig({ version: 1, footerMode: "total" }), { version: 1, footerMode: "total" });
-    assert.deepEqual(
-      internals.parsePersistedCacheOptimizerConfig({ version: 2, footerMode: "session", promptCacheKey: { omit: ["z/model", "a/model", "a/model"] } }),
-      { version: 2, footerMode: "session", promptCacheKey: { omit: ["a/model", "z/model"] } },
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "Unsupported parameter: prompt_cache_key",
+      }),
+      true,
     );
-    assert.equal(internals.parsePersistedCacheOptimizerConfig({ version: 2, promptCacheKey: { omit: ["proxy/model", 4] } }), undefined);
-    assert.equal(internals.parsePersistedCacheOptimizerConfig({ version: 2, promptCacheKey: { omit: ["proxy/model"], prompt: "secret" } }), undefined);
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "Unknown field promptCacheKey",
+      }),
+      true,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "prompt_cache_key is not supported",
+      }),
+      true,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "Invalid parameter value for prompt_cache_key",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "Unsupported parameter value for prompt_cache_key",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "The prompt_cache_key value is not supported",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "prompt_cache_key must be omitted when temperature is set",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "prompt_cache_key is not allowed when temperature is set",
+      }),
+      false,
+    );
+    assert.equal(
+      internals.hasPromptCacheKeyUnsupportedSignal({
+        "x-error": "promptCacheKey is not permitted with stream=true",
+      }),
+      false,
+    );
+    assert.deepEqual(
+      internals.parsePersistedCacheOptimizerConfig({
+        version: 1,
+        footerMode: "total",
+      }),
+      { version: 1, footerMode: "total" },
+    );
+    assert.deepEqual(
+      internals.parsePersistedCacheOptimizerConfig({
+        version: 2,
+        footerMode: "session",
+        promptCacheKey: { omit: ["z/model", "a/model", "a/model"] },
+      }),
+      {
+        version: 2,
+        footerMode: "session",
+        promptCacheKey: { omit: ["a/model", "z/model"] },
+      },
+    );
+    assert.equal(
+      internals.parsePersistedCacheOptimizerConfig({
+        version: 2,
+        promptCacheKey: { omit: ["proxy/model", 4] },
+      }),
+      undefined,
+    );
+    assert.equal(
+      internals.parsePersistedCacheOptimizerConfig({
+        version: 2,
+        promptCacheKey: { omit: ["proxy/model"], prompt: "secret" },
+      }),
+      undefined,
+    );
   });
 
   test("omits both key spellings only for the exact configured model", () => {
     internals.setRuntimeOptimizerEnabled(true);
-    const config = { version: 2 as const, footerMode: "total" as const, promptCacheKey: { omit: ["proxy/gpt-5.5"] } };
-    assert.equal(internals.isPromptCacheKeyOmittedForModel(model, config), true);
-    assert.equal(internals.isPromptCacheKeyOmittedForModel({ ...model, id: "gpt-5.6" }, config), false);
-    assert.equal(internals.isPromptCacheKeyOmittedForModel({ ...model, provider: "other" }, config), false);
+    const config = {
+      version: 2 as const,
+      footerMode: "total" as const,
+      promptCacheKey: { omit: ["proxy/gpt-5.5"] },
+    };
+    assert.equal(
+      internals.isPromptCacheKeyOmittedForModel(model, config),
+      true,
+    );
+    assert.equal(
+      internals.isPromptCacheKeyOmittedForModel(
+        { ...model, id: "gpt-5.6" },
+        config,
+      ),
+      false,
+    );
+    assert.equal(
+      internals.isPromptCacheKeyOmittedForModel(
+        { ...model, provider: "other" },
+        config,
+      ),
+      false,
+    );
     assert.deepEqual(
-      internals.omitOpenAIPromptCacheKeys({ prompt_cache_key: "pi", promptCacheKey: "caller", keep: 1 }),
+      internals.omitOpenAIPromptCacheKeys({
+        prompt_cache_key: "pi",
+        promptCacheKey: "caller",
+        keep: 1,
+      }),
       { keep: 1 },
     );
     assert.equal(internals.omitOpenAIPromptCacheKeys({ keep: 1 }), undefined);
@@ -2925,25 +4024,45 @@ describe("prompt_cache_key model opt-out", () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-test-"));
     const configPath = join(tempDir, "pi-cache-optimizer-config.json");
     const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
-    const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
+    const original =
+      JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
     try {
       await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
-      const applied = await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      const applied = await internals.applyPromptCacheKeyConfigFix(
+        model,
+        configPath,
+        receiptPath,
+      );
       const parsed = internals.readPersistedCacheOptimizerConfig(configPath);
-      assert.deepEqual(parsed, { version: 2, footerMode: "total", promptCacheKey: { omit: ["proxy/gpt-5.5"] } });
+      assert.deepEqual(parsed, {
+        version: 2,
+        footerMode: "total",
+        promptCacheKey: { omit: ["proxy/gpt-5.5"] },
+      });
       assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
       assert.equal(await readFile(applied.backupPath, "utf8"), original);
       assert.equal((await stat(applied.backupPath)).mode & 0o7777, 0o640);
-      const receiptSnapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      const receiptSnapshot =
+        await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
       assert.ok(receiptSnapshot);
       const receipt = receiptSnapshot.receipt;
       assert.equal(receipt.addedModelKey, "proxy/gpt-5.5");
       assert.equal(receipt.targetHadModelKey, false);
       assert.equal(JSON.stringify(receipt).includes("prompt_cache_key"), false);
-      await internals.rollbackPromptCacheKeyConfig(receiptSnapshot, configPath, receiptPath);
+      await internals.rollbackPromptCacheKeyConfig(
+        receiptSnapshot,
+        configPath,
+        receiptPath,
+      );
       assert.equal(await readFile(configPath, "utf8"), original);
-      assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath), { version: 2, footerMode: "total" });
-      assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.status, "rolled_back");
+      assert.deepEqual(
+        internals.readPersistedCacheOptimizerConfig(configPath),
+        { version: 2, footerMode: "total" },
+      );
+      assert.equal(
+        (await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.status,
+        "rolled_back",
+      );
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -2951,22 +4070,42 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("fix receipt failure restores both existing and absent config targets", async () => {
     for (const targetExists of [true, false]) {
-      const tempDir = await mkdtemp(join(tmpdir(), `pi-cache-key-config-fix-receipt-failure-${targetExists}-`));
+      const tempDir = await mkdtemp(
+        join(
+          tmpdir(),
+          `pi-cache-key-config-fix-receipt-failure-${targetExists}-`,
+        ),
+      );
       const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-      const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
-      const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
+      const receiptPath = join(
+        tempDir,
+        "pi-cache-optimizer-config-receipt.json",
+      );
+      const original =
+        JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
       try {
-        if (targetExists) await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
+        if (targetExists)
+          await writeFile(configPath, original, {
+            encoding: "utf8",
+            mode: 0o640,
+          });
         await mkdir(receiptPath);
         await assert.rejects(
-          internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath),
+          internals.applyPromptCacheKeyConfigFix(
+            model,
+            configPath,
+            receiptPath,
+          ),
           /invalid prompt-cache-key receipt path/,
         );
         if (targetExists) {
           assert.equal(await readFile(configPath, "utf8"), original);
           assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
         } else {
-          await assert.rejects(readFile(configPath, "utf8"), (error: any) => error?.code === "ENOENT");
+          await assert.rejects(
+            readFile(configPath, "utf8"),
+            (error: any) => error?.code === "ENOENT",
+          );
         }
       } finally {
         await rm(tempDir, { recursive: true, force: true });
@@ -2975,35 +4114,61 @@ describe("prompt_cache_key model opt-out", () => {
   });
 
   test("receipt replacement after preview aborts config rollback and restores the post-fix config", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-receipt-race-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-config-receipt-race-test-"),
+    );
     const configPath = join(tempDir, "pi-cache-optimizer-config.json");
     const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
-    const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
+    const original =
+      JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
     try {
       await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
-      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      await internals.applyPromptCacheKeyConfigFix(
+        model,
+        configPath,
+        receiptPath,
+      );
       const fixed = await readFile(configPath, "utf8");
-      const snapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      const snapshot =
+        await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
       assert.ok(snapshot);
-      const replacement = { ...snapshot.receipt, transactionId: "replacement-transaction" };
+      const replacement = {
+        ...snapshot.receipt,
+        transactionId: "replacement-transaction",
+      };
 
       await assert.rejects(
-        internals.rollbackPromptCacheKeyConfig(snapshot, configPath, receiptPath, {
-          beforeReceiptRename: async () => {
-            await writeFile(receiptPath, JSON.stringify(replacement, null, 2) + "\n", "utf8");
+        internals.rollbackPromptCacheKeyConfig(
+          snapshot,
+          configPath,
+          receiptPath,
+          {
+            beforeReceiptRename: async () => {
+              await writeFile(
+                receiptPath,
+                JSON.stringify(replacement, null, 2) + "\n",
+                "utf8",
+              );
+            },
           },
-        }),
+        ),
         /prompt-cache-key receipt changed/,
       );
       assert.equal(await readFile(configPath, "utf8"), fixed);
-      assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.transactionId, "replacement-transaction");
+      assert.equal(
+        (await internals.readPromptCacheKeyConfigReceipt(receiptPath))
+          ?.transactionId,
+        "replacement-transaction",
+      );
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test("atomic config creation never overwrites a file that appears at the final boundary", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-create-race-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-config-create-race-test-"),
+    );
     const configPath = join(tempDir, "pi-cache-optimizer-config.json");
     try {
       await assert.rejects(
@@ -3023,37 +4188,66 @@ describe("prompt_cache_key model opt-out", () => {
   });
 
   test("receipt update failure recreates a newly-created post-fix config", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-new-config-receipt-failure-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-new-config-receipt-failure-test-"),
+    );
     const configPath = join(tempDir, "pi-cache-optimizer-config.json");
     const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
     try {
-      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      await internals.applyPromptCacheKeyConfigFix(
+        model,
+        configPath,
+        receiptPath,
+      );
       const fixed = await readFile(configPath, "utf8");
-      const snapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      const snapshot =
+        await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
       assert.ok(snapshot);
-      const replacement = { ...snapshot.receipt, transactionId: "replacement-new-config" };
+      const replacement = {
+        ...snapshot.receipt,
+        transactionId: "replacement-new-config",
+      };
 
       await assert.rejects(
-        internals.rollbackPromptCacheKeyConfig(snapshot, configPath, receiptPath, {
-          beforeReceiptRename: async () => {
-            await writeFile(receiptPath, JSON.stringify(replacement, null, 2) + "\n", "utf8");
+        internals.rollbackPromptCacheKeyConfig(
+          snapshot,
+          configPath,
+          receiptPath,
+          {
+            beforeReceiptRename: async () => {
+              await writeFile(
+                receiptPath,
+                JSON.stringify(replacement, null, 2) + "\n",
+                "utf8",
+              );
+            },
           },
-        }),
+        ),
         /prompt-cache-key receipt changed/,
       );
       assert.equal(await readFile(configPath, "utf8"), fixed);
-      assert.equal((await internals.readPromptCacheKeyConfigReceipt(receiptPath))?.transactionId, "replacement-new-config");
+      assert.equal(
+        (await internals.readPromptCacheKeyConfigReceipt(receiptPath))
+          ?.transactionId,
+        "replacement-new-config",
+      );
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test("direct repeated fixes reject without changing config or receipt", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-repeat-config-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-repeat-config-test-"),
+    );
     const configPath = join(tempDir, "pi-cache-optimizer-config.json");
     const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
     try {
-      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+      await internals.applyPromptCacheKeyConfigFix(
+        model,
+        configPath,
+        receiptPath,
+      );
       const configBefore = await readFile(configPath, "utf8");
       const receiptBefore = await readFile(receiptPath, "utf8");
       await assert.rejects(
@@ -3068,42 +4262,96 @@ describe("prompt_cache_key model opt-out", () => {
   });
 
   test("multiple model fixes preserve earlier opt-outs and rollback only the latest change", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-multi-config-test-"));
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-multi-config-test-"),
+    );
     const configPath = join(tempDir, "pi-cache-optimizer-config.json");
     const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
     const otherModel = { ...model, id: "gpt-5.6", name: "GPT-5.6" };
     try {
-      await writeFile(configPath, JSON.stringify({ version: 2, footerMode: "process", promptCacheKey: { omit: ["proxy/existing"] } }, null, 2) + "\n", { mode: 0o640 });
-      await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
-      await internals.applyPromptCacheKeyConfigFix(otherModel, configPath, receiptPath);
-      assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath).promptCacheKey?.omit, ["proxy/existing", "proxy/gpt-5.5", "proxy/gpt-5.6"]);
-      const receiptSnapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+      await writeFile(
+        configPath,
+        JSON.stringify(
+          {
+            version: 2,
+            footerMode: "process",
+            promptCacheKey: { omit: ["proxy/existing"] },
+          },
+          null,
+          2,
+        ) + "\n",
+        { mode: 0o640 },
+      );
+      await internals.applyPromptCacheKeyConfigFix(
+        model,
+        configPath,
+        receiptPath,
+      );
+      await internals.applyPromptCacheKeyConfigFix(
+        otherModel,
+        configPath,
+        receiptPath,
+      );
+      assert.deepEqual(
+        internals.readPersistedCacheOptimizerConfig(configPath).promptCacheKey
+          ?.omit,
+        ["proxy/existing", "proxy/gpt-5.5", "proxy/gpt-5.6"],
+      );
+      const receiptSnapshot =
+        await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
       assert.ok(receiptSnapshot);
-      await internals.rollbackPromptCacheKeyConfig(receiptSnapshot, configPath, receiptPath);
-      assert.deepEqual(internals.readPersistedCacheOptimizerConfig(configPath), {
-        version: 2,
-        footerMode: "process",
-        promptCacheKey: { omit: ["proxy/existing", "proxy/gpt-5.5"] },
-      });
+      await internals.rollbackPromptCacheKeyConfig(
+        receiptSnapshot,
+        configPath,
+        receiptPath,
+      );
+      assert.deepEqual(
+        internals.readPersistedCacheOptimizerConfig(configPath),
+        {
+          version: 2,
+          footerMode: "process",
+          promptCacheKey: { omit: ["proxy/existing", "proxy/gpt-5.5"] },
+        },
+      );
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test("active fix requires confirmation and removes a Pi-provided key after reload", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-command-test-"));
+    const tempAgentDir = await mkdtemp(
+      join(tmpdir(), "pi-cache-key-command-test-"),
+    );
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(join(tempAgentDir, "pi-cache-optimizer-config.json"), JSON.stringify({ version: 1, footerMode: "process" }) + "\n");
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      await writeFile(
+        join(tempAgentDir, "pi-cache-optimizer-config.json"),
+        JSON.stringify({ version: 1, footerMode: "process" }) + "\n",
+      );
+      const jiti = createJiti(
+        join(process.cwd(), "tests", "review-findings.test.ts"),
+        { interopDefault: false, moduleCache: false },
+      );
+      const freshModule = await jiti.import<typeof import("../index.ts")>(
+        join(process.cwd(), "index.ts"),
+      );
       const handlers = new Map<string, (event: any, context: any) => unknown>();
-      const commands = new Map<string, { handler: (args: string, context: any) => unknown }>();
+      const commands = new Map<
+        string,
+        { handler: (args: string, context: any) => unknown }
+      >();
       freshModule.default({
-        on(name: string, handler: (event: any, context: any) => unknown) { handlers.set(name, handler); },
-        registerCommand(name: string, command: { handler: (args: string, context: any) => unknown }) { commands.set(name, command); },
+        on(name: string, handler: (event: any, context: any) => unknown) {
+          handlers.set(name, handler);
+        },
+        registerCommand(
+          name: string,
+          command: { handler: (args: string, context: any) => unknown },
+        ) {
+          commands.set(name, command);
+        },
       } as any);
       const notifications: string[] = [];
       let confirm = false;
@@ -3112,30 +4360,68 @@ describe("prompt_cache_key model opt-out", () => {
         model,
         hasUI: true,
         sessionManager: { getSessionId: () => "fixture-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+        modelRegistry: {
+          find: () => undefined,
+          getAvailable: () => [],
+          getAll: () => [],
+        },
         ui: {
-          confirm: async (_title: string, message: string) => { confirmationMessages.push(message); return confirm; },
+          confirm: async (_title: string, message: string) => {
+            confirmationMessages.push(message);
+            return confirm;
+          },
           notify: (message: string) => notifications.push(message),
           setStatus() {},
         },
       };
-      await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
-      assert.match(confirmationMessages.at(-1) ?? "", /prompt_cache_key.*promptCacheKey/s);
-      assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process" });
+      await commands
+        .get("cache-optimizer")
+        ?.handler("fix prompt-cache-key", context);
+      assert.match(
+        confirmationMessages.at(-1) ?? "",
+        /prompt_cache_key.*promptCacheKey/s,
+      );
+      assert.deepEqual(
+        freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(),
+        { version: 2, footerMode: "process" },
+      );
       confirm = true;
-      await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
-      assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process", promptCacheKey: { omit: ["proxy/gpt-5.5"] } });
-      const payload = { prompt_cache_key: "pi-generated", promptCacheKey: "caller", keep: true };
-      const result = handlers.get("before_provider_request")?.({ payload }, context) as any;
+      await commands
+        .get("cache-optimizer")
+        ?.handler("fix prompt-cache-key", context);
+      assert.deepEqual(
+        freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(),
+        {
+          version: 2,
+          footerMode: "process",
+          promptCacheKey: { omit: ["proxy/gpt-5.5"] },
+        },
+      );
+      const payload = {
+        prompt_cache_key: "pi-generated",
+        promptCacheKey: "caller",
+        keep: true,
+      };
+      const result = handlers.get("before_provider_request")?.(
+        { payload },
+        context,
+      ) as any;
       assert.deepEqual(result, { keep: true });
-      await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
+      await commands
+        .get("cache-optimizer")
+        ?.handler("fix prompt-cache-key", context);
       assert.match(notifications.at(-1) ?? "", /already omitted/);
       await commands.get("cache-optimizer")?.handler("rollback", context);
-      assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process" });
+      assert.deepEqual(
+        freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(),
+        { version: 2, footerMode: "process" },
+      );
     } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      if (previousAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
+      if (previousRetention === undefined)
+        delete process.env.PI_CACHE_RETENTION;
       else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
