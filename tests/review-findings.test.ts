@@ -178,8 +178,27 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config "),
-      [{ value: "config footer-mode", label: "footer-mode" }],
+      [
+        { value: "config footer-mode", label: "footer-mode" },
+        { value: "config retention", label: "retention" },
+      ],
     );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config r"),
+      [{ value: "config retention", label: "retention" }],
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config retention "),
+      ["long", "short", "none", "startup"].map((value) => ({ value: `config retention ${value}`, label: value })),
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config retention s"),
+      [
+        { value: "config retention short", label: "short" },
+        { value: "config retention startup", label: "startup" },
+      ],
+    );
+    assert.equal(internals.getCacheOptimizerArgumentCompletions("config retention long extra"), null);
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("stats "),
       ["all", "contributors"].map((value) => ({ value: `stats ${value}`, label: value })),
