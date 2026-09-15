@@ -2110,7 +2110,15 @@ function persistedConfigWriteShape(config: PersistedCacheOptimizerConfigV3): Run
 
 function readPersistedCacheOptimizerConfig(configPath: string = CONFIG_FILE_PATH): RuntimeCacheOptimizerConfig {
   try {
-    return normalizePersistedCacheOptimizerConfig(parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8"))));
+    const parsed = parsePersistedCacheOptimizerConfig(JSON.parse(readFileSync(configPath, "utf8")));
+    if (!parsed) {
+      // Readable + valid JSON but schema-rejected (unknown key / invalid
+      // value): surface it instead of silently steering back to defaults —
+      // a typo'd retention value must not quietly re-enable `long`.
+      console.warn(`${LOG_PREFIX}: optimizer config schema rejected (unknown keys or invalid values); using defaults`);
+      return { version: 2 };
+    }
+    return normalizePersistedCacheOptimizerConfig(parsed);
   } catch (error) {
     if (getErrorCode(error) !== "ENOENT") console.warn(`${LOG_PREFIX}: failed to read optimizer config; using defaults`, error);
     return { version: 2 };

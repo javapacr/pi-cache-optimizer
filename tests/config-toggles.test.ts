@@ -19,6 +19,9 @@ const {
   resolveConfigToggle,
   setPersistedCacheOptimizerConfig,
   setRuntimeOptimizerEnabled,
+  applyPromptCacheKeyConfigFix,
+  rollbackPromptCacheKeyConfig,
+  readPromptCacheKeyConfigReceiptSnapshot,
   isToolOrderEnabled,
   isPromptRewriteEnabled,
   isSkillCompressionEnabled,
@@ -322,6 +325,54 @@ test("writePersistedRetention round-trips and preserves sibling keys", async () 
     assert.equal(fromV1.version, 3);
     assert.equal(fromV1.retention, "startup");
     assert.equal(fromV1.footerMode, "session");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("schema-rejected readable config warns instead of silently using defaults", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-cache-reject-warn-"));
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    const path = join(dir, "pi-cache-optimizer-config.json");
+    await writeFile(path, JSON.stringify({ version: 3, retention: "forever" }) + "\n");
+    assert.deepEqual(readPersistedCacheOptimizerConfig(path), { version: 2 });
+    assert.equal(warnings.some((text) => text.includes("schema rejected")), true);
+
+    warnings.length = 0;
+    await writeFile(path, JSON.stringify({ version: 3, retention: "short" }) + "\n");
+    assert.deepEqual(readPersistedCacheOptimizerConfig(path), { version: 3, retention: "short" });
+    assert.equal(warnings.length, 0);
+  } finally {
+    console.warn = originalWarn;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("prompt-cache-key rollback preserves v3-only config", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-cache-rollback-v3-"));
+  try {
+    const configPath = join(dir, "pi-cache-optimizer-config.json");
+    const receiptPath = join(dir, "pi-cache-optimizer-config-receipt.json");
+    await writeFile(configPath, JSON.stringify({ version: 3, retention: "short" }) + "\n");
+    const model = { provider: "p", id: "m" } as Parameters<typeof applyPromptCacheKeyConfigFix>[0];
+    await applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
+    const afterFix = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(afterFix.version, 3);
+    assert.equal(afterFix.retention, "short");
+    assert.deepEqual(afterFix.promptCacheKey, { omit: ["p/m"] });
+
+    const snapshot = await readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
+    assert.ok(snapshot, "receipt snapshot readable");
+    await rollbackPromptCacheKeyConfig(snapshot, configPath, receiptPath);
+    const afterRollback = JSON.parse(await readFile(configPath, "utf8"));
+    // Invariant: rollback restores the pre-fix config; a v3-only file must
+    // survive intact (never unlinked, v3 keys never dropped).
+    assert.equal(afterRollback.version, 3);
+    assert.equal(afterRollback.retention, "short");
+    assert.equal(afterRollback.promptCacheKey, undefined);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
