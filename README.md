@@ -149,6 +149,23 @@ Complete key set with effective defaults (any key you omit from the file falls b
 
 `promptCacheKey` is the one key with no default above: it is unset until `/cache-optimizer fix prompt-cache-key` (or a manual edit) adds a per-model `omit` list.
 
+Env-var names never appear verbatim in the config file — most env vars are `NO_*` opt-outs while the config keys are positive booleans, so the equivalent is the opposite polarity. Direct translation:
+
+| Env var | Config-file equivalent |
+|---|---|
+| `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | `"promptRewrite": false` |
+| `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | `"skillCompression": false` |
+| `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` or `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | `"promptCacheKeyFallback": false` |
+| `PI_CACHE_OPTIMIZER_NO_COMPAT_WARNINGS=1` | `"compatWarnings": false` |
+| `PI_CACHE_OPTIMIZER_NO_FOOTER_STATS=1` | `"footerStats": false` |
+| `PI_CACHE_OPTIMIZER_NO_SESSION_AFFINITY=1` | `"sessionAffinity": false` |
+| `PI_CACHE_OPTIMIZER_NO_ANTHROPIC_TTL_DOWNGRADE=1` | `"anthropicTtlDowngrade": false` |
+| `PI_CACHE_OPTIMIZER_TOOL_ORDER=1` | `"deterministicToolOrdering": true` (opt-in — note the same polarity) |
+| `PI_CACHE_OPTIMIZER_RETENTION=long\|short\|none\|startup` | `"retention": "long\|short\|none\|startup"` |
+| `PI_CACHE_OPTIMIZER_FOOTER_MODE=total\|session\|process` | `"footerMode": "total\|session\|process"` |
+
+When both are set, the config key wins.
+
 A config key set to `true`/`false` always wins over the env var; an absent key defers to the env var; with neither present, behavior is byte-identical to upstream v2.8.10.
 
 ### Cache retention modes
