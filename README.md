@@ -129,6 +129,26 @@ Every optimization in this extension is individually toggleable. Two surfaces co
 | Anthropic TTL downgrade | `anthropicTtlDowngrade` | `PI_CACHE_OPTIMIZER_NO_ANTHROPIC_TTL_DOWNGRADE=1` | on | Always-on safety repair (1h → 5m when the wire order is invalid), even while `disable`d. |
 | Session affinity headers | `sessionAffinity` | `PI_CACHE_OPTIMIZER_NO_SESSION_AFFINITY=1` | on | Header restoration for models.json-configured affinity compat. |
 
+Complete key set with effective defaults (any key you omit from the file falls back to the value shown here):
+
+```json
+{
+  "version": 3,
+  "footerMode": "session",
+  "retention": "long",
+  "promptRewrite": true,
+  "skillCompression": true,
+  "promptCacheKeyFallback": true,
+  "compatWarnings": true,
+  "footerStats": true,
+  "deterministicToolOrdering": false,
+  "anthropicTtlDowngrade": true,
+  "sessionAffinity": true
+}
+```
+
+`promptCacheKey` is the one key with no default above: it is unset until `/cache-optimizer fix prompt-cache-key` (or a manual edit) adds a per-model `omit` list.
+
 A config key set to `true`/`false` always wins over the env var; an absent key defers to the env var; with neither present, behavior is byte-identical to upstream v2.8.10.
 
 ### Cache retention modes
