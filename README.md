@@ -129,7 +129,7 @@ Every optimization in this extension is individually toggleable. Two surfaces co
 | Anthropic TTL downgrade | `anthropicTtlDowngrade` | `PI_CACHE_OPTIMIZER_NO_ANTHROPIC_TTL_DOWNGRADE=1` | on | Always-on safety repair (1h → 5m when the wire order is invalid), even while `disable`d. |
 | Session affinity headers | `sessionAffinity` | `PI_CACHE_OPTIMIZER_NO_SESSION_AFFINITY=1` | on | Header restoration for models.json-configured affinity compat. |
 
-Complete key set with effective defaults (any key you omit from the file falls back to the value shown here):
+Reference of every key and the built-in fallback it inherits from the existing system when you don't set it — these are the current upstream defaults, not suggested values. **Do not copy this block into your config file**: write only the keys you explicitly want to override, so everything you leave unset keeps following the system's defaults if they change in a future version:
 
 ```json
 {
@@ -164,9 +164,7 @@ Env-var names never appear verbatim in the config file — most env vars are `NO
 | `PI_CACHE_OPTIMIZER_RETENTION=long\|short\|none\|startup` | `"retention": "long\|short\|none\|startup"` |
 | `PI_CACHE_OPTIMIZER_FOOTER_MODE=total\|session\|process` | `"footerMode": "total\|session\|process"` |
 
-When both are set, the config key wins.
-
-A config key set to `true`/`false` always wins over the env var; an absent key defers to the env var; with neither present, behavior is byte-identical to upstream v2.8.10.
+Priority order: a config key that is set wins; when the config key is absent, the environment variable takes priority; only when neither is set does the built-in default apply (byte-identical to upstream v2.8.10).
 
 ### Cache retention modes
 
