@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
-- **Last Active**: 2026-08-03
+- **Total Sessions**: 12
+- **Last Active**: 2026-09-20
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~650 | Active |
+| `journal-1.md` | ~718 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,8 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-09-20 | 升级 Pi 开发基线到 0.86.1 | `4752791` | `master` |
+| 11 | 2026-09-20 | Deep review prompt cache key safety | `a0ce9ae`, `dc9be50`, `89ed5b7` | `master` |
 | 10 | 2026-08-03 | Add total session process footer modes | `e32bdc4` | `master` |
 | 9 | 2026-08-03 | Fix footer mode interactive menu | `f766ea8` | `master` |
 | 8 | 2026-08-03 | Publish pi-cache-optimizer v2.7.0 | `8722116` | `master` |

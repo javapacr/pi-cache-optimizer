@@ -62,7 +62,7 @@ Run `/reload` in Pi after install/update/remove so extension hooks refresh.
 
 On Pi 0.79.7 and newer, `pi update` updates Pi itself only. To update installed Pi packages such as this extension, run `pi update --extensions` (packages only) or `pi update --all` (Pi + packages).
 
-This extension requires Pi 0.82+ and is validated against Pi 0.85.1. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
+This extension requires Pi 0.82+ and is validated against Pi 0.87.1. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
 
 ## Commands
 
@@ -164,7 +164,7 @@ Env-var names never appear verbatim in the config file — most env vars are `NO
 | `PI_CACHE_OPTIMIZER_RETENTION=long\|short\|none\|startup` | `"retention": "long\|short\|none\|startup"` |
 | `PI_CACHE_OPTIMIZER_FOOTER_MODE=total\|session\|process` | `"footerMode": "total\|session\|process"` |
 
-Priority order: a config key that is set wins; when the config key is absent, the environment variable takes priority; only when neither is set does the built-in default apply (byte-identical to upstream v2.8.10).
+Priority order: a config key that is set wins; when the config key is absent, the environment variable takes priority; only when neither is set does the built-in default apply (byte-identical to upstream).
 
 ### Cache retention modes
 
@@ -225,7 +225,7 @@ The explicit setting is stored in `pi-cache-optimizer-config.json` under Pi's ag
 
 ## Per-model `prompt_cache_key` opt-out
 
-Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.85.1 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
+Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.87.1 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
 
 When the extension observes an explicit field-level `prompt_cache_key` unsupported error for the exact provider/model, ordinary `/cache-optimizer fix` offers a confirmed model-scoped repair. Value-validation failures and conditional restrictions such as “not allowed when temperature is set” do not qualify. If concurrent responses from different models cannot be correlated because Pi provides no request ID, header-only evidence is ignored unless the finalized assistant message supplies exact provider/model identity. If you already know that the endpoint rejects the field, use the explicit command:
 
@@ -239,7 +239,7 @@ The preview explains that the setting is stored in the extension-owned `pi-cache
 
 Third-party `openai-completions` proxies (LiteLLM / OneAPI / NewAPI / OpenRouter-like channels) often route one session across multiple upstream backends. That splits provider-side prompt caches.
 
-Pi 0.84.1 also fixes built-in Fireworks compatibility for models that reject `prompt_cache_retention`; the extension avoids provider-name special cases and resolves exact provider/model compat from `models.json` plus the runtime model. Pi 0.81+ also has a built-in `llama.cpp` provider using an OpenAI-shaped transport. Pi 0.82+ core generates a session `prompt_cache_key` for it when cache retention is enabled, so this extension preserves that key and may add the same conservative fallback when missing. The built-in provider's explicit compat fingerprint is excluded from generic proxy routing/session-affinity advice, but a custom or overridden provider that merely reuses the id `llama.cpp` is treated like any other OpenAI-compatible channel. `prompt_cache_retention` remains subject to the normal safety rule: keep it only for official OpenAI or an explicit effective `supportsLongCacheRetention: true` opt-in in `models.json`; otherwise strip it before sending. Pi 0.85.1 has no native `supportsPromptCacheKey` compat field, so the per-model key opt-out is stored in this extension's `pi-cache-optimizer-config.json` instead of `models.json`. The extension config is independent of Pi's compat precedence and only affects the exact provider/model listed there.
+Pi 0.84.1 also fixes built-in Fireworks compatibility for models that reject `prompt_cache_retention`; the extension avoids provider-name special cases and resolves exact provider/model compat from `models.json` plus the runtime model. Pi 0.81+ also has a built-in `llama.cpp` provider using an OpenAI-shaped transport. Pi 0.82+ core generates a session `prompt_cache_key` for it when cache retention is enabled, so this extension preserves that key and may add the same conservative fallback when missing. The built-in provider's explicit compat fingerprint is excluded from generic proxy routing/session-affinity advice, but a custom or overridden provider that merely reuses the id `llama.cpp` is treated like any other OpenAI-compatible channel. `prompt_cache_retention` remains subject to the normal safety rule: keep it only for official OpenAI or an explicit effective `supportsLongCacheRetention: true` opt-in in `models.json`; otherwise strip it before sending. Pi 0.87.1 has no native `supportsPromptCacheKey` compat field, so the per-model key opt-out is stored in this extension's `pi-cache-optimizer-config.json` instead of `models.json`. The extension config is independent of Pi's compat precedence and only affects the exact provider/model listed there.
 
 For real proxies, start with session affinity:
 
@@ -265,7 +265,7 @@ Notes:
 
 - `sendSessionAffinityHeaders: true` is the safe default when your proxy supports sticky routing.
 - `supportsLongCacheRetention: true` is optional. Add it only when the endpoint explicitly supports OpenAI long prompt cache retention.
-- Do not add `supportsPromptCacheKey` to `models.json`: Pi 0.85.1 does not define that compat field. Use `/cache-optimizer fix prompt-cache-key` to store an exact provider/model omit rule in the extension-owned config; it removes both key spellings, including a key supplied by Pi.
+- Do not add `supportsPromptCacheKey` to `models.json`: Pi 0.87.1 does not define that compat field. Use `/cache-optimizer fix prompt-cache-key` to store an exact provider/model omit rule in the extension-owned config; it removes both key spellings, including a key supplied by Pi.
 - If you see `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongCacheRetention` for that channel. Keep `sendSessionAffinityHeaders` if supported. The extension detects the explicit error from response headers or the finalized assistant error message and strips the parameter from subsequent requests in the current process.
 - Use `/cache-optimizer compat` or `/cache-optimizer doctor` to see model-specific advice.
 - DeepSeek model names select the `DS cache` adapter only; they do not prove a reasoning wire protocol. Generic cache/routing advice remains active for absent or non-DeepSeek formats. DeepSeek replay advice is shown only when effective `compat.thinkingFormat: "deepseek"` is explicitly configured; it never treats `thinkingFormat` as a missing fix key.
@@ -353,7 +353,7 @@ Pi 0.80.9+ already includes Kimi K3 in built-in Kimi Coding, Moonshot AI / China
 - DeepSeek Pi Mono replay compat (`requiresReasoningContentOnAssistantMessages: true` only when `thinkingFormat: "deepseek"` is already explicit; `/fix` never invents that format)
 - OpenAI-compatible proxy session affinity (`sendSessionAffinityHeaders: true` for `openai-completions`). Pi 0.80.7+ controls `openai-responses` header shape with `sessionAffinityFormat` and auto-detects its default; this extension no longer writes the removed `sendSessionIdHeader` field.
 
-**Scope:** only the currently active model. Other channels require switching models and running `fix` again.
+**Scope:** the fix starts from the currently active model. An affinity-only repair can write provider-level compat once for all applicable models on that provider, including models absent from `models[]` when the provider entry already exists and no higher-priority setting shadows it. Explicit per-model `false` remains an opt-out. Other or ambiguous repairs stay model-scoped.
 
 **Safety:**
 
@@ -366,15 +366,15 @@ Pi 0.80.9+ already includes Kimi K3 in built-in Kimi Coding, Moonshot AI / China
 7. Writes a privacy-safe, versioned receipt atomically only after a successful write; the receipt contains transaction/model identity, placement, scalar compat before/after values, file hashes, backup filename, timestamps/status, and no credentials or request data
 8. Uses unique, non-overwriting backup names and falls back to manual guidance if the JSONC scanner cannot confidently locate the target
 
-Existing `modelOverrides[modelId]` entries have Pi's highest precedence, so `fix` repairs them directly. For built-in or API-login models without a custom `models[]` entry, `fix` creates a compat-only `modelOverrides` entry instead of inventing a custom model definition. Runtime-observed provider failures are always written to that highest-precedence model override so extension-provided runtime compat cannot shadow the repair. Self-validation checks the full provider → custom model → runtime model → modelOverride result and rejects an ineffective lower-layer edit.
+Existing `modelOverrides[modelId]` entries have Pi's highest precedence, so `fix` repairs them directly. For built-in or API-login models without a custom `models[]` entry, an affinity-only fix prefers provider-level compat when the existing provider is safely locatable and no higher-priority explicit/runtime value shadows it; otherwise `fix` creates a compat-only `modelOverrides` entry instead of inventing a custom model definition. Runtime-observed provider failures are always written to that highest-precedence model override so extension-provided runtime compat cannot shadow the repair. Self-validation checks the full provider → custom model → runtime model → modelOverride result and rejects an ineffective lower-layer edit.
 
 **Non-interactive mode:** refuses to write; shows manual edit guidance instead.
 
-**Run:** `/cache-optimizer fix` when the active model has detected compat issues. The command shows "nothing to fix" when compat is already complete.
+**Run:** `/cache-optimizer fix` when the active model has detected compat issues. Affinity-only missing-compat notifications are shown once per provider per extension instance and point to this confirmed command; model-specific warnings remain separate. The command shows "nothing to fix" when compat is already complete.
 
 ## `/cache-optimizer rollback`
 
-Rollback is available through completion, direct execution, and the interactive menu. It always requires UI confirmation; without an interactive UI it gives manual-review guidance and does not write. The command selects the latest unapplied receipt for the active provider/model, validates the recorded backup and current file hashes, creates a new access-mode-preserving rollback backup, and uses temp-file + atomic rename. Fix and rollback transactions are serialized across extension instances; rollback also binds the receipt transaction id/hash from preview through commit and refuses if another transaction replaces it.
+Rollback is available through completion, direct execution, and the interactive menu. It always requires UI confirmation; without an interactive UI it gives manual-review guidance and does not write. The command selects the latest unapplied receipt for the active provider/model (or any active model on that provider for a provider-level receipt), validates the recorded backup and current file hashes, creates a new access-mode-preserving rollback backup, and uses temp-file + atomic rename. Fix and rollback transactions are serialized across extension instances; rollback also binds the receipt transaction id/hash from preview through commit and refuses if another transaction replaces it.
 
 If `models.json` is unchanged since the fix, rollback can restore the exact pre-fix JSONC. If the file changed, it never blindly replaces it: it may restore only receipt-owned scalar compat keys whose recorded post-fix values are still present, preserving later user changes. If a receipt-owned key changed, the target was removed/moved, or the fix created a new target entry, it refuses and points to the recorded backup for manual review. Successful rollback marks the receipt and requires `/reload` or a restart.
 
@@ -443,7 +443,7 @@ Example footer:
 · OpenAI cache 3/10·0.002M/0.005M 40.0% ⚠️ compat
 ```
 
-The leading `·` is owned by this extension and separates its status from statuses published by other extensions in the same footer. It is present for normal, disabled, router-restored, and warning-suffixed statuses. The compact footer format is `<label> <hit requests>/<total requests>·<cached input tokens>/<total input tokens> <token hit rate>`; token hit rate keeps one decimal place and the footer omits the redundant `tok` suffix. `/cache-optimizer stats` lists detailed current-session models; `/cache-optimizer stats all` lists all local models and includes compact summaries such as `4/5·0.66M/0.84M 78.7%`. Some adapters may also append `·write <tokens>`, and runtime diagnostics may append `⚠️ compat` or `⚠️ integrity`.
+The leading `· ` is owned by this extension and separates its status from statuses published by other extensions in the same footer. It is present for normal, disabled, router-restored, and warning-suffixed statuses. The compact footer format is `<label> <hit requests>/<total requests>·<cached input tokens>/<total input tokens> <token hit rate>`; token hit rate keeps one decimal place and the footer omits the redundant `tok` suffix. `/cache-optimizer stats` lists detailed current-session models; `/cache-optimizer stats all` lists all local models and includes compact summaries such as `4/5·0.66M/0.84M 78.7%`. Some adapters may also append `·write <tokens>`, and runtime diagnostics may append `⚠️ compat` or `⚠️ integrity`.
 
 Supported footer labels include: DS, Claude, OpenAI, Gemini, Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan, Mistral, Grok, Llama, Nemotron, Cohere, Yi, Doubao, ERNIE, Baichuan, StepFun, Spark, InternLM, Gemma, Phi, Jamba, Solar, Sonar, Nova, Reka, Falcon, DBRX, MPT, StableLM, Aquila, EXAONE, HyperCLOVA, Luminous, Hermes, Granite, Arctic, Pangu, SenseNova, Zhinao, MiniCPM, XVERSE, Orion, OpenChat, Vicuna, Wizard, Zephyr, Dolphin, OpenOrca, Starling, BLOOM, RWKV, and Aya.
 

@@ -202,7 +202,7 @@ core's own cache transport.
   persistently listed in the extension-owned config as
   `promptCacheKey.omit`; this removes both request-key spellings, including a
   key already supplied by Pi. Do not add `supportsPromptCacheKey` to Pi's
-  `models.json`, because Pi 0.85.1 does not define that compat field.
+  `models.json`, because Pi 0.87.1 does not define that compat field.
 * All `before_agent_start` prompt mutations (session-overview churn strip,
   skill compression, stable-prefix reorder) can be disabled persistently with:
   `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` (truthy: `1`, `true`, `yes`, `on`).
@@ -1225,7 +1225,7 @@ only the status line as before.
 
 ### `/cache-optimizer fix`
 
-Auto-repairs safe compat issues detected for the **current active model only**.
+Starts safe compat repair from the current active model. Affinity-only fixes may be placed at provider scope for an existing provider when the active model is absent from `models[]` and no higher-priority explicit/runtime affinity value shadows the edit. Such confirmed edits cover applicable sibling models; explicit model-level `false` remains an opt-out. Affinity-only warnings dedupe per provider per extension instance and direct the user to `/cache-optimizer fix`; model-specific warnings remain separate.
 For an explicit prompt-cache-key unsupported signal, or for the informed command
 `/cache-optimizer fix prompt-cache-key`, it instead writes the extension-owned
 config and does not modify `models.json`.
@@ -1277,7 +1277,9 @@ Safety contract:
   remains shadowed MUST fail self-check.
 * If the target already has a `modelOverrides[modelId]` entry, the fix MUST repair
   that highest-precedence entry directly. For a built-in/API-login model without
-  a custom `models[]` entry, the fix MAY create a provider and/or compat-only
+  a custom `models[]` entry, an affinity-only fix MAY write provider-level compat
+  if the existing provider is safely locatable and no higher-priority explicit/runtime
+  value shadows it; otherwise the fix MAY create a provider and/or compat-only
   `modelOverrides[modelId]` entry after preview and confirmation. It MUST NOT
   invent a custom `models[]` definition, API key, credential, base URL, or router
   slug.
@@ -1321,7 +1323,7 @@ after checking owner PID plus file identity, and active live owners are never ev
 only because a transaction runs longer than a timeout. It MUST require
 `ctx.ui.confirm`; without an
 interactive UI it refuses to write and points to the recorded backup for manual
-review. It uses the latest actionable receipt matching the active provider/model.
+review. It uses the latest actionable receipt matching the active provider/model, or a provider-level receipt matching the active provider even if a sibling model is selected.
 
 A receipt is versioned and atomic and contains only a transaction id, exact
 provider/model identity, placement, whether the target existed before, changed
@@ -1472,7 +1474,7 @@ compat). It does NOT read or expose:
 | Every non-empty extension footer status | Begins with `· `, including disabled-mode, router-restored, integrity-warning, and compat-warning variants; other extension statuses remain visibly separated |
 | `/cache-optimizer` argument completion | Native `getArgumentCompletions` offers top-level commands including `rollback`, `config`, `config footer-mode`, and `total`/`session`/`process`, filters by prefix, tolerates surrounding whitespace, and returns `null` for unknown prefixes |
 | Footer status when compat is fixed or model changes | `⚠️ compat` marker clears |
-| `/cache-optimizer fix` with API-logged-in model not in models.json (interactive UI) | Analyzes models.json, shows a preview of a compat-only `modelOverrides[modelId]` entry, confirms, writes atomically with backup, validates the full provider/model/runtime/modelOverride result, and succeeds |
+| `/cache-optimizer fix` with API-logged-in model not in models.json (interactive UI) | For an existing provider and affinity-only missing value, previews one provider-level compat edit when no explicit/runtime override shadows it; otherwise previews a compat-only `modelOverrides[modelId]` entry. Both paths confirm, write atomically with backup/receipt, and validate the effective precedence result. |
 | `/cache-optimizer fix` with API-logged-in model not in models.json (non-interactive) | Shows manual guidance with complete JSON snippet, keeps existing auth as-is, includes fallback for both missing-provider and missing-model scenarios |
 | Direct `/cache-optimizer fix` and no-args menu Fix | Both paths call the same command handler. Permanent command-level tests run both against a temporary `PI_CODING_AGENT_DIR`, require confirmation, compare the unique backup byte-for-byte, preserve the original access mode, parse the written JSONC, validate effective modelOverrides compat, and assert comments/credentials/unrelated fields remain unchanged |
 | `/cache-optimizer fix` creates new provider entry in models.json | Does NOT create API keys, credentials, baseUrl, router slugs, or a custom `models[]` definition; only inserts a minimal compat-only `modelOverrides` structure |
@@ -1488,7 +1490,7 @@ compat). It does NOT read or expose:
 | Router/channel diagnostics do not affect adapter selection | An OpenRouter Llama model still selects the Llama adapter, not an "OpenRouter" adapter |
 | Diagnostic text must not expose API keys, prompts, payloads, or model output | All router/channel output uses only provider, api, baseUrl, compat metadata |
 | Third-party OpenAI-compatible proxy (`openai-completions` or `openai-responses`) returns HTTP 400 while `supportsLongCacheRetention` is enabled | Extension records a one-time model-scoped warning from an explicit response-header or assistant-error-message `prompt_cache_retention` unsupported signal; subsequent current-process requests strip the parameter and `/cache-optimizer doctor` surfaces the recovery hint. Routed assistant errors use message-local provider/model/API identity even without a live registry; value-validation-only `bad request` errors do not activate the fallback. |
-| Third-party `openai-completions` proxy returns HTTP 403 while `sendSessionAffinityHeaders` is enabled | Extension records a one-time model-scoped warning (`sendSessionAffinityHeaders403Models`) and `/cache-optimizer doctor` surfaces the session-affinity 403 hint with `/cache-optimizer fix` offering `sendSessionAffinityHeaders: false`. Pi 0.80.7+ `openai-responses` is excluded because it uses `sessionAffinityFormat`. |
+| Third-party `openai-completions` proxy returns HTTP 403 while `sendSessionAffinityHeaders` is enabled | Extension records a one-time model-scoped warning (`sendSessionAffinityHeaders403Models`) and `/cache-optimizer doctor` surfaces the session-affinity 403 hint with `/cache-optimizer fix` offering a highest-precedence model-scoped `sendSessionAffinityHeaders: false`; the runtime observation MUST NOT broaden to provider scope. Pi 0.80.7+ `openai-responses` is excluded because it uses `sessionAffinityFormat`. |
 | `/cache-optimizer doctor` with session-affinity enabled but no 403 observed | Shows advisory text that some CDNs/WAFs block custom headers (session_id, x-client-request-id, x-session-affinity) and return 403 |
 | `/cache-optimizer fix` with 403-observed OpenAI-compatible model | Offers `sendSessionAffinityHeaders: false` as the compat-key suggestion (mirror of the 400 `supportsLongCacheRetention: false` path) |
 | `/cache-optimizer fix` after explicit field-level `prompt_cache_key` unsupported evidence | Shows a precise model-scoped extension-config preview and offers final payload omission; value-validation or conditional-use errors do not qualify, ambiguous cross-model response headers are discarded unless finalized message identity resolves them, and no `models.json` field is written |

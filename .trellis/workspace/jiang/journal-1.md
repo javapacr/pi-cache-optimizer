@@ -648,3 +648,71 @@ Preserved PR contributor session semantics, added process-local footer mode that
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: Deep review prompt cache key safety
+
+**Date**: 2026-09-20
+**Task**: Deep review prompt cache key safety
+**Branch**: `master`
+
+### Summary
+
+Completed and merged the 2.8.9 prompt-cache-key security review: fixed five P1/P2 transaction, evidence-correlation, and concurrency issues with permanent regression coverage; verified quality gates and archived the completed related tasks.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a0ce9ae` | (see git log) |
+| `dc9be50` | (see git log) |
+| `89ed5b7` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 12: 升级 Pi 开发基线到 0.86.1
+
+**Date**: 2026-09-20
+**Task**: 升级 Pi 开发基线到 0.86.1
+**Branch**: `master`
+
+### Summary
+
+将项目本地 Pi 开发基线升级到 0.86.1，完成干净安装、类型检查、102 项测试、diff 与打包验证；评估确认无需调整运行时逻辑、测试或 peer 最低版本，仅同步兼容性文档与规范。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4752791` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
