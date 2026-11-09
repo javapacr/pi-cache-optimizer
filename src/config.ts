@@ -414,6 +414,7 @@ export function getOptimizerRuntimeModeLines(): string[] {
   lines.push(`• OpenAI prompt_cache_key fallback: ${shouldInjectOpenAIPromptCacheKey() ? "on" : "off"}`);
   lines.push(`• Footer cache stats: on${runtimeOptimizerEnabled ? "" : " (comparison mode)"}`);
   lines.push(`• Compat warnings: ${runtimeOptimizerEnabled ? "on" : "off"}`);
+  lines.push(`• ${formatCacheRetentionSetting()}`);
   lines.push(`• ${PI_CACHE_RETENTION_ENV}: ${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`);
   lines.push(`• Persistent feature overrides: ${Object.keys(persistedCacheOptimizerConfig.features ?? {}).length > 0 ? "configured" : "none"}`);
   if (!runtimeOptimizerEnabled) {
@@ -442,6 +443,14 @@ export function formatPersistentFeatureConfig(): string {
     lines.push(`• ${label}: ${featureEnabled(feature, envName, defaultValue) ? "on" : "off"} (${source})`);
   }
   return lines.join("\n");
+}
+
+export function formatCacheRetentionSetting(
+  config: PersistedCacheOptimizerConfigV3 = persistedCacheOptimizerConfig,
+  env: MutableEnv = process.env,
+): string {
+  const { mode, source } = resolveCacheRetentionMode(config.retention, env);
+  return `Retention: ${mode} (${source})`;
 }
 
 export function formatOptimizerRuntimeMode(): string {

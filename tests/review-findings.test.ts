@@ -114,7 +114,7 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config "),
-      ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"].map((value) => ({ value: `config ${value}`, label: value })),
+      ["footer-mode", "retention", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"].map((value) => ({ value: `config ${value}`, label: value })),
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("stats "),
@@ -133,12 +133,25 @@ describe("footer status separation and command completion", () => {
       [{ value: "config footer-mode session", label: "session" }],
     );
     assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config r"),
+      [{ value: "config retention", label: "retention" }, { value: "config reset", label: "reset" }],
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config retention "),
+      ["long", "short", "none", "startup"].map((value) => ({ value: `config retention ${value}`, label: value })),
+    );
+    assert.deepEqual(
+      internals.getCacheOptimizerArgumentCompletions("config retention s"),
+      [{ value: "config retention short", label: "short" }, { value: "config retention startup", label: "startup" }],
+    );
+    assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("fix p"),
       [{ value: "fix prompt-cache", label: "prompt-cache" }, { value: "fix prompt-cache-key", label: "prompt-cache-key" }],
     );
     assert.equal(internals.getCacheOptimizerArgumentCompletions("unknown "), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions("config unknown "), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions("config footer-mode session extra"), null);
+    assert.equal(internals.getCacheOptimizerArgumentCompletions("config retention long extra"), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions(undefined as unknown as string), null);
   });
 });

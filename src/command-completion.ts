@@ -1,4 +1,5 @@
 import { type PersistedCacheOptimizerFeature } from "./config.ts";
+import { CACHE_RETENTION_MODES } from "./retention.ts";
 
 export type CommandCompletionItem = {
   value: string;
@@ -18,7 +19,7 @@ export const CACHE_OPTIMIZER_COMMANDS = [
   "rollback",
 ] as const;
 
-export const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"] as const;
+export const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "retention", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"] as const;
 
 export const CACHE_OPTIMIZER_FEATURE_COMMANDS = ["prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental"] as const;
 
@@ -102,11 +103,17 @@ export function getCacheOptimizerArgumentCompletions(argumentPrefix: string): Co
     if (nestedPrefix === "footer-mode") {
       return filterCommandCompletionItems(CACHE_OPTIMIZER_FOOTER_MODES, "", "config footer-mode");
     }
+    if (nestedPrefix === "retention") {
+      return filterCommandCompletionItems(CACHE_RETENTION_MODES, "", "config retention");
+    }
     return filterCommandCompletionItems(CACHE_OPTIMIZER_CONFIG_ARGUMENTS, parts[1], "config");
   }
 
   if (parts.length === 3 && parts[1].toLowerCase() === "footer-mode") {
     return filterCommandCompletionItems(CACHE_OPTIMIZER_FOOTER_MODES, parts[2], "config footer-mode");
+  }
+  if (parts.length === 3 && parts[1].toLowerCase() === "retention") {
+    return filterCommandCompletionItems(CACHE_RETENTION_MODES, parts[2], "config retention");
   }
   if (parts.length === 3 && CACHE_OPTIMIZER_FEATURE_COMMANDS.includes(parts[1] as typeof CACHE_OPTIMIZER_FEATURE_COMMANDS[number])) {
     return filterCommandCompletionItems(CACHE_OPTIMIZER_FEATURE_VALUES, parts[2], `config ${parts[1]}`);

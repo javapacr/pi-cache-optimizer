@@ -11,6 +11,7 @@ import {
   RETENTION_ENV,
   applyCacheRetentionMode,
   decidePromptCacheRetention,
+  getOrCaptureCacheRetentionBaseline,
   parseCacheRetentionMode,
   resolveCacheRetentionMode,
 } from "../src/retention.ts";
@@ -20,6 +21,7 @@ import {
 type ConfigModule = typeof import("../src/config.ts");
 type PromptCacheKeyConfigModule = typeof import("../src/prompt-cache-key-config.ts");
 type ExtensionModule = typeof import("../index.ts");
+type CompletionModule = typeof import("../src/command-completion.ts");
 
 const CONFIG_FILE_NAME = "pi-cache-optimizer-config.json";
 const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
@@ -389,4 +391,196 @@ test("gate: fork-mode writes never count as user-requested", async () => {
     });
     assert.deepEqual(decision, preset === "long" ? { keep: true, reason: "user-requested-long" } : { keep: false, reason: "unverified-endpoint" }, label);
   }
+});
+
+type CommandHarness = {
+  extension: ExtensionModule;
+  dir: string;
+  configPath: string;
+  notifications: string[];
+  selectCalls: string[];
+  handler: (args: string) => Promise<unknown>;
+  sessionStart: () => Promise<void>;
+};
+
+function claudeModel() {
+  return {
+    provider: "anthropic",
+    id: "claude-sonnet-4-5",
+    name: "Claude Sonnet 4.5",
+    api: "anthropic-messages",
+    baseUrl: "https://api.anthropic.com",
+    compat: {},
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 32_000,
+  };
+}
+
+async function commandHarness(
+  config: unknown,
+  options: { hasUI?: boolean; model?: unknown; select?: (title: string, options: string[]) => string | undefined } = {},
+): Promise<CommandHarness> {
+  const dir = await agentDir(config);
+  const extension = await fresh<ExtensionModule>("index.ts");
+  const commands = new Map<string, { handler: (args: string, context: unknown) => Promise<unknown> }>();
+  const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+  extension.default({
+    on(name: string, handler: (event: unknown, context: unknown) => unknown) {
+      handlers.set(name, handler);
+    },
+    registerCommand(name: string, command: { handler: (args: string, context: unknown) => Promise<unknown> }) {
+      commands.set(name, command);
+    },
+  } as never);
+  const command = commands.get("cache-optimizer");
+  assert.ok(command, "cache-optimizer command registered");
+  const notifications: string[] = [];
+  const selectCalls: string[] = [];
+  const context = {
+    model: options.model,
+    hasUI: options.hasUI ?? false,
+    sessionManager: { getSessionId: () => "retention-command-session" },
+    modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+    ui: {
+      notify: (message: string) => notifications.push(message),
+      setStatus() {},
+      select: async (title: string, choices: string[]) => {
+        selectCalls.push(title);
+        return options.select?.(title, choices);
+      },
+    },
+  };
+  return {
+    extension,
+    dir,
+    configPath: join(dir, CONFIG_FILE_NAME),
+    notifications,
+    selectCalls,
+    handler: (args) => command.handler(args, context),
+    sessionStart: async () => {
+      await handlers.get("session_start")?.({ reason: "startup" }, context);
+      await extension.__internals_for_tests.waitForStatsRestore();
+    },
+  };
+}
+
+function startupValue(): string | undefined {
+  const baseline = getOrCaptureCacheRetentionBaseline();
+  return baseline.wasSet ? baseline.value : undefined;
+}
+
+test("command: config retention <mode> persists and applies live", async () => {
+  const expected: Record<(typeof CACHE_RETENTION_MODES)[number], () => string | undefined> = {
+    long: () => "long",
+    short: () => "short",
+    none: () => undefined,
+    startup: startupValue,
+  };
+  const harness = await commandHarness(undefined);
+  const sentinel = `sentinel-${process.pid}-${Date.now()}`;
+  for (const mode of CACHE_RETENTION_MODES) {
+    assert.notEqual(expected[mode](), sentinel, `${mode} must be distinguishable from the sentinel`);
+    process.env[PI_CACHE_RETENTION_ENV] = sentinel;
+    await harness.handler(`config retention ${mode}`);
+    const raw = await readJson(harness.configPath);
+    assert.equal(raw.version, 3);
+    assert.equal(raw.retention, mode);
+    assert.equal(process.env[PI_CACHE_RETENTION_ENV], expected[mode](), mode);
+  }
+
+  const before = await readFile(harness.configPath, "utf8");
+  harness.notifications.length = 0;
+  await harness.handler("config retention forever");
+  assert.match(harness.notifications.join("\n"), /Usage: \/cache-optimizer config retention long\|short\|none\|startup/);
+  assert.equal(await readFile(harness.configPath, "utf8"), before);
+});
+
+test("command: while disabled the mode is stored and applied on enable", async () => {
+  const harness = await commandHarness({ version: 3, retention: "long" });
+  await harness.sessionStart();
+  process.env[PI_CACHE_RETENTION_ENV] = `sentinel-${process.pid}-${Date.now()}`;
+  await harness.handler("disable");
+  const baseline = startupValue();
+  assert.equal(process.env[PI_CACHE_RETENTION_ENV], baseline);
+
+  await harness.sessionStart();
+  assert.equal(process.env[PI_CACHE_RETENTION_ENV], baseline, "session_start while disabled must not re-apply retention");
+  if (baseline === undefined) delete process.env[PI_CACHE_RETENTION_ENV];
+  else process.env[PI_CACHE_RETENTION_ENV] = baseline;
+
+  const mode = baseline === "short" ? "long" : "short";
+  await harness.handler(`config retention ${mode}`);
+  assert.equal((await readJson(harness.configPath)).retention, mode);
+  assert.equal(process.env[PI_CACHE_RETENTION_ENV], baseline);
+
+  await harness.handler("enable");
+  assert.notEqual(baseline, mode);
+  assert.equal(process.env[PI_CACHE_RETENTION_ENV], mode);
+});
+
+// pi 1.5.0 loads extensions with moduleCache:false, which freezes imported `export let` bindings (D35).
+test("command: a live retention switch is seen by session_start and later switches", async () => {
+  const harness = await commandHarness(undefined);
+  await harness.sessionStart();
+
+  await harness.handler("config retention short");
+  assert.equal(process.env[PI_CACHE_RETENTION_ENV], "short");
+  await harness.sessionStart();
+  assert.equal(process.env[PI_CACHE_RETENTION_ENV], "short");
+
+  await harness.handler("config retention none");
+  assert.ok((harness.notifications.at(-1) ?? "").includes("Retention: none (config)"), harness.notifications.at(-1));
+  assert.equal(PI_CACHE_RETENTION_ENV in process.env, false);
+  await harness.sessionStart();
+  assert.equal(PI_CACHE_RETENTION_ENV in process.env, false);
+});
+
+test("surfaces: config listing, runtime status and doctor show the Retention line", async () => {
+  const harness = await commandHarness({ version: 3, retention: "short" }, { model: claudeModel() });
+
+  await harness.handler("config");
+  const listing = harness.notifications.at(-1) ?? "";
+  assert.ok(listing.includes("• Retention: short (config)"), listing);
+  assert.ok(listing.includes("• Footer mode: session"), listing);
+
+  assert.ok(harness.extension.__internals_for_tests.getOptimizerRuntimeModeLines().includes("• Retention: short (config)"));
+
+  await harness.handler("doctor");
+  const doctor = harness.notifications.at(-1) ?? "";
+  assert.ok(doctor.includes("Retention: short (config) · PI_CACHE_RETENTION=short"), doctor);
+});
+
+test("surfaces: the interactive menu Retention entry persists the mode", async () => {
+  const harness = await commandHarness(undefined, {
+    hasUI: true,
+    select: (title, choices) => choices.find((choice) => choice.startsWith(title === "Cache Optimizer" ? "Retention" : "short")),
+  });
+  await harness.handler("");
+  assert.deepEqual(harness.selectCalls, ["Cache Optimizer", "Cache retention mode"]);
+  assert.equal((await readJson(harness.configPath)).retention, "short");
+});
+
+test("surfaces: help text documents config retention", async () => {
+  const harness = await commandHarness(undefined, { hasUI: false });
+  await harness.handler("");
+  assert.ok(harness.notifications.join("\n").includes("config retention long|short|none|startup"));
+});
+
+test("surfaces: completion offers exactly the four modes", async () => {
+  await agentDir();
+  const completion = await fresh<CompletionModule>("src/command-completion.ts");
+  const items = completion.getCacheOptimizerArgumentCompletions("config retention ");
+  assert.deepEqual(items?.map((item) => item.label), ["long", "short", "none", "startup"]);
+});
+
+test("invalid: the Retention line names the source actually used", async () => {
+  await agentDir({ version: 3, retention: "forever" });
+  const config = await fresh<ConfigModule>("src/config.ts");
+  process.env[RETENTION_ENV] = "short";
+  assert.equal(config.formatCacheRetentionSetting(), "Retention: short (env)");
+  process.env[RETENTION_ENV] = "forever";
+  assert.equal(config.formatCacheRetentionSetting(), "Retention: long (default)");
 });

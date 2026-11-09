@@ -8,7 +8,7 @@ import { FEATURE_COMMAND_MAP } from "./command-completion.ts";
 import { type PiModel, asRecord } from "./common.ts";
 import { describeMissingCacheCompatForModel, getModelsJsonDisplayPath, isAdaptiveThinkingCompatApplicable } from "./compat-advice.ts";
 import { resolveEffectiveCompatFromConfig } from "./compat-config.ts";
-import { isZeroPriceWarmingEnabled, FOOTER_MODE_ENV, type FooterStatsMode, formatOptimizerRuntimeMode, formatPersistentFeatureConfig, persistedFooterStatsMode, readPersistedCacheOptimizerConfig, resetPersistedFeatures, resolveFooterStatsMode, setPersistedCacheOptimizerConfig, setRuntimeOptimizerEnabled, writePersistedFeature, writePersistedFooterMode } from "./config.ts";
+import { isZeroPriceWarmingEnabled, FOOTER_MODE_ENV, type FooterStatsMode, applyPersistedCacheRetention, formatCacheRetentionSetting, formatOptimizerRuntimeMode, formatPersistentFeatureConfig, isRuntimeOptimizerEnabled, persistedFooterStatsMode, readPersistedCacheOptimizerConfig, resetPersistedFeatures, resolveFooterStatsMode, setPersistedCacheOptimizerConfig, setRuntimeOptimizerEnabled, writePersistedFeature, writePersistedFooterMode, writePersistedRetention } from "./config.ts";
 import { buildCompatDiagnosis, buildDoctorDiagnosis, buildLowHitDiagnosis, getCompatCheckNotApplicableLines, isCompatCheckApplicable, isDeepSeekCompatCheckApplicable, isPromptCacheKeyUnsupportedApplicable } from "./diagnostics.ts";
 import { locateModelOverrideInJsonc, parseJsonc } from "./jsonc.ts";
 import { invalidateModelsConfigCache, isValidModelsConfigForEffectiveCompat, modelKey } from "./model-identity.ts";
@@ -24,7 +24,7 @@ import { type ProviderRequestState } from "./request-state.ts";
 import { type CacheStats, type ShardAggregate } from "./stats-store.ts";
 import { type CacheUsageSample } from "./stats-report.ts";
 import { describeSkillCompressionOutcome } from "./prompt-rewrite.ts";
-import { describePromptCacheRetentionDecision, getLastPromptCacheRetentionDecision, LONG_CACHE_RETENTION_VALUE, PI_CACHE_RETENTION_ENV } from "./retention.ts";
+import { CACHE_RETENTION_MODES, describePromptCacheRetentionDecision, getLastPromptCacheRetentionDecision, LONG_CACHE_RETENTION_VALUE, PI_CACHE_RETENTION_ENV, RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, parseCacheRetentionMode } from "./retention.ts";
 import { buildCacheWarmingDiagnosis, type CacheWarmingMode } from "./cache-warming.ts";
 
 /**
@@ -126,7 +126,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
           : [];
         const kimiBaseUrlLines = buildKimiBaseUrlDoctorLines(model);
         const modelsJsonLintLines = buildModelsJsonLintDoctorLines();
-        const fullDiagnosis = [routeNote, diagnosis, kimiBaseUrlLines.length > 0 ? kimiBaseUrlLines.join("\n") : undefined, modelsJsonLintLines.length > 0 ? modelsJsonLintLines.join("\n") : undefined, describeSkillCompressionOutcome(), describePromptCacheRetentionDecision(getLastPromptCacheRetentionDecision()), ...warmingLines, ...lowHitLines].filter((line) => line !== undefined).join("\n");
+        const fullDiagnosis = [routeNote, diagnosis, formatCacheRetentionSetting() + " · " + PI_CACHE_RETENTION_ENV + "=" + (process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"), kimiBaseUrlLines.length > 0 ? kimiBaseUrlLines.join("\n") : undefined, modelsJsonLintLines.length > 0 ? modelsJsonLintLines.join("\n") : undefined, describeSkillCompressionOutcome(), describePromptCacheRetentionDecision(getLastPromptCacheRetentionDecision()), ...warmingLines, ...lowHitLines].filter((line) => line !== undefined).join("\n");
         cmdCtx.ui.notify(fullDiagnosis, "info");
       } else if (subcommand === "stats") {
         const aggregate = await refreshShardAggregate();
@@ -145,6 +145,23 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
         const configKey = commandParts[1];
         const requestedMode = commandParts[2];
         const feature = configKey ? FEATURE_COMMAND_MAP[configKey] : undefined;
+        if (configKey === "retention") {
+          const retentionMode = parseCacheRetentionMode(requestedMode);
+          if (!retentionMode) {
+            cmdCtx.ui.notify(`Usage: /cache-optimizer config retention long|short|none|startup\nCurrent: ${formatCacheRetentionSetting()}`, "info");
+            return;
+          }
+          try {
+            await writePersistedRetention(retentionMode);
+            if (isRuntimeOptimizerEnabled()) applyPersistedCacheRetention(process.env, STARTUP_CACHE_RETENTION_ENV);
+            clearLastStatusText();
+            await publishStatus(cmdCtx, model);
+            cmdCtx.ui.notify(`✅ ${formatCacheRetentionSetting()}. Persistent config overrides ${RETENTION_ENV}.`, "info");
+          } catch (error) {
+            cmdCtx.ui.notify(`❌ Could not update retention: ${error instanceof Error ? error.message : String(error)}`, "error");
+          }
+          return;
+        }
         if (feature && (requestedMode === "on" || requestedMode === "off")) {
           try {
             await writePersistedFeature(feature, requestedMode === "on");
@@ -168,14 +185,15 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
           return;
         }
         if (!configKey) {
-          cmdCtx.ui.notify(formatPersistentFeatureConfig() + `\n• Footer mode: ${resolveFooterStatsMode(persistedFooterStatsMode).mode}` + "\n\n" +
-            "Usage: /cache-optimizer config <feature> on|off | footer-mode total|session|process | reset", "info");
+          cmdCtx.ui.notify(formatPersistentFeatureConfig() + `\n• Footer mode: ${resolveFooterStatsMode(persistedFooterStatsMode).mode}` + `\n• ${formatCacheRetentionSetting()}` + "\n\n" +
+            "Usage: /cache-optimizer config <feature> on|off | footer-mode total|session|process | retention long|short|none|startup | reset", "info");
           return;
         }
         if (configKey !== "footer-mode" || !requestedMode || !["session", "total", "process"].includes(requestedMode)) {
           const resolved = resolveFooterStatsMode(persistedFooterStatsMode);
           cmdCtx.ui.notify(
             `Usage: /cache-optimizer config footer-mode total|session|process\n` +
+            `       /cache-optimizer config retention long|short|none|startup\n` +
             `       /cache-optimizer config prompt-rewrite|virtual-rewrite|skill-compression|openai-cache-key|tool-order|zero-price-warming|stats-incremental on|off\n` +
             `       /cache-optimizer config reset\n` +
             `Current footer mode: ${resolved.mode} (${resolved.source})`,
@@ -968,6 +986,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
             "Disable prompt_cache_key — Omit it for the active model",
             "Rollback — Undo the latest confirmed fix",
             "Footer mode — Choose total, session, or process stats",
+            "Retention — Choose long, short, none, or startup cache retention",
             "Reset — Reset local provider/model stats",
             "Cancel",
           ];
@@ -1000,6 +1019,17 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
                   : undefined;
             if (nextMode) await handleCacheOptimizerCommand(`config footer-mode ${nextMode}`, cmdCtx);
           } else if (choice === menuOptions[9]) {
+            const retentionOptions = [
+              "long — 1-hour cache TTL (upstream default)",
+              "short — 5-minute cache TTL",
+              "none — Remove PI_CACHE_RETENTION (Pi core default)",
+              "startup — Keep the value Pi started with",
+              "Cancel",
+            ];
+            const retentionChoice = await cmdCtx.ui.select("Cache retention mode", retentionOptions);
+            const nextRetention = retentionOptions.indexOf(retentionChoice ?? "Cancel");
+            if (nextRetention >= 0 && nextRetention < 4) await handleCacheOptimizerCommand(`config retention ${CACHE_RETENTION_MODES[nextRetention]}`, cmdCtx);
+          } else if (choice === menuOptions[10]) {
             await handleCacheOptimizerCommand("reset", cmdCtx);
           }
           // choice === "cancel" or undefined → no action
@@ -1018,6 +1048,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
         diagnosis.push("  compat  — Show compat suggestion with edit location");
         diagnosis.push("  config prompt-rewrite|virtual-rewrite|skill-compression|openai-cache-key|tool-order|zero-price-warming|stats-incremental on|off — Persist feature settings");
         diagnosis.push("  config footer-mode total|session|process — Persist the footer stats mode");
+        diagnosis.push("  config retention long|short|none|startup — Persist the cache retention mode (steers PI_CACHE_RETENTION)");
         diagnosis.push("  config reset — Remove persistent feature overrides");
         diagnosis.push("  fix     — Auto-fix compat issues (writes models.json or extension config, requires UI)");
         diagnosis.push("  fix prompt-cache — Add promptCache lifetimes so Pi's cache warming can run");
