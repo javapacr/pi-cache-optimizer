@@ -37,6 +37,45 @@ export function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, en
   }
 }
 
+export const RETENTION_ENV = "PI_CACHE_OPTIMIZER_RETENTION";
+
+export const CACHE_RETENTION_MODES = ["long", "short", "none", "startup"] as const;
+
+export type CacheRetentionMode = (typeof CACHE_RETENTION_MODES)[number];
+
+export type CacheRetentionSource = "config" | "env" | "default";
+
+export function parseCacheRetentionMode(value: unknown): CacheRetentionMode | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return CACHE_RETENTION_MODES.find((mode) => mode === normalized);
+}
+
+export function resolveCacheRetentionMode(
+  configured: CacheRetentionMode | undefined,
+  env: MutableEnv,
+): { mode: CacheRetentionMode; source: CacheRetentionSource } {
+  if (configured) return { mode: configured, source: "config" };
+  const envMode = parseCacheRetentionMode(env[RETENTION_ENV]);
+  return envMode ? { mode: envMode, source: "env" } : { mode: "long", source: "default" };
+}
+
+export function applyCacheRetentionMode(
+  mode: CacheRetentionMode,
+  env: MutableEnv,
+  startupSnapshot?: CacheRetentionEnvSnapshot,
+): void {
+  if (mode === "long") {
+    requestLongCacheRetention(env);
+  } else if (mode === "short") {
+    if (env[PI_CACHE_RETENTION_ENV] !== "short") env[PI_CACHE_RETENTION_ENV] = "short";
+  } else if (mode === "none") {
+    delete env[PI_CACHE_RETENTION_ENV];
+  } else if (startupSnapshot) {
+    restoreCacheRetentionEnv(startupSnapshot, env);
+  }
+}
+
 /**
  * Why `prompt_cache_retention` was kept on, or removed from, a provider payload.
  *
@@ -146,7 +185,7 @@ export const STARTUP_CACHE_RETENTION_ENV = getOrCaptureCacheRetentionBaseline();
  *
  * What it does:
  * 1. Reorders Pi's system prompt so stable content is sent before dynamic context.
- * 2. Sets PI_CACHE_RETENTION=long at extension load time.
+ * 2. Steers PI_CACHE_RETENTION at extension load time (fork: mode-aware, see applyConfiguredCacheRetention in src/config.ts; default long).
  * 3. Warns once for provider/model cache compat gaps where the signal is conservative.
  * 4. Shows lightweight persisted provider-specific cache stats in Pi's footer.
  * 5. Offers disabled-by-default deterministic built-in tool ordering when
@@ -155,9 +194,3 @@ export const STARTUP_CACHE_RETENTION_ENV = getOrCaptureCacheRetentionBaseline();
  * Provider prompt/KV caches are provider-side and best-effort. This extension improves
  * the odds of cache hits; it cannot guarantee hits, especially through proxies.
  */
-
-// ============================================================
-// Automatically request long prompt-cache retention when Pi supports it.
-// /cache-optimizer disable restores the startup value for this Pi process.
-// ============================================================
-requestLongCacheRetention();

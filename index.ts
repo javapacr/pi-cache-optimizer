@@ -21,7 +21,7 @@ import { STATS_INCREMENTAL_ENV, STATS_TIMING_ENV, STATS_VERIFY_ENV, isStatsIncre
 import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
 import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
 import { LONG_CACHE_RETENTION_VALUE, PI_CACHE_RETENTION_BASELINE_SYMBOL, PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, captureCacheRetentionEnv, getOrCaptureCacheRetentionBaseline, decidePromptCacheRetention, recordPromptCacheRetentionDecision, requestLongCacheRetention, restoreCacheRetentionEnv, userRequestedLongCacheRetention } from "./src/retention.ts";
-import { isRuntimeOptimizerEnabled, isZeroPriceWarmingEnabled, setRuntimeOptimizerEnabled } from "./src/config.ts";
+import { applyPersistedCacheRetention, isRuntimeOptimizerEnabled, isZeroPriceWarmingEnabled, setRuntimeOptimizerEnabled } from "./src/config.ts";
 import { compareToolOrderEntries, getToolNameForPayload, isKnownToolOrderApi, isToolOrderingEligibleModel, isVerifiedToolForApi, normalizeToolsInPayload, sortToolsInPayload } from "./src/tool-ordering.ts";
 import { SKILL_COMPRESSION_MIN_COUNT, SKILL_PATH_RULE_WORDINGS, compressSkillsInSystemPrompt, compressSkillsViaSection, formatSkillsForPrompt, formatSkillsForPromptCompressed, stripSessionOverviewChurn, explainSkillCompressionSkip, recordSkillCompressionOutcome, getLastSkillCompressionOutcome, describeSkillCompressionOutcome } from "./src/prompt-rewrite.ts";
 import { addEffectiveSessionAffinityHeaders, addOpenAIPromptCacheKey, clampPromptCacheKey, collectAnthropicCacheControlsInWireOrder, downgradeAnthropicLongCacheControls, getEffectiveCompatValueSource, hasAnthropicCacheTtlOrderError, hasEffectivePromptCacheKey, isPromptCacheKeyOmittedForModel, normalizeAnthropicCacheControlTtlOrder, omitOpenAIPromptCacheKeys, shouldInjectOpenAIPromptCacheKeyForModel, withAnthropicCacheTtlRepair, withoutPromptCacheRetention, derivePromptCacheKey } from "./src/request-payload.ts";
@@ -1664,7 +1664,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (event, ctx) => {
-    if (runtimeOptimizerEnabled) requestLongCacheRetention();
+    if (isRuntimeOptimizerEnabled()) applyPersistedCacheRetention(process.env);
     // Do not block Pi's startup on historical stats (issue #28). The
     // restore runs in the background (chained after any earlier restore so
     // two never interleave) and the footer is published when it finishes.

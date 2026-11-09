@@ -1,7 +1,7 @@
 import { type AtomicTargetGuard, atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, hashText, withModelsJsonTransactionLock } from "./atomic-fs.ts";
 import { LOG_PREFIX, type MutableEnv, asRecord, getErrorCode, isNonEmptyString } from "./common.ts";
 import { STATE_DIR } from "./paths.ts";
-import { PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, requestLongCacheRetention, restoreCacheRetentionEnv } from "./retention.ts";
+import { type CacheRetentionEnvSnapshot, type CacheRetentionMode, PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, applyCacheRetentionMode, parseCacheRetentionMode, resolveCacheRetentionMode, restoreCacheRetentionEnv } from "./retention.ts";
 import { type Stats, readFileSync } from "node:fs";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
@@ -56,6 +56,7 @@ export type PersistedCacheOptimizerConfigV3 = {
   footerMode?: FooterStatsMode;
   promptCacheKey?: { omit?: string[] };
   features?: Partial<Record<PersistedCacheOptimizerFeature, boolean>>;
+  retention?: CacheRetentionMode;
 };
 
 export type PersistedCacheOptimizerConfig = PersistedCacheOptimizerConfigV1 | PersistedCacheOptimizerConfigV2 | PersistedCacheOptimizerConfigV3;
@@ -135,7 +136,7 @@ export function parseFooterStatsMode(value: unknown): FooterStatsMode | undefine
 export function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCacheOptimizerConfig | undefined {
   const record = asRecord(value);
   if (!record || (record.version !== 1 && record.version !== 2 && record.version !== 3)) return undefined;
-  const allowedTopLevel = new Set(record.version === 1 ? ["version", "footerMode"] : record.version === 2 ? ["version", "footerMode", "promptCacheKey"] : ["version", "footerMode", "promptCacheKey", "features"]);
+  const allowedTopLevel = new Set(record.version === 1 ? ["version", "footerMode"] : record.version === 2 ? ["version", "footerMode", "promptCacheKey"] : ["version", "footerMode", "promptCacheKey", "features", "retention"]);
   if (Object.keys(record).some((key) => !allowedTopLevel.has(key))) return undefined;
   const footerMode = parseFooterStatsMode(record.footerMode);
   if (record.footerMode !== undefined && !footerMode) return undefined;
@@ -146,6 +147,8 @@ export function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCac
   const featuresRecord = asRecord(rawFeatures);
   const featureNames = new Set<PersistedCacheOptimizerFeature>(["promptRewrite", "virtualRewrite", "skillCompression", "openAICacheKey", "toolOrder", "zeroPriceWarming", "statsIncremental"]);
   if (featuresRecord && Object.keys(featuresRecord).some((key) => !featureNames.has(key as PersistedCacheOptimizerFeature) || typeof featuresRecord[key] !== "boolean")) return undefined;
+
+  const retention = record.version === 3 ? parseCacheRetentionMode(record.retention) : undefined;
 
   const rawPromptCacheKey = record.promptCacheKey;
   if (rawPromptCacheKey !== undefined && !asRecord(rawPromptCacheKey)) return undefined;
@@ -159,6 +162,7 @@ export function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCac
     version: record.version === 3 ? 3 : 2,
     ...(footerMode ? { footerMode } : {}),
     ...(uniqueOmit && uniqueOmit.length > 0 ? { promptCacheKey: { omit: uniqueOmit } } : {}),
+    ...(retention ? { retention } : {}),
     ...(featuresRecord ? { features: Object.fromEntries(Object.entries(featuresRecord)) as Partial<Record<PersistedCacheOptimizerFeature, boolean>> } : {}),
   } as PersistedCacheOptimizerConfigV3;
 }
@@ -166,10 +170,12 @@ export function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCac
 export function normalizePersistedCacheOptimizerConfig(value: PersistedCacheOptimizerConfig | undefined): PersistedCacheOptimizerConfigV3 {
   if (!value) return { version: 2 };
   const features = value.version === 3 ? value.features : undefined;
+  const retention = value.version === 3 ? value.retention : undefined;
   return {
-    version: features ? 3 : 2,
+    version: features || retention ? 3 : 2,
     ...(value.footerMode ? { footerMode: value.footerMode } : {}),
     ...(value.version !== 1 && value.promptCacheKey ? { promptCacheKey: value.promptCacheKey } : {}),
+    ...(retention ? { retention } : {}),
     ...(features ? { features } : {}),
   };
 }
@@ -271,8 +277,8 @@ export async function writePersistedFooterMode(
   await withModelsJsonTransactionLock(() => writePersistedFooterModeUnlocked(mode, configPath));
 }
 
-async function updatePersistedFeatures(
-  update: (features: Partial<Record<PersistedCacheOptimizerFeature, boolean>>) => PersistedCacheOptimizerConfigV3["features"],
+async function updatePersistedConfig(
+  update: (current: PersistedCacheOptimizerConfigV3) => PersistedCacheOptimizerConfigV3,
   configPath: string,
 ): Promise<void> {
   await withModelsJsonTransactionLock(async () => {
@@ -298,13 +304,16 @@ async function updatePersistedFeatures(
       }
     }
     const current = normalizePersistedCacheOptimizerConfig(raw);
-    await writePersistedCacheOptimizerConfigUnlocked({
-      ...current,
-      version: 3,
-      features: update(current.features ?? {}),
-    }, configPath, guard);
+    await writePersistedCacheOptimizerConfigUnlocked(update(current), configPath, guard);
   });
   if (configPath === CONFIG_FILE_PATH) setPersistedCacheOptimizerConfig(readPersistedCacheOptimizerConfig());
+}
+
+async function updatePersistedFeatures(
+  update: (features: Partial<Record<PersistedCacheOptimizerFeature, boolean>>) => PersistedCacheOptimizerConfigV3["features"],
+  configPath: string,
+): Promise<void> {
+  await updatePersistedConfig((current) => ({ ...current, version: 3, features: update(current.features ?? {}) }), configPath);
 }
 
 export async function writePersistedFeature(
@@ -317,6 +326,10 @@ export async function writePersistedFeature(
 
 export async function resetPersistedFeatures(configPath: string = CONFIG_FILE_PATH): Promise<void> {
   await updatePersistedFeatures(() => undefined, configPath);
+}
+
+export async function writePersistedRetention(mode: CacheRetentionMode, configPath: string = CONFIG_FILE_PATH): Promise<void> {
+  await updatePersistedConfig((current) => ({ ...current, version: 3, retention: mode }), configPath);
 }
 
 export function resolveFooterStatsMode(
@@ -335,9 +348,25 @@ export function footerStatsMode(
   return resolveFooterStatsMode(configuredMode, env).mode;
 }
 
+export function applyConfiguredCacheRetention(
+  config: PersistedCacheOptimizerConfigV3,
+  env: MutableEnv,
+  startupSnapshot?: CacheRetentionEnvSnapshot,
+): void {
+  applyCacheRetentionMode(resolveCacheRetentionMode(config.retention, env).mode, env, startupSnapshot);
+}
+
 export let persistedCacheOptimizerConfig = readPersistedCacheOptimizerConfig();
 
+/** Reads the module-internal config: pi's jiti loader freezes imported `export let` bindings, so callers outside this module must not read `persistedCacheOptimizerConfig` themselves. */
+export function applyPersistedCacheRetention(env: MutableEnv, startupSnapshot?: CacheRetentionEnvSnapshot): void {
+  applyConfiguredCacheRetention(persistedCacheOptimizerConfig, env, startupSnapshot);
+}
+
 export let persistedFooterStatsMode = persistedCacheOptimizerConfig.footerMode;
+
+// fork D1′: replaces upstream's top-level requestLongCacheRetention() in retention.ts; explicit arguments (TDZ rule).
+applyConfiguredCacheRetention(persistedCacheOptimizerConfig, process.env);
 
 export function isDisabledEnv(value: string | undefined): boolean {
   if (!value) return false;
@@ -357,7 +386,7 @@ export function setPersistedCacheOptimizerConfig(config: PersistedCacheOptimizer
 export function setRuntimeOptimizerEnabled(enabled: boolean, env: MutableEnv = process.env): void {
   runtimeOptimizerEnabled = enabled;
   if (enabled) {
-    requestLongCacheRetention(env);
+    applyConfiguredCacheRetention(persistedCacheOptimizerConfig, env);
   } else {
     restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV, env);
   }

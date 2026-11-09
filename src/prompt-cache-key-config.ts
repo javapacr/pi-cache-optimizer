@@ -313,7 +313,7 @@ export async function rollbackPromptCacheKeyConfigUnderLock(
       { backupHash: receipt.beforeHash, identity: currentInfo, hash: currentHash, mode: currentMode },
     );
     rollbackResultInfo = await lstat(configPath);
-  } else if (current.footerMode || omit.length > 1 || (current.version === 3 && current.features)) {
+  } else if (current.footerMode || omit.length > 1 || (current.version === 3 && (current.features || current.retention))) {
     const remaining = omit.filter((item) => item !== receipt.addedModelKey);
     const restored = normalizePersistedCacheOptimizerConfig({
       ...current,
