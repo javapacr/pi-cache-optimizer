@@ -95,6 +95,41 @@ test("model-specific diagnostics remain separate within one provider", async () 
   assert.ok(warnings.some((text) => text.includes("proxy/deepseek-b")));
 });
 
+test("provider-level affinity compat suppresses warnings for every sibling model", async () => {
+  await writeFile(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      proxy: {
+        compat: { sendSessionAffinityHeaders: true },
+        models: [{ id: "mimo-a" }, { id: "qwen-b" }],
+      },
+    },
+  }));
+  const { hooks, context, notifications } = setup();
+  for (const id of ["mimo-a", "qwen-b", "unlisted-model"]) {
+    const current = model(id);
+    await hooks.get("model_select")?.({ model: current }, context(current));
+  }
+  assert.equal(notifications.filter((text) => text.includes("merged compat lacks")).length, 0);
+});
+
+test("provider-level generic compat does not invent DeepSeek wire protocol warnings", async () => {
+  await writeFile(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      proxy: {
+        compat: {
+          sendSessionAffinityHeaders: true,
+          requiresReasoningContentOnAssistantMessages: true,
+          supportsReasoningEffort: true,
+        },
+      },
+    },
+  }));
+  const { hooks, context, notifications } = setup();
+  const current = model("DeepSeek-V4-Flash", "proxy", { supportsReasoningEffort: true });
+  await hooks.get("model_select")?.({ model: current }, context(current));
+  assert.equal(notifications.length, 0);
+});
+
 test("one confirmed provider repair covers missing models, preserves explicit false, and rolls back", async () => {
   const path = join(agentDir, "models.json");
   const original = `{"providers":{"proxy":{"api":"openai-completions","baseUrl":"https://proxy.example/v1","modelOverrides":{"opted-out":{"compat":{"sendSessionAffinityHeaders":false}}}}}}`;
@@ -204,6 +239,37 @@ test("observed affinity-header 403 stays model-scoped", async () => {
   assert.equal(changed.providers.proxy.compat.sendSessionAffinityHeaders, true);
   assert.equal(changed.providers.proxy.modelOverrides.blocked.compat.sendSessionAffinityHeaders, false);
   assert.equal(changed.providers.proxy.modelOverrides.sibling, undefined);
+});
+
+test("issue #30: misspelled provider compat key is named in the affinity warning and fix preview", async () => {
+  const path = join(agentDir, "models.json");
+  const original = JSON.stringify({
+    providers: {
+      proxy: {
+        api: "openai-completions",
+        baseUrl: "https://proxy.example/v1",
+        compat: { sendSessionAfinityHeaders: true },
+      },
+    },
+  });
+  await writeFile(path, original);
+  const hint = '⚠️ providers["proxy"].compat.sendSessionAfinityHeaders is not a known Pi key and looks like a typo of "sendSessionAffinityHeaders"; Pi ignores unknown keys, so it most likely has no effect.';
+  const { hooks, commands, context, notifications, previews } = setup();
+  const current = model("mimo-typo");
+  await hooks.get("model_select")?.({ model: current }, context(current));
+  const warning = notifications.find((text) => text.includes("merged compat lacks"));
+  assert.ok(warning?.includes(hint));
+
+  await commands.get("cache-optimizer")!.handler("fix", context(current, false));
+  assert.ok(previews.at(-1)?.includes(hint));
+  assert.equal(await readFile(path, "utf8"), original);
+
+  // An approved fix adds the correct key and leaves the misspelled one untouched.
+  await commands.get("cache-optimizer")!.handler("fix", context(current, true));
+  const written = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(written.providers.proxy.compat.sendSessionAfinityHeaders, true);
+  assert.equal(written.providers.proxy.compat.sendSessionAffinityHeaders, true);
+  await rm(join(agentDir, "pi-cache-optimizer-fix-receipt.json"), { force: true });
 });
 
 test("ambiguous or malformed provider compat fails closed", () => {

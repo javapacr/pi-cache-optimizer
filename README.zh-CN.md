@@ -19,12 +19,15 @@
 - [持久 Opt-out](#持久-opt-out)
 - [按模型关闭 `prompt_cache_key`](#按模型关闭-prompt_cache_key)
 - [Opt-in 确定性工具排序](#opt-in-确定性工具排序)
+- [Footer 刷新（2.10）](#footer-刷新210)
 - [Footer 缓存统计模式](#footer-缓存统计模式)
 - [OpenAI-compatible 代理配置](#openai-compatible-代理配置)
+- [Prompt cache 保温（Pi 0.86+）](#prompt-cache-保温pi-086)
 - [Adaptive thinking 模型](#adaptive-thinking-模型)
 - [使用 `/cache-optimizer fix` 自动修复](#使用-cache-optimizer-fix-自动修复)
 - [DeepSeek 协议安全与回滚](#deepseek-协议安全与回滚)
 - [Footer 统计](#footer-统计)
+- [原生虚拟模型（Pi 0.99+）](#原生虚拟模型pi-099)
 - [Router / Virtual-channel 扩展作者指南](#router--virtual-channel-扩展作者指南)
 - [卸载](#卸载)
 - [验证效果](#验证效果)
@@ -32,16 +35,16 @@
 
 ## 功能
 
-- 将能唯一定位的稳定 system prompt 内容移动到动态上下文之前。如果同一候选出现多次（例如动态上下文引用了它），则保持原样，避免删除错误的那一处。
-- 压缩 Pi skill 列表，并移除 session-overview 中的易变字段。
+- 将 Pi 的 skill 列表压缩为按目录分组的 Markdown 列表，保留每个 skill 的名称和完整描述（只去掉 XML 外壳和重复路径），并移除 session-overview 中的易变字段。这两项都是原位修改，不会在 Pi 的提示段之间搬移内容，对 OpenAI Responses/Codex 模型同样生效。（早期版本还会把“稳定”内容提到提示最前面；Pi 0.86 起已按从稳定到易变的顺序拼段，实测前缀稳定性没有差别，因此移除了这一步。）
 - 在 Pi / provider compat 支持时请求长缓存保留。
-- 对 `openai-completions` / `openai-responses` 请求，在没有有效 key 时使用 Pi session id 补 `prompt_cache_key`；Pi 0.82+ core 对内置 `llama.cpp` 也使用这一语义。
+- 仅对 `openai-completions` 代理请求，在没有有效 key 时按会话保守补 `prompt_cache_key`；本扩展自己补的值（该 key、session-affinity 头补齐、cache hints）使用 Pi session id 的单向哈希（`pi-<32 位 hex>`）；Pi 核心自己设置的 key 和头保持不变，已有 key 也绝不覆盖；Pi 1.0+ 已负责 Responses/Codex transport 的 key。
 - 对缺少缓存 / session-affinity compat 的第三方 OpenAI-compatible 代理给出一次性提醒。
-- 检测 Claude（opus-4.6+ 含 Opus 5、sonnet-4.6+ 含 Sonnet 5、fable-5+）以及 Kimi Coding K3 / `kimi-for-coding` 自定义渠道的 adaptive-thinking compat。
+- 检测 Claude（opus-4.6+ 含 Opus 5、sonnet-4.6+ 含 Sonnet 5、fable-5+、haiku-5+ 含 Haiku 5.5）以及 Kimi Coding K3 / `kimi-for-coding` 自定义渠道的 adaptive-thinking compat。
 - 使用每个 extension instance 独占的原子 shard 保存缓存统计，避免父会话、子 Pi agent 和并行 Pi 进程互相覆盖。
 - Footer 默认显示当前 conversation session 的 provider/model 统计；`total` 可聚合同一精确 provider/model 的所有有效本地 shard。
 - 通过版本化全局协议（`Symbol.for("pi.routing.registry.v1")` 与 `Symbol.for("pi.cache.hints.v1")`）支持可选的 router extension 集成，而不导入任何 router 包。
 - 提供默认关闭的确定性排序，用于已验证的 Pi 内置工具 payload。
+- 支持 Pi 0.99+ 原生虚拟模型（`pi.registerVirtualModel()`）：请求 hook、footer 统计和诊断都作用于每次请求实际路由到的物理模型。
 
 缓存是 provider 侧的 best-effort 行为。第三方代理和 router extension 仍可能隐藏缓存 usage、拒绝不支持的参数，或把请求路由到多个上游。
 
@@ -61,7 +64,7 @@ pi remove npm:pi-deepseek-cache-optimizer && pi install npm:pi-cache-optimizer
 
 Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安装的 Pi package（包括本扩展），请运行 `pi update --extensions`（只更新 packages）或 `pi update --all`（Pi 与 packages 一起更新）。
 
-本扩展要求 Pi 0.82+，并已使用 Pi 0.87.1 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。
+本扩展要求 Pi 0.82+，并已使用 Pi 1.5.0 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。原生虚拟模型支持与 codemode 嵌套工具调用合并只在会产生它们的 Pi 0.99+ 上生效，较早版本保持原有行为。本地开发基线需要 Node.js 22.19.0 或更高版本，与 Pi 1.0.3 的 engine 要求一致。
 
 ## 命令
 
@@ -70,7 +73,7 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `/cache-optimizer` | UI 支持时打开交互菜单；否则打印帮助和当前状态。 |
 | `/cache-optimizer enable` | 在当前 Pi 进程中开启运行时优化，清零本地 footer 统计，并开始新的“开启状态”测量。 |
 | `/cache-optimizer disable` | 在当前 Pi 进程中关闭优化，清零本地 footer 统计，并继续以 disabled 对比模式采集 footer 统计。运行 `/reload` 或重启 Pi 后回到启动时行为。 |
-| `/cache-optimizer doctor` | 显示当前模型 / provider / API / base URL / compat 与低命中诊断。 |
+| `/cache-optimizer doctor` | 显示当前模型 / provider / API / base URL / compat、上一次提示中 skill 列表是否被压缩（未压缩时给出原因，例如无法识别 Pi 的格式）、Pi 缓存保温是否生效以及低命中诊断。 |
 | `/cache-optimizer compat` | 对当前模型显示可复制的 compat 建议（如适用）。 |
 | `/cache-optimizer stats` | 显示当前 conversation session 今天使用过的各 cache-adapter-matched 模型详细统计。 |
 | `/cache-optimizer stats all` | 显示所有有效本地 session/shard 今天的逐模型详细总计，包括请求数与 token 数。 |
@@ -78,21 +81,46 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `/cache-optimizer reset` | 重置当前 provider/model 的本地 footer 统计；不会修改上游 provider 缓存。 |
 | `/cache-optimizer config footer-mode total\|session\|process` | 持久设置 footer 统计模式；持久命令配置优先于环境变量。 |
 | `/cache-optimizer fix` | 为当前模型自动修复安全的 compat 问题。展示预览 + 风险提示，需要用户确认；原生 compat 修复写 `models.json`，已观测到的 `prompt_cache_key` 问题写扩展配置。 |
+| `/cache-optimizer fix prompt-cache` | 为当前模型写入 `promptCache` 缓存时长，让 Pi 原生保温生效。带预览、备份、receipt 和回滚。需要确认。 |
 | `/cache-optimizer fix prompt-cache-key` | 明确把当前 OpenAI-compatible provider/model 配置为从最终请求体移除 `prompt_cache_key` 与 `promptCacheKey`。需要确认。 |
+| `/cache-optimizer fix kimi-base-url` | 为使用 OpenAI Chat Completions 的模型（Pi 1.3.0+ `kimi-coding`）在官方 Kimi Code base URL（`api.kimi.com` / `api.kimi.ai`，路径 `/coding`）后补 `/v1`。带预览、备份、receipt 和回滚。需要确认。 |
 | `/cache-optimizer rollback` | 查看最近一次匹配的已确认修复；经 UI 确认后安全恢复扩展配置或 `models.json` 修复。 |
 
-`/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer fix <Tab>` 补全 `prompt-cache-key`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
+`/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer fix <Tab>` 补全 `prompt-cache`、`prompt-cache-key` 或 `kimi-base-url`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
 
 交互式 `/cache-optimizer` 菜单包含 `Footer mode`，可以选择 `total`、`session` 或 `process`。`enable` / `disable` 是当前进程内开关。若要持久关闭某些能力，请使用下面的环境变量。
+
+Doctor 显示的 endpoint URL 会移除用户名/密码、查询参数和 fragment。无效 URL 显示为不可用；实际 transport URL 不会被修改。
 
 ## 持久 Opt-out
 
 | 环境变量 | 作用 |
 |---|---|
 | `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | 只关闭 prompt 改写；footer 统计和 cache-key fallback 仍启用。 |
+| `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` | 显式允许原生 virtual prompt 改写，但仅当 routing registry 暴露的候选链不包含 Responses/Codex 时生效。路由未知或信息不完整时仍保持原 prompt。 |
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | 保留 Pi 原始 verbose skill XML。 |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | 关闭 OpenAI-compatible `prompt_cache_key` fallback。推荐使用这个显式 opt-out。 |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | 通过旧的反向开关关闭同一个 fallback。取值 `0`、`false`、`no`、`off` 时关闭。 |
+| `PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0` | 增量 footer 刷新的 kill switch（见 [Footer 刷新（2.10）](#footer-刷新210)）：每次刷新重新 stat 全部 shard 文件，与 2.9.3 相同。取值 `0`、`false`、`no`、`off` 时关闭。 |
+| `PI_CACHE_OPTIMIZER_STATS_TIMING=1` | 开启 footer 刷新计时日志（JSON lines，写到 agent 目录下的 `pi-cache-optimizer-stats-timing.jsonl`；取值为绝对路径时写到该路径）。默认关闭。 |
+| `PI_CACHE_OPTIMIZER_STATS_VERIFY=1` | 开启校验：每次后台全扫之后，检查有没有 shard 文件内容变了、文件身份（inode、大小、时间戳）却没变。没有 inode、时间戳精度又粗的文件系统（FAT、部分 SMB 服务器）会出现这种情况。发现的文件会被重新读取；出现两次后提示一次改用 kill switch。默认关闭。 |
+
+持久化 feature 配置由 Pi agent 目录中的原生命令管理，并且优先于对应环境变量，包括上面的两个 OpenAI cache-key 开关。运行时 `disable` 仍会抑制优化，不受持久配置影响：
+
+```text
+/cache-optimizer config prompt-rewrite on|off
+/cache-optimizer config virtual-rewrite on|off
+/cache-optimizer config skill-compression on|off
+/cache-optimizer config openai-cache-key on|off
+/cache-optimizer config tool-order on|off
+/cache-optimizer config stats-incremental on|off
+/cache-optimizer config footer-mode total|session|process
+/cache-optimizer config reset
+```
+
+对于 `openai-codex-responses`，即使开启 skill compression，也会保留 Pi 原生 skill index。真实 `openai-codex/gpt-6-luna` 任务级 benchmark 表明，较短的 Markdown skill index 虽然减少了单次 prompt，但可能增加模型的工具调用轨迹和最终任务总成本；因此 Codex 保留 Pi 原生 XML skill 列表，同时继续使用本扩展的其他缓存与运行时优化。
+
+`config reset` 在共享事务锁内读取最新磁盘配置，只移除持久化 feature 覆盖，保留最新 footer mode、按模型配置的 prompt-cache-key 设置和文件权限。JSON/schema 无效、symlink、非普通文件或并发手动修改时会拒绝覆盖。这些命令不会修改 shell 启动文件或 `PI_CACHE_RETENTION`；`enable` 和 `disable` 仍然是当前进程的运行时开关。
 
 ## Opt-in 确定性工具排序
 
@@ -110,17 +138,38 @@ bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
 
 该 verifier 只报告数字形式的工具排序变化，并确认带 cache marker 的 payload 不会变化。由于它不会连接 provider，provider cache usage 会明确报告为 unavailable，也不会虚构 cache hit。
 
+## Footer 刷新（2.10）
+
+2.10 之前，每次 footer 刷新都要 stat 每一个原始 shard 文件（忙碌的一天约 400 个），而且 Pi 在每次工具调用、每条 assistant 消息和每次 settle 之后都要等它完成。在 Windows 上，杀毒软件扫描让每次 stat 都很贵，一次刷新约 28 ms，直接压在 agent 循环的关键路径上。自 2.10 起：
+
+- **Pi 不再等待。** `tool_execution_end`、`agent_settled`、`message_end` 之后的刷新改在后台进行（用量仍先同步记入内存）。同一时刻最多只有一个刷新在跑；期间到来的请求共享一个在它之后开始的后续刷新，所以拿到的结果不会早于请求时刻。命令（`stats`、`doctor`、`reset` 等）、`session_shutdown` 和切换模型仍然等待一次新鲜的刷新；shutdown 会先等后台刷新结束再做最后一次写入，所以 print 模式不会在刷新中途退出。
+- **文件操作更少。** 每次刷新列一次 shard 目录（新增和删除的 shard 立刻可见），只 stat 新文件和"热"集合：active shard、最近 15 分钟内更新过的 shard，以及 TUI watcher 报告有变化的文件。文件只有变了才重新读取。本进程自己的 shard 从不读回（内存里的副本更新）。在基准夹具上（约 400 个原始 shard，每次文件操作 0.2 ms），一次刷新从约 410 次文件操作、29 ms 降到约 18 次（2 次列目录、10 个 active shard 的 stat、6 次 epoch 读取）、3 ms 以内。
+- **陈旧上限。** 已关闭的 shard 只会被它所属的进程改写：该进程用同一个 shard 开始另一个 session 时（Pi 在 `/new`、`/resume`、fork 之间沿用同一个 extension：shutdown 把 shard 关闭，下一个 session 又把它写回 active）。如果很快发生，15 分钟窗口能覆盖；关闭超过 15 分钟的 shard 只在有刷新发生时由后台全扫复查，最多每 30 秒一次（同时最多 2 个文件操作）。所以这类文件的变化（包括这种较晚的重新激活）最迟约 30 秒加一次全扫的时间后反映到 footer。active 和最近更新的 shard（所有活着的进程的）、新增和删除的 shard、reset epoch 以及本进程自己的用量都不会陈旧。命令和 shutdown 的 flush 始终 stat 全部文件。
+- **数字不变。** 每次刷新都用与以前相同的聚合，对缓存的 shard 做完整的重新聚合，所以总数与对同一批文件做全量扫描完全相同。reset epoch 每次刷新并行读取一次，慢的读取不能再把较新的 epoch 改回去。epoch 文件在 Windows 上的读取错误（另一个进程 reset 时的 `EPERM`/`EBUSY`）不再被当作"从未 reset"；2.10 之前它可能清掉本进程尚未落盘的用量。磁盘格式、文件名和写入协议都不变，2.8.x/2.9.x 进程可以共用同一目录。
+- **Archive。** 新的 archive generation 仍然只解析一次；为 footer 做的归约现在只覆盖当前 session（不再为每个 bucket 拼接键字符串），2 MB 的 archive 主线程耗时约减少四分之一（JSON 解析本身仍在）。未变化的 generation 只凭目录列表确认，但每次命令和 flush、以及至少每 30 秒仍会核对一次它的文件身份（archive 目录被删除重建时，generation 编号会被重复使用）。2.9.0 的 `archive.json`、仍在原地写入的 generation 和不可读的最新 generation，照旧每次刷新都核对。
+- **Watcher。** TUI 的 shard watcher 现在有 `error` 监听（Windows 上删除被监视的目录曾让 Pi 崩溃），在后台 restore 之后才创建（以前启动时目录还不存在，整个进程都没有 watcher），只把变化的文件标记给下一次刷新，忽略本进程自己的写入，并在 shutdown 和 reload 时关闭。
+
+Kill switch：`/cache-optimizer config stats-incremental off` 或 `PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0` 让每次刷新重新 stat 全部 shard 文件（后台刷新和其他修复保留）；和其他功能设置一样，持久化配置优先于环境变量。注意：2.10 之前的版本不认识这个配置键，设置后会忽略整个配置文件（回到默认值），如果同一 agent 目录下还会运行旧版本，请优先使用环境变量。`PI_CACHE_OPTIMIZER_STATS_TIMING=1` 记录每次刷新的分阶段耗时、热集合大小和文件数；`PI_CACHE_OPTIMIZER_STATS_VERIFY=1` 检查刷新所依赖的文件身份在你的文件系统上是否可靠。
+
 ## Footer 缓存统计模式
 
-当前版本把统计保存在 Pi agent 目录的 `pi-cache-optimizer-stats.d/shards/` 下。每个已加载的 extension instance 独占一个 UUID 命名 shard，并通过临时文件 + 原子 rename 写入，因此父/子/并行 Pi 进程不会互相覆盖。旧 v6 单文件统计在升级时直接删除，本地 footer 计数从零开始；不会影响上游 provider 的实际缓存。
+当前版本把统计保存在 Pi agent 目录的 `pi-cache-optimizer-stats.d/shards/` 下。每个已加载的 extension instance 独占一个当天的活跃 UUID shard，并通过临时文件 + 原子 rename 写入；本地日期切换时关闭旧 shard、创建新的 UUID，保留 session 历史，因此父/子/并行 Pi 进程不会互相覆盖。旧 v6 单文件统计在升级时直接删除，本地 footer 计数从零开始；不会影响上游 provider 的实际缓存。
+
+从 2.9.0 起，维护任务会把已关闭的往日 shard，以及进程已退出超过 24 小时的活跃 shard，合并进 `pi-cache-optimizer-stats.d/archive/` 下的一份归档快照，再删除原文件。维护最多每 6 小时一次，在共享维护锁下后台运行。某一天只有在所有时区都已结束后（该日 UTC 零点之后 36 小时）才会被归档，所以运行在其他时区的 Pi 进程看到的当天计数不会因此变化；午夜之后、日切换之前记下的用量所在的 shard 保持原样不归档。这样 shard 目录里基本只剩最近两天的 shard，启动和刷新的开销不再随 60 天保留期增长。归档计数保留 reset epoch，`reset` 立即生效，并按同样的 60 天窗口过期。归档会记录已吸收的 shard，所以合并中途崩溃也不会重复计数。旧版本不会读取归档：如果降级或与旧版本同时运行，旧版的 `session` footer 只显示尚未归档的历史；当天的 `total` 和 `process` 计数不受影响。
+
+2.9.0 之后的版本把每份快照保存为不可变的紧凑代号文件 `archive/archive.<generation>.json`，大小约为 2.9.0 单个 `archive.json` 的五分之一。压缩读到第 N 代后，只有在期间没有别人发布过的情况下才能发布第 N+1 代（用独占的硬链接实现，在 Windows 和 POSIX 上都是原子的），而且只有自己发布的代号仍是最新时才删除原始 shard；压缩运行期间还会刷新维护锁的时间戳。因此，一个停顿超过锁过期时间的进程（比如笔记本休眠）醒来后，再也不会覆盖更新的归档、造成计数丢失。读取端使用最新的代号，上一代保留到下一次发布。2.9.0 的 `archive.json` 仍然会被读取，下一次压缩会迁移它，并用一个同名目录取而代之。仍在运行的 2.9.0 进程随后会把归档视为不可读：它不再压缩或删除任何文件，它的 `session` footer 只显示尚未归档的历史，与上面所说一致。如果迁移之后 2.9.0 又写出了 `archive.json`（只有在这个目录被删除时才可能），为了杜绝重复计数，这个文件永远不会被计入，而是改名为 `archive.legacy-<time>.json` 留存，那个进程归档进去的 shard 将不会出现在 footer 里。2.9.1 之后的版本中，迁移会先把 `archive.json` 移到一旁（`archive.migrating-<id>.json`），用目录占住原位置，并在链接第一代之前核对移走的文件就是自己读到的那一份。因此，如果期间有 2.9.0 进程重新写了这个文件，下一次压缩会迁移它，而不是把它隔离；如果迁移在这一步被中断，之后会从这个占位文件继续完成。
+
+2.9.1 之后的版本中，归档读不出来时会自行恢复，而不是永久停止压缩：读取端会跳过损坏或被截断的代号，改用上一代。每一代只覆盖它记录为已吸收的原始 shard，所以回退不会重复计数，缺少的只是那一代已经归档并删除的部分。下一次压缩会在它之上发布新的一代，并把它保留为 `archive.<generation>.corrupt-<time>.json`，同时给出警告。读不出的 2.9.0 `archive.json` 会被改名为 `archive.legacy-<time>.json`，归档从原始 shard 重新开始。更新版本格式写出的归档永远不会被跳过或覆盖。在不支持硬链接的文件系统（FAT/exFAT、部分网络盘）上，新的一代以独占方式直接创建并落盘，写完整之后才会被计入。压缩出错时，约 10 分钟后重试，而不是等 6 小时。瞬时读错误（比如 Windows 上杀毒软件占用文件）会短暂重试；如果一直失败，这次刷新沿用上一次一致的快照。
+
+即使等待响应时切换到同一 provider 的另一个模型，响应统计仍归属于实际请求的 catalog/request-local 模型。旧 transport 的响应别名只根据请求快照处理，不使用新选择的模型；footer 继续显示当前选择的 direct 模型。损坏 JSON/schema 的旧 shard 按文件修改时间在两个月后清理；较新的损坏文件、有效的当天 shard、仍存活的旧 instance 和 symlink 目标均受保护。
 
 Footer 默认使用 `session`，避免另一个并行 Pi 终端使用相同 provider/model 时污染当前窗口。可以通过命令或环境变量切换显示范围：
 
 | 值 | 作用 |
 |---|---|
-| `session`（默认） | 聚合今天携带当前 hashed Pi conversation session id 且精确 provider/model 相同的 shard。Extension reload 会产生新 instance shard，但仍属于同一 session 范围。 |
-| `total` | 聚合今天同一精确 provider/model 的全部有效本地 shard，包括加载本扩展并共享同一 agent 目录的子 Pi agent。 |
-| `process` | 仅显示当前 extension instance 采集的统计。Pi 重启或 extension reload 后从 `0/0` 开始。 |
+| `session`（默认） | 聚合所有携带当前 hashed Pi conversation session id 且精确 provider/model 相同的保留 shard，跨越本地日期仍会累计。Extension reload 会产生新 instance shard，但仍属于同一长期 session 范围。 |
+| `total` | 聚合当前本地日期同一精确 provider/model 的全部有效本地 shard，包括加载本扩展并共享同一 agent 目录的子 Pi agent。 |
+| `process` | 仅显示当前 extension instance 当天采集的统计。本地日期切换、Pi 重启或 extension reload 后从 `0/0` 开始。 |
 
 持久命令配置优先于环境变量：
 
@@ -134,9 +183,9 @@ Footer 默认使用 `session`，避免另一个并行 Pi 终端使用相同 prov
 
 ## 按模型关闭 `prompt_cache_key`
 
-某些 OpenAI-compatible endpoint 会因 `prompt_cache_key` 返回 HTTP 400，但同一个字段对其他 provider 可能有效。Pi 0.87.1 没有原生的 `supportsPromptCacheKey` compat 字段，**不要**把这个未知字段加入 `models.json`。`supportsLongCacheRetention` 也不是等价开关，不应借用来实现此目的。
+某些 OpenAI-compatible Completions endpoint 会因 `prompt_cache_key` 返回 HTTP 400，但同一个字段对其他 provider 可能有效。Pi 1.0+ 已负责 Responses/Codex transport 的 key；本扩展的 fallback 和 opt-out 只作用于 `openai-completions`。Pi 1.0.3 没有原生的 `supportsPromptCacheKey` compat 字段，**不要**把这个未知字段加入 `models.json`。`supportsLongCacheRetention` 也不是等价开关，不应借用来实现此目的。
 
-当扩展观察到精确 provider/model 对 `prompt_cache_key` 的明确字段级拒绝后，普通 `/cache-optimizer fix` 会提供经过确认的模型级修复。参数值校验失败，以及“设置 temperature 时不允许”这类条件限制都不构成证据。若不同模型的响应并发交错，而 Pi 又没有提供 request ID，扩展会忽略无法安全关联的 response-header 证据；只有最终 assistant message 提供精确 provider/model 身份时才恢复归因。如果你已经确定 endpoint 不支持该字段，可以主动执行：
+当扩展观察到精确 provider/model 对 `prompt_cache_key` 的明确字段级拒绝后（包括 `未知请求字段：prompt_cache_key` 这类已识别的中文错误），普通 `/cache-optimizer fix` 会提供经过确认的模型级修复。参数值校验失败，以及“设置 temperature 时不允许”这类条件限制都不构成证据。若不同模型的响应并发交错，而 Pi 又没有提供 request ID，扩展会忽略无法安全关联的 response-header 证据；只有最终 assistant message 提供精确 provider/model 身份时才恢复归因。如果你已经确定 endpoint 不支持该字段，可以主动执行：
 
 ```text
 /cache-optimizer fix prompt-cache-key
@@ -148,7 +197,7 @@ Footer 默认使用 `session`，避免另一个并行 Pi 终端使用相同 prov
 
 LiteLLM / OneAPI / NewAPI / 类 OpenRouter 渠道等第三方 `openai-completions` 代理，常会把同一个 session 分散到多个上游后端，导致 provider 侧 prompt cache 被拆散。
 
-Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 的模型兼容性；本扩展不按 provider 名称增加特殊分支，而是结合 `models.json` 与 runtime model，按精确 provider/model 解析有效 compat。Pi 0.81+ 也内置了使用 OpenAI-shaped transport 的 `llama.cpp` provider。Pi 0.82+ core 在启用 cache retention 时会为它生成 session `prompt_cache_key`，因此本扩展会保留该 key，并在缺失时使用同样的保守 fallback。只有符合 Pi 内置 provider 明确 compat 指纹的模型会跳过通用 proxy 路由 / session-affinity 建议；仅复用 `llama.cpp` id 的自定义或覆盖 provider 仍按普通 OpenAI-compatible 渠道处理。`prompt_cache_retention` 继续遵循统一安全规则：仅官方 OpenAI 或 `models.json` 中有效配置为 `supportsLongCacheRetention: true` 时保留，否则发送前移除。Pi 0.87.1 没有原生的 `supportsPromptCacheKey` compat 字段，因此按模型关闭 key 的策略保存在本扩展的 `pi-cache-optimizer-config.json` 中，而不是 `models.json`。扩展配置独立于 Pi 的 compat 优先级，只影响其中列出的精确 provider/model。
+Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 的模型兼容性；本扩展不按 provider 名称增加特殊分支，而是结合 `models.json` 与 runtime model，按精确 provider/model 解析有效 compat。Pi 0.81+ 也内置了使用 OpenAI-shaped transport 的 `llama.cpp` provider。本扩展只对第三方 `openai-completions` 保留 session-id key fallback；Pi 1.0+ 已负责 Responses/Codex transport 的 key。只有符合 Pi 内置 provider 明确 compat 指纹的模型会跳过通用 proxy 路由 / session-affinity 建议；仅复用 `llama.cpp` id 的自定义或覆盖 provider 仍按普通 OpenAI-compatible 渠道处理。`prompt_cache_retention` 遵循统一安全规则：扩展只撤销自己设置 `PI_CACHE_RETENTION=long` 带来的副作用。依次判断：本进程内该模型已明确拒绝过该参数 → 移除；官方 OpenAI → 保留；显式 `supportsLongCacheRetention: true`（来自 `models.json`，或 provider 扩展注册的 runtime model；`models.json` 中显式 `false` 仍优先）→ 保留；用户在 Pi 启动前自行设置了 `PI_CACHE_RETENTION=long` → 保留；其余情况发送前移除。Azure OpenAI 不在白名单中，因为其长缓存支持取决于具体部署的模型。`/cache-optimizer doctor` 会显示最近一次判断及原因。Pi 1.0.3 没有原生的 `supportsPromptCacheKey` compat 字段，因此仅对 `openai-completions` 按模型关闭 key 的策略保存在本扩展的 `pi-cache-optimizer-config.json` 中，而不是 `models.json`。扩展配置独立于 Pi 的 compat 优先级，只影响其中列出的精确 provider/model。
 
 对真正的代理，建议先启用 session affinity：
 
@@ -174,12 +223,21 @@ Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 
 
 - `sendSessionAffinityHeaders: true` 是安全默认项，前提是你的代理支持 sticky routing。
 - `supportsLongCacheRetention: true` 是可选项。只有 endpoint 明确支持 OpenAI long prompt cache retention 时才添加。
-- 不要把 `supportsPromptCacheKey` 加入 `models.json`：Pi 0.87.1 没有定义这个 compat 字段。请使用 `/cache-optimizer fix prompt-cache-key` 在扩展自有配置中保存精确 provider/model 的 omit 规则；它会移除两种 key 写法，包括 Pi 提供的 key。
+- 不要把 `supportsPromptCacheKey` 加入 `models.json`：Pi 1.0.3 没有定义这个 compat 字段。请使用 `/cache-optimizer fix prompt-cache-key` 在扩展自有配置中保存精确 provider/model 的 omit 规则；它会移除两种 key 写法，包括 Pi 提供的 key。
 - 如果出现 `400 Unsupported parameter: prompt_cache_retention`，请为该渠道移除 / 避免 `supportsLongCacheRetention`；如支持，可保留 `sendSessionAffinityHeaders`。扩展会从响应头或最终 assistant error message 中识别这条明确错误，并在当前进程的后续请求中移除该参数。
 - 使用 `/cache-optimizer compat` 或 `/cache-optimizer doctor` 查看当前模型的具体建议。
+- 如果修改 `models.json` 后 compat 警告仍反复出现，请检查拼写：Pi 会忽略未知 key，`model0verrides`、`sendSessionAfinityHeaders` 这类拼错的 key 很可能不会生效。警告、`doctor` 和 `fix` 会指出疑似拼错的已知 Pi key（仅提示，不会自动改名）。
 - DeepSeek 模型名只用于选择 `DS cache` adapter，不能证明 reasoning wire protocol。缺少或使用非 DeepSeek format 时仍保留通用缓存 / 路由建议；只有 effective `compat.thinkingFormat: "deepseek"` 被明确配置时，才显示 DeepSeek replay 建议，且不会把 `thinkingFormat` 列为缺失修复项。
 - 不要因为模型 id 含有 `deepseek` 就添加 `thinkingFormat: "deepseek"`；catalog 中也存在 `openai`、`qwen`、`openrouter`、`together` 或没有显式 format 的情况。
 - 本扩展的 `doctor` 和 `compat` 命令只给建议，不会修改 `models.json`。
+
+## Prompt cache 保温（Pi 0.86+）
+
+Pi 自带缓存保温：在缓存条目过期前，用一个 token 的输出上限原样重放上一次请求（全局设置 `cacheWarming`：`off`、`streaming`（默认）或 `idle`；在 `/settings` → Cache warming 中修改，或在 `~/.pi/agent/settings.json` 中设置 `"cacheWarming"`）。本扩展不自行运行保活定时器：第二个保温器会重复计费，而且无法精确重放 Pi 的请求。
+
+Pi 只会为满足以下条件的模型保温：为当前保留档位声明了缓存时长、有输入/缓存价格、请求可重放（Anthropic 基于 budget 的 thinking 不可重放）。`models.json` 里的自定义代理模型常常缺前两项，保温根本不会启动。对价格全为 0 的模型，Pi 会以 “cache economics unavailable” 停止保温；本扩展仅在这种情况下通过 `cache_warming_decision` 返回 `warm`，因为一次刷新只是一次缓存读取加一个输出 token。有真实价格的模型仍按 Pi 自己的判断，Pi 的模式、缓存时长、可重放性和时间上限也照常生效。每次刷新都是一次真实请求，若渠道价格写 0 但实际计费，会产生费用。刷新间隔里 Pi 的 `/session` 仍会显示 “cache economics unavailable”；若其他扩展也处理 `cache_warming_decision`，以 Pi 最后执行的那个为准。有两种 0 不算免费：OpenRouter 路由模型（ID 以 `openrouter/` 开头，如 `openrouter/auto`），其 -1 占位价格在 Pi 1.2.0+ 显示为 0，但实际按路由到的模型计费；以及 Pi 1.2.0 `cost.tiers` 中有正价格的模型。可用 `/cache-optimizer config zero-price-warming off` 或 `PI_CACHE_OPTIMIZER_NO_ZERO_PRICE_WARMING=1` 关闭。`/cache-optimizer doctor` 现在会显示保温模式、档位和缺失项，并给出片段，例如 `anthropic-messages` 模型的 `"promptCache": {"short":300,"long":3600}`。自定义模型写在该模型条目中，内置模型写在 provider 的 `modelOverrides` 下；也可以运行 `/cache-optimizer fix prompt-cache` 一键写入：先预览、需确认、保留带时间戳的备份和注释，并记录 receipt，`/cache-optimizer rollback` 只会删除这次加入的 `promptCache` 对象（若文件之后没有改动则整文件恢复）。`anthropic-messages` 模型写入 `{"short":300,"long":3600}`（Anthropic 文档的 5 分钟/1 小时，与 Pi 内置 Claude 模型一致），其他 API 写入 `{"short":300}`；若当前使用长档位而该 API 没有文档化的长时长，则拒绝写入而不是猜测。已有 `promptCache` 时不会合并或覆盖，models.json 中不存在的 provider 条目也不会被创建。
+
+streaming 保温在真实请求后 60 分钟停止，idle 保温在 30 分钟后停止。本扩展使用 1 小时保留时，刷新会在第 54 分钟才触发，所以 `idle` 没有额外作用；1 小时的缓存本身已覆盖一小时内的中断。除非你使用 5 分钟缓存且经常在半小时内回来，否则保持默认的 `streaming` 即可。
 
 ## Anthropic 缓存 TTL 兼容
 
@@ -191,7 +249,7 @@ Anthropic 按 `tools → system → messages` 顺序处理 cache breakpoint，�
 
 ## Adaptive thinking 模型
 
-Claude 从 opus-4.6 / sonnet-4.6（含 Opus 5、Sonnet 5）/ fable-5 开始需要在 compat 中设置 `forceAdaptiveThinking: true`。Kimi Coding K3（`k3`）和 `kimi-for-coding` 也使用 adaptive thinking，并需要 `allowEmptySignature: true`，以正确重放空 signature 的 thinking block。缺少这些 compat 时，Pi 可能发送旧版 thinking payload 或错误重放 thinking。Pi 0.83+ 的原生 Opus 5 catalog 已覆盖在同一 adaptive-thinking 检测中；如果自定义 `anthropic-messages` 渠道没有继承该 compat，仍需手动设置。
+Claude 从 opus-4.6 / sonnet-4.6（含 Opus 5、Sonnet 5）/ fable-5 / haiku-5（Haiku 5.5，Pi 1.1.0+）开始需要在 compat 中设置 `forceAdaptiveThinking: true`。Kimi Coding K3（`k3`）和 `kimi-for-coding` 也使用 adaptive thinking，并需要 `allowEmptySignature: true`，以正确重放空 signature 的 thinking block。缺少这些 compat 时，Pi 可能发送旧版 thinking payload 或错误重放 thinking。Pi 0.83+ 的原生 Opus 5 catalog 已覆盖在同一 adaptive-thinking 检测中；如果自定义 `anthropic-messages` 渠道没有继承该 compat，仍需手动设置。
 
 Pi 内置 catalog 已为官方模型设置此 flag。`models.json` 中覆盖这些模型的自定义渠道必须包含该 flag：
 
@@ -251,6 +309,8 @@ Kimi Coding K3 自定义渠道如果包含混合模型，建议使用模型级 c
 ```
 
 Pi 0.80.9+ 已在内置 Kimi Coding、Moonshot AI / 中国区、OpenRouter 和 Vercel AI Gateway catalog 中加入 Kimi K3。Moonshot/OpenRouter 变体使用 OpenAI-compatible transport，继续走普通 Kimi footer / proxy 路径；上面的 adaptive compat 只适用于 `anthropic-messages` Kimi Coding 渠道。
+
+**Pi 1.3.0+：** 内置 `kimi-coding` 改用 OpenAI Chat Completions（`openai-completions`），地址为 `https://api.kimi.com/coding/v1`（海外：`https://api.kimi.ai/coding/v1`），compat 由 Pi 自带（`thinkingFormat: "openai"`、`reasoning_content` 回传）。因此上面的 K3 adaptive compat 只适用于旧版 Pi，或仍声明 `anthropic-messages` 的自定义渠道。官方 Kimi Code 地址是源站而不是代理，doctor/compat/fix 不再对它提示缺 `sendSessionAffinityHeaders`；经第三方中转访问 Kimi 时仍照常检查。Anthropic 时代留下的 `baseUrl` 覆盖（`https://api.kimi.com/coding`，缺 `/v1`）会让所有 Chat Completions 请求失败：doctor 会报告，`/cache-optimizer fix kimi-base-url`（或直接 `fix`）会补上 `/v1`，带预览、备份、receipt 和回滚。只处理官方域名、路径恰为 `/coding`、且模型实际使用 `openai-completions` 的情况；代理、其他路径和 Anthropic 协议条目只提示，不会修改。provider 级 `baseUrl` 若同时被其他 API 的自定义或内置模型继承（例如 Pi < 1.3.0 的 `anthropic-messages` 内置模型），则拒绝修改；请改在该模型条目上设置 `baseUrl`。
 
 `/cache-optimizer doctor` 和 `/cache-optimizer compat` 会检测缺失的 flag 并显示可复制的 JSON。
 
@@ -331,7 +391,7 @@ Pi Cache Optimizer 按 Pi 的优先级解析有效 compat（`provider.compat` �
 面向新手的安全流程是分阶段的：
 
 1. 先运行 `/cache-optimizer fix`，只处理协议无关的缓存 / 路由修复，例如 session affinity；命令会展示具体位置并要求确认。
-2. 发起一次普通请求。如果 OpenAI-compatible 的 DeepSeek-like 模型明确拒绝 `thinking` 并要求使用 `reasoning_effort`，扩展只在当前进程保留 model-scoped 分类，不会持久化或显示完整错误，不会发送隐藏探测请求，也不会在 response hook 中自动修改配置。
+2. 发起一次普通请求。如果 OpenAI-compatible 的 DeepSeek-like 模型明确拒绝 `thinking` 并要求使用 `reasoning_effort`（包括已识别的中文拒绝和建议文本），扩展只在当前进程保留 model-scoped 分类，不会持久化或显示完整错误，不会发送隐藏探测请求，也不会在 response hook 中自动修改配置。
 3. 再次运行 `/cache-optimizer fix`，查看基于证据的 model-level 协议修复；该修复写入最高优先级的 `modelOverrides[modelId].compat`，并结合 runtime compat 自检，避免 extension-provided model 静默遮挡。不会仅凭共享 provider 或模型名字扩大修改范围，显式 `openai`、`qwen`、`openrouter`、`together` format 会被尊重。
 4. 如果最近一次已确认修复导致问题，运行 `/cache-optimizer rollback`；回滚始终需要 UI 确认。
 
@@ -341,7 +401,7 @@ Rollback 会创建新的、保留访问权限的备份并使用原子替换。�
 
 ## Footer 统计
 
-统计是只读本地计数，保存在 Pi agent 目录的 UUID shard（`pi-cache-optimizer-stats.d/shards/`；自定义 agent 目录使用 `PI_CODING_AGENT_DIR`）。Shard 只包含日期、opaque session hash、精确 provider/model 计数、reset epoch 和进程生命周期元数据，不包含 API key、prompt、payload、headers、响应或模型输出。Footer 默认显示当前 conversation session；`total` 聚合同一精确 provider/model 的所有有效本地 shard，`process` 只显示当前 extension instance。旧 v6 共享统计文件升级时直接删除，不迁移旧计数。
+统计是只读本地计数，保存在 Pi agent 目录的 UUID shard（`pi-cache-optimizer-stats.d/shards/`；自定义 agent 目录使用 `PI_CODING_AGENT_DIR`）。Shard 只包含日期、opaque session hash、精确 provider/model 计数、reset epoch 和进程生命周期元数据，不包含 API key、prompt、payload、headers、响应或模型输出。Footer 默认显示当前 conversation session，并跨本地日期累计该 session；`total` 只聚合当前本地日期的同一精确 provider/model shard，`process` 只显示当前 extension instance。旧 v6 共享统计文件升级时直接删除，不迁移旧计数。
 
 Pi 0.79+ 已内置 footer `CH` 标记，用于显示最近一次 prompt cache hit rate。本扩展在此基础上补充持久化的 provider/model 计数，以及代理 compat 诊断。
 
@@ -357,9 +417,21 @@ Pi 0.79+ 已内置 footer `CH` 标记，用于显示最近一次 prompt cache hi
 
 Adapter 选择只看模型 id/name（以及 message_end 时 assistant message 的 model/name）。仅使用 OpenAI-shaped API 不会被当作 OpenAI-family，除非模型 id/name 匹配受支持的家族。
 
+## 原生虚拟模型（Pi 0.99+）
+
+Pi 0.99 允许扩展通过 `pi.registerVirtualModel()` 注册虚拟模型。选中虚拟模型时，`ctx.model` 保持为虚拟模型（`api: "pi-virtual"`），而 Pi 会把每次请求路由到某个物理模型。本扩展会自动跟随该物理模型，router 作者无需接入下文的协议。
+
+- 请求 hook 从 provider payload 中读取实际派发的模型 id，并在已配置凭证的物理模型中匹配。`prompt_cache_key` fallback、`prompt_cache_retention` 安全规则、Anthropic TTL 修复以及按模型关闭 `prompt_cache_key` 的规则都按该物理模型生效。如果多个已配置凭证的 provider 共用同一个 id 且处理方式不同，扩展不会猜测，而是跳过依赖模型身份的请求修改。
+- Footer 统计以及 `/cache-optimizer doctor`、`compat`、`stats`、`reset`、`fix` 使用当前会话分支上最近一次应答的物理模型，与 Pi 自身显示的路由模型和 context 上限一致。doctor 与 compat 会同时标出虚拟选择和该物理模型。
+- 在 Pi 路由第一个请求之前，footer 保持为空，诊断会提示先发送一个 prompt。
+- 虚拟选择默认不做 prompt 改写：Pi 在构建 system prompt 之后才决定物理模型，改写后的 prompt 不应被送到后端未知的路由。只有设置 `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` 且 routing registry 暴露完整候选链、所有候选都是已知的非 Responses / 非 Codex transport 时，才允许改写；路由未知或信息不完整时仍保持原 prompt。
+- Session-affinity header 桥接同样跳过，因为 Pi 在 payload 生成之前就构造请求 header。Pi 仍会发送物理模型自身配置的 affinity header。
+
 ## Router / Virtual-channel 扩展作者指南
 
-如果你的 Pi 扩展提供虚拟 routing provider（例如 `router/auto`、`router/smart`，或会转发到真实上游的 profile/channel），本扩展可以为真实上游 provider/model 显示缓存统计，而不是把统计记到虚拟外壳上。集成是可选、版本化的，并且**不需要导入本包**。
+如果你的 Pi 扩展提供虚拟 routing provider（例如 [`pi-router`](https://github.com/jiangge/pi-router) 的 `router/auto`、`router/smart`，或会转发到真实上游的 profile/channel），本扩展可以为真实上游 provider/model 显示缓存统计，而不是把统计记到虚拟外壳上。集成是可选、版本化的，并且**不需要导入本包**。
+
+对于 [`pi-router`](https://github.com/jiangge/pi-router)，请使用实现 `pi.routing.registry.v1` 的较新版本。直接选择 `router/*` 模型时仍使用普通 prompt optimizer；当 Pi 0.99+ 原生 virtual model 通过支持该 registry 的 router 路由时，可选的 `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` 会先检查 router candidate chain 再决定是否改写。候选包含 OpenAI Responses/Codex API、元数据不完整或路由信息不可用时，会 fail closed。
 
 ### 最小集成：最终 assistant message metadata
 
@@ -383,7 +455,7 @@ Adapter 选择只看模型 id/name（以及 message_end 时 assistant message �
 
 ### 可选：用于预响应 UX 的实时路由注册表
 
-最终 message metadata 足以支持响应后的统计。若要支持响应前流程——首次响应前的 footer 显示、`/cache-optimizer doctor`、`/cache-optimizer compat`、`/cache-optimizer reset` 和 OpenAI-compatible `prompt_cache_key` fallback——请在 `Symbol.for("pi.routing.registry.v1")` 下注册 live route adapter。
+最终 message metadata 足以支持响应后的统计。若要支持响应前流程——首次响应前的 footer 显示、`/cache-optimizer doctor`、`/cache-optimizer compat`、`/cache-optimizer reset` 和 `openai-completions` 的 `prompt_cache_key` fallback——请在 `Symbol.for("pi.routing.registry.v1")` 下注册 live route adapter。
 
 协议形状：
 
@@ -480,12 +552,11 @@ pi remove npm:pi-cache-optimizer
 
 清理时不要删除 `models.json`；它保存你的 Pi 模型 / provider 配置，不属于本包。
 
-## 验证效果
+## 可选：查看缓存统计
 
-1. 选择一个 provider 会暴露 cache usage 的模型。
-2. 在同一个 Pi session 中连续发送几轮相似请求。
-3. 观察 footer，或运行 `/cache-optimizer stats`。
-4. 对第三方代理，再运行 `/cache-optimizer doctor`，并在代理侧确认 sticky routing / session affinity。
+安装后不需要再做任何验证步骤，正常使用即可。如果希望查看 provider 实际报告的缓存情况，可以观察 footer，或运行 `/cache-optimizer stats`；排查第三方代理配置时可使用 `/cache-optimizer doctor`。
+
+仓库中的 `benchmarks/` 仅用于维护者做基准测试、A/B 实验和研究验证。它们不会进入发布包，也不是普通用户正常使用本扩展所需要的步骤。
 
 ## License
 

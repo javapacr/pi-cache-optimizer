@@ -7,6 +7,7 @@ import { createJiti } from "jiti";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { __internals_for_tests as internals } from "#extension";
+import { derivePromptCacheKey } from "../src/request-payload.ts";
 
 type PiModel = NonNullable<ExtensionContext["model"]>;
 
@@ -79,9 +80,9 @@ describe("OpenAI-compatible request contracts", () => {
       true,
     );
     assert.deepEqual(headers, {
-      session_id: "session-123",
-      "x-client-request-id": "session-123",
-      "x-session-affinity": "session-123",
+      session_id: derivePromptCacheKey("session-123"),
+      "x-client-request-id": derivePromptCacheKey("session-123"),
+      "x-session-affinity": derivePromptCacheKey("session-123"),
     });
     assert.deepEqual(internals.describeMissingOpenAICompatibleProxyCompat({ ...extensionModel, compat: effective }), []);
     assert.equal(internals.buildFixSuggestion({ ...extensionModel, compat: effective }), undefined);
@@ -105,8 +106,8 @@ describe("OpenAI-compatible request contracts", () => {
     );
     assert.deepEqual(existing, {
       "X-Client-Request-Id": "provider-value",
-      session_id: "session-123",
-      "x-session-affinity": "session-123",
+      session_id: derivePromptCacheKey("session-123"),
+      "x-session-affinity": derivePromptCacheKey("session-123"),
     });
 
     const openRouterHeaders: Record<string, string | null | undefined> = {};
@@ -121,7 +122,7 @@ describe("OpenAI-compatible request contracts", () => {
       ),
       true,
     );
-    assert.deepEqual(openRouterHeaders, { "x-session-id": "session-456" });
+    assert.deepEqual(openRouterHeaders, { "x-session-id": derivePromptCacheKey("session-456") });
 
     for (const [candidate, compat, enabled, sessionId] of [
       [extensionModel, { sendSessionAffinityHeaders: false }, true, "session-123"],
@@ -208,6 +209,218 @@ describe("OpenAI-compatible request contracts", () => {
     }
   });
 
+  test("installed Pi built-in llama.cpp models match the untouched fingerprint exemption", async () => {
+    // Hermetic agent dir: a developer's real models.json must not change the
+    // effective compat seen by the fingerprint.
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-llama-fingerprint-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      const jiti = createJiti(join(process.cwd(), "tests", "llama-fingerprint-test.ts"), { interopDefault: false, moduleCache: false });
+      const fresh = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const llamaModule = await jiti.import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/extensions/llama/provider.js")>(
+        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "extensions", "llama", "provider.js"),
+      );
+      const t = fresh.__internals_for_tests;
+      const controller = llamaModule.createLlamaProvider();
+      controller.setCatalog([{ id: "qwen-local", status: { value: "loaded" }, meta: { n_ctx: 32_768 } }], llamaModule.DEFAULT_LLAMA_SERVER_URL);
+      const [builtIn] = controller.provider.getModels();
+      assert.ok(builtIn);
+      assert.equal(builtIn.provider, "llama.cpp");
+      assert.equal(builtIn.api, "openai-completions");
+
+      // The real provider shape from the installed Pi is exempt from generic
+      // proxy routing/session-affinity advice, even on a non-official base URL.
+      assert.equal(t.isPiBuiltInLlamaCppModel(builtIn), true);
+      assert.deepEqual(t.describeMissingOpenAICompatibleProxyCompat(builtIn), []);
+
+      // Pi 0.82.x reported supportsUsageInStreaming: false; Pi 0.83+ reports
+      // true. Streaming usage is not routing configuration, so both host
+      // shapes inside the supported peer range must stay recognized.
+      for (const supportsUsageInStreaming of [false, true]) {
+        assert.equal(
+          t.isPiBuiltInLlamaCppModel({ ...builtIn, compat: { ...builtIn.compat, supportsUsageInStreaming } }),
+          true,
+          `supportsUsageInStreaming: ${supportsUsageInStreaming}`,
+        );
+      }
+
+      // Same-id providers with routing/cache overrides or a different
+      // transport fingerprint remain ordinary OpenAI-compatible channels.
+      for (const [name, compat] of Object.entries({
+        sessionAffinity: { sendSessionAffinityHeaders: true },
+        sessionAffinityFormat: { sessionAffinityFormat: "openai" },
+        longRetention: { supportsLongCacheRetention: true },
+        developerRole: { supportsDeveloperRole: true },
+      })) {
+        assert.equal(t.isPiBuiltInLlamaCppModel({ ...builtIn, compat: { ...builtIn.compat, ...compat } } as PiModel), false, name);
+      }
+      assert.deepEqual(
+        t.describeMissingOpenAICompatibleProxyCompat({ ...builtIn, compat: { ...builtIn.compat, supportsDeveloperRole: true } }),
+        ["sendSessionAffinityHeaders"],
+      );
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("skill compression anchors on the installed Pi skills formatter", async () => {
+    // compressSkillsInSystemPrompt only substitutes an exact copy of Pi's
+    // verbose skills block. Drift would silently disable compression.
+    const piSkills = await createJiti(join(process.cwd(), "tests", "skills-format-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/skills.js")>(
+      join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "skills.js"),
+    );
+    const sourceInfo = { path: "/skills/alpha/SKILL.md", source: "local", scope: "user", origin: "top-level" };
+    const skills = [
+      { name: "alpha", description: "Alpha <xml> & \"quotes\"", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", sourceInfo, disableModelInvocation: false },
+      { name: "beta", description: "Beta", filePath: "/project/.pi/skills/beta/SKILL.md", baseDir: "/project/.pi/skills/beta", sourceInfo, disableModelInvocation: false },
+      { name: "hidden", description: "Hidden", filePath: "/skills/hidden/SKILL.md", baseDir: "/skills/hidden", sourceInfo, disableModelInvocation: true },
+    ] as any;
+    assert.equal(internals.formatSkillsForPrompt(skills), piSkills.formatSkillsForPrompt(skills));
+    assert.equal(internals.formatSkillsForPrompt(skills, "bash"), piSkills.formatSkillsForPrompt(skills, "bash"));
+    assert.equal(internals.formatSkillsForPrompt(skills, "indirect"), piSkills.formatSkillsForPrompt(skills, "indirect"));
+  });
+
+  test("the legacy skill-list wording is byte-exact with Pi 1.4.0", async () => {
+    // Pinned output of Pi 1.4.0's formatSkillsForPrompt (the last release with the legacy path rule), so the
+    // legacy entry of SKILL_PATH_RULE_WORDINGS cannot drift once the installed Pi only emits the new wording.
+    const fixture = JSON.parse(await readFile(join(process.cwd(), "tests", "fixtures", "pi-1.4.0-skills-format.json"), "utf8"));
+    const sourceInfo = { path: "/skills/alpha/SKILL.md", source: "local", scope: "user", origin: "top-level" };
+    const skills = [
+      { name: "alpha", description: "Alpha <xml> & \"quotes\"", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", sourceInfo, disableModelInvocation: false },
+      { name: "beta", description: "Beta", filePath: "/project/.pi/skills/beta/SKILL.md", baseDir: "/project/.pi/skills/beta", sourceInfo, disableModelInvocation: false },
+      { name: "hidden", description: "Hidden", filePath: "/skills/hidden/SKILL.md", baseDir: "/skills/hidden", sourceInfo, disableModelInvocation: true },
+    ] as any;
+    const legacyRule = internals.SKILL_PATH_RULE_WORDINGS[1];
+    for (const tool of ["read", "bash", "indirect"] as const) {
+      assert.equal(internals.formatSkillsForPrompt(skills, tool, legacyRule), fixture[tool], tool);
+    }
+  });
+
+  describe("skill compression on Pi's real system prompt", () => {
+    const sourceInfo = { path: "", source: "local", scope: "user", origin: "top-level" };
+    const skill = (name: string, description: string, filePath: string, disableModelInvocation = false) =>
+      ({ name, description, filePath, baseDir: filePath, sourceInfo, disableModelInvocation }) as any;
+    const skills = [
+      skill("zeta", "Zeta does things.\n  Use when zeta.", "/home/u/.agents/skills/zeta/SKILL.md"),
+      skill("alpha", "Alpha with <xml> & \"quotes\" and $& replacement tokens", "/home/u/.agents/skills/alpha/SKILL.md"),
+      skill("beta", "Beta project skill", "/work/.pi/skills/beta/SKILL.md"),
+      skill("odd", "Directory name differs from skill name", "/home/u/.agents/skills/other-dir/SKILL.md"),
+      skill("win", "Windows style path", "C:\\Users\\u\\skills\\win\\SKILL.md"),
+      skill("hidden", "Must never be listed", "/home/u/.agents/skills/hidden/SKILL.md", true),
+    ];
+    const loadPiPrompt = async () => {
+      const mod = await createJiti(join(process.cwd(), "tests", "system-prompt-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js")>(
+        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "system-prompt.js"),
+      );
+      return (selectedTools: string[], hiddenTools: string[] = []) =>
+        mod.buildSystemPrompt({ cwd: "/work", selectedTools, hiddenTools, skills, contextFiles: [] } as any);
+    };
+
+    test("fires on the prompt Pi actually assembles, keeping every name and description", async () => {
+      const build = await loadPiPrompt();
+      const prompt = build(["read", "bash"]);
+      assert.ok(prompt.includes("<available_skills>"), "Pi should emit the verbose block");
+      const out = internals.compressSkillsInSystemPrompt(prompt, { skills } as any);
+      assert.notEqual(out, prompt, "compression must fire against Pi's real output");
+      assert.ok(out.length < prompt.length);
+      assert.ok(!out.includes("<available_skills>"));
+      assert.match(out, /<skills>\nThe following skills provide specialized instructions/);
+      assert.match(out, /<\/skills>/);
+      for (const s of skills.filter((entry: any) => !entry.disableModelInvocation)) {
+        assert.ok(out.includes(s.name), `${s.name} listed`);
+        assert.ok(out.includes(s.description.replace(/\s+/g, " ").trim()), `${s.name} description kept verbatim`);
+      }
+      assert.ok(!out.includes("Must never be listed"));
+    });
+
+    test("states each root once and gives explicit paths where the convention does not hold", async () => {
+      const build = await loadPiPrompt();
+      const out = internals.compressSkillsInSystemPrompt(build(["read"]), { skills } as any);
+      assert.equal(out.split("## Skills in /home/u/.agents/skills/").length, 2);
+      assert.ok(out.includes("Each skill file is at /home/u/.agents/skills/<name>/SKILL.md"));
+      assert.ok(out.includes("## Skills in /work/.pi/skills/"));
+      assert.ok(out.includes("- odd (file: /home/u/.agents/skills/other-dir/SKILL.md): Directory name differs"));
+      assert.ok(out.includes("- win (file: C:\\Users\\u\\skills\\win\\SKILL.md): Windows style path"));
+      // Conventional skills must not repeat their path.
+      assert.ok(!out.includes("/home/u/.agents/skills/alpha/SKILL.md"));
+      // Dollar patterns in descriptions must not be interpreted as replacement tokens.
+      assert.ok(out.includes("$& replacement tokens"));
+    });
+
+    test("is deterministic, idempotent and independent of skill order", async () => {
+      const build = await loadPiPrompt();
+      const prompt = build(["read"]);
+      const once = internals.compressSkillsInSystemPrompt(prompt, { skills } as any);
+      assert.equal(internals.compressSkillsInSystemPrompt(once, { skills } as any), once);
+      const reversed = [...skills].reverse();
+      assert.equal(internals.formatSkillsForPromptCompressed(reversed), internals.formatSkillsForPromptCompressed(skills));
+    });
+
+    test("also matches the pre-0.86 layout where the block was appended with leading newlines", () => {
+      const legacy = `base prompt${internals.formatSkillsForPrompt(skills)}\n\nCurrent working directory: /work`;
+      const out = internals.compressSkillsInSystemPrompt(legacy, { skills } as any);
+      assert.notEqual(out, legacy);
+      assert.ok(out.startsWith("base prompt\n\nThe following skills"));
+      assert.ok(out.endsWith("\n\nCurrent working directory: /work"));
+    });
+
+    test("still compresses a list rendered with the pre-1.5 Pi path-rule wording, keeping that wording", () => {
+      const [current, legacyRule] = internals.SKILL_PATH_RULE_WORDINGS;
+      for (const tool of ["read", "bash", "indirect"] as const) {
+        const selectedTools = tool === "read" ? ["read"] : tool === "bash" ? ["bash"] : ["codemode", "read"];
+        const hiddenTools = tool === "indirect" ? ["read"] : [];
+        const block = internals.formatSkillsForPrompt(skills, tool, legacyRule).trim();
+        assert.ok(block.includes(legacyRule) && !block.includes(current));
+        const prompt = `base\n\n<skills>\n${block}\n</skills>\n\nCurrent working directory: /work`;
+        const opts = { skills, selectedTools, hiddenTools } as any;
+        const out = internals.compressSkillsInSystemPrompt(prompt, opts);
+        assert.ok(!out.includes("<available_skills>"), `${tool}: legacy list is compressed`);
+        assert.ok(out.includes(legacyRule) && !out.includes(current), `${tool}: the legacy wording is kept`);
+        assert.equal(internals.compressSkillsInSystemPrompt(out, opts), out);
+        assert.notEqual(internals.explainSkillCompressionSkip(prompt, opts),
+          "Pi's skill list format was not recognised; Pi may have changed it (please report this)", `${tool}: doctor recognises the legacy wording`);
+      }
+    });
+
+    test("compresses via the skills section when Pi renders the pre-1.5 wording", () => {
+      const legacyRule = internals.SKILL_PATH_RULE_WORDINGS[1];
+      const block = internals.formatSkillsForPrompt(skills, "read", legacyRule).trim();
+      const compressed = internals.formatSkillsForPromptCompressed(skills, "read", legacyRule).trim();
+      const options: any = { skills, sections: {} };
+      const event = { get systemPrompt() { return `base\n\n<skills>\n${options.sections.skills ?? block}\n</skills>`; }, systemPromptOptions: options };
+      assert.equal(internals.compressSkillsViaSection(event), true);
+      assert.equal(options.sections.skills, compressed);
+      assert.ok(compressed.includes(legacyRule));
+    });
+
+    test("no-ops below the minimum count, when Pi's text differs, and when opted out", async () => {
+      const build = await loadPiPrompt();
+      const prompt = build(["read"]);
+      assert.equal(internals.compressSkillsInSystemPrompt(prompt, { skills: skills.slice(0, 2) } as any), prompt);
+      // `bash`-only tool sets make Pi say "Use bash to load…"; compression must recognise that wording too.
+      const bashOnly = build(["bash"]);
+      const bashOut = internals.compressSkillsInSystemPrompt(bashOnly, { skills, selectedTools: ["bash"] } as any);
+      assert.ok(!bashOut.includes("<available_skills>"), "bash-only prompt is compressed");
+      assert.ok(bashOut.includes("Use bash to load a skill's file when the task matches its description."), "Pi's bash wording is kept");
+      // Hidden readers (reachable only through another tool, e.g. a code-mode wrapper) make Pi name no tool.
+      const hidden = build(["codemode", "read", "bash"], ["read", "bash"]);
+      const hiddenOut = internals.compressSkillsInSystemPrompt(hidden, { skills, selectedTools: ["codemode", "read", "bash"], hiddenTools: ["read", "bash"] } as any);
+      assert.ok(!hiddenOut.includes("<available_skills>"), "hidden-reader prompt is compressed");
+      assert.ok(hiddenOut.includes("Load a skill's file when the task matches its description."), "Pi's tool-less wording is kept");
+      const previous = process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION;
+      process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION = "1";
+      try {
+        assert.equal(internals.compressSkillsInSystemPrompt(prompt, { skills } as any), prompt);
+      } finally {
+        if (previous === undefined) delete process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION;
+        else process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION = previous;
+      }
+    });
+  });
+
   test("installed Pi registerProvider drops lower provider compat for extension-owned models", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-extension-provider-model-test-"));
     try {
@@ -287,9 +500,9 @@ describe("OpenAI-compatible request contracts", () => {
       const enabledHeaders: Record<string, string | null> = {};
       requestHeaders({ headers: enabledHeaders }, context);
       assert.deepEqual(enabledHeaders, {
-        session_id: "hook-session",
-        "x-client-request-id": "hook-session",
-        "x-session-affinity": "hook-session",
+        session_id: derivePromptCacheKey("hook-session"),
+        "x-client-request-id": derivePromptCacheKey("hook-session"),
+        "x-session-affinity": derivePromptCacheKey("hook-session"),
       });
       assert.deepEqual(fresh.__internals_for_tests.describeMissingOpenAICompatibleProxyCompat(runtimeModel), []);
       assert.equal(fresh.__internals_for_tests.buildFixSuggestion(runtimeModel), undefined);
@@ -433,7 +646,7 @@ describe("OpenAI-compatible request contracts", () => {
         }));
         const routedProxyHeaders: Record<string, string | null> = {};
         requestHeaders({ headers: routedProxyHeaders }, routeContext);
-        assert.equal(routedProxyHeaders["x-session-affinity"], "hook-session");
+        assert.equal(routedProxyHeaders["x-session-affinity"], derivePromptCacheKey("hook-session"));
       } finally {
         unregisterRouter();
       }
@@ -501,9 +714,17 @@ describe("OpenAI-compatible request contracts", () => {
         providers: { "cache-key-proxy": { compat: { supportsPromptCacheKey: false } } },
       }));
       assert.equal(fresh.__internals_for_tests.shouldInjectOpenAIPromptCacheKeyForModel(runtimeModel), true);
+      assert.equal(
+        fresh.__internals_for_tests.shouldInjectOpenAIPromptCacheKeyForModel({ ...runtimeModel, api: "openai-responses" } as any),
+        false,
+      );
       assert.deepEqual(
         request({ payload: { messages: [] } }, context),
-        { messages: [], prompt_cache_key: "cache-key-session" },
+        { messages: [], prompt_cache_key: derivePromptCacheKey("cache-key-session") },
+      );
+      assert.equal(
+        request({ payload: { input: [] } }, { ...context, model: { ...runtimeModel, api: "openai-responses" } }),
+        undefined,
       );
 
       // The extension-owned config is the only per-model opt-out. It removes
@@ -924,6 +1145,7 @@ describe("v7 shard persistence and aggregation", () => {
       // Lifecycle refresh must clear the stale process-local bucket before the
       // final closed write, even when no new assistant message arrives.
       await handlers.get("agent_settled")?.({}, context);
+      await fresh.__internals_for_tests.statsRefreshSettled();
       await handlers.get("session_shutdown")?.({ reason: "quit" }, context);
       const shardDir = fresh.__internals_for_tests.SHARD_FILES_DIR;
       const shardName = (await readdir(shardDir)).find((name) => name.endsWith(".json"));
