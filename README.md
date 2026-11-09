@@ -17,6 +17,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Install](#install)
 - [Commands](#commands)
 - [Persistent opt-out](#persistent-opt-out)
+- [Cache retention modes](#cache-retention-modes)
 - [Per-model `prompt_cache_key` opt-out](#per-model-prompt_cache_key-opt-out)
 - [Opt-in deterministic tool ordering](#opt-in-deterministic-tool-ordering)
 - [Footer refresh (2.10)](#footer-refresh-210)
@@ -80,6 +81,7 @@ This extension requires Pi 0.82+ and is validated against Pi 1.5.0. It uses the 
 | `/cache-optimizer stats contributors` | Shows current/other contributing sessions for the active exact provider/model without exposing session ids. |
 | `/cache-optimizer reset` | Resets local footer stats for the active provider/model; upstream provider cache is not modified. |
 | `/cache-optimizer config footer-mode total\|session\|process` | Persist the footer stats mode. Persistent command configuration overrides the environment variable. |
+| `/cache-optimizer config retention long\|short\|none\|startup` | Persist the cache retention mode (fork). Applies at once while the optimizer is enabled; persistent configuration overrides the environment variable. See [Cache retention modes](#cache-retention-modes). |
 | `/cache-optimizer fix` | Auto-repairs safe compat issues for the active model. Shows preview + risk warning, requires confirmation. It writes `models.json` only for native compat fixes, or the extension config for an evidenced `prompt_cache_key` issue. |
 | `/cache-optimizer fix prompt-cache` | Adds `promptCache` lifetimes for the active model so Pi's native cache warming can run. Preview, backup, receipt, and rollback. Requires confirmation. |
 | `/cache-optimizer fix prompt-cache-key` | Explicitly configures the active OpenAI-compatible provider/model to omit `prompt_cache_key` and `promptCacheKey` from the final request body. Requires confirmation. |
@@ -121,6 +123,29 @@ Persistent feature settings are managed under the Pi agent directory by the nati
 `openai-codex-responses` keeps Pi's native skill index even when skill compression is enabled. Real task-level benchmarks with `openai-codex/gpt-6-luna` showed that the shorter Markdown skill index could increase the model's tool-call trajectory and total task cost; Codex therefore keeps the native Pi XML skill list while still benefiting from the optimizer's other cache/runtime features.
 
 `config reset` reads the latest disk configuration under the shared transaction lock and removes only persistent feature overrides, preserving the latest footer mode, model-specific prompt-cache-key settings, and file permissions. Invalid JSON/schema, symlinks, non-regular targets, and concurrent manual changes are refused rather than overwritten. These commands do not modify shell startup files or `PI_CACHE_RETENTION`; `enable` and `disable` remain current-process runtime switches.
+
+## Cache retention modes
+
+> Fork-only (`javapacr/pi-cache-optimizer`); upstream has no retention setting. For every other toggle, see [Persistent opt-out](#persistent-opt-out).
+
+Upstream sets `PI_CACHE_RETENTION=long` at extension load, on `/cache-optimizer enable` and at session start, overwriting any value Pi started with. This fork gates those three writes with one setting. With no setting, behaviour is upstream's: `long`.
+
+| Mode | Effect on `PI_CACHE_RETENTION` |
+|---|---|
+| `long` (default) | Set to `long`: 1-hour cache TTL where Pi supports it. Upstream behaviour, including the `prompt_cache_retention` safety rule. |
+| `short` | Set to `short`: 5-minute cache TTL. |
+| `none` | Removed: Pi core applies its own default (5 minutes). |
+| `startup` | Left as Pi started with it (shell or env loader). |
+
+Three knobs, in priority order:
+
+1. The top-level `retention` key in `pi-cache-optimizer-config.json`, next to upstream's `features` (schema v3): `{"version":3,"footerMode":"session","retention":"short","features":{"promptRewrite":false}}`.
+2. The environment variable `PI_CACHE_OPTIMIZER_RETENTION=long|short|none|startup`.
+3. The default, `long`.
+
+`/cache-optimizer config retention long|short|none|startup` writes the key; as you type it, the completion menu offers the four modes, and the interactive menu has a `Retention` entry. It applies at once while the optimizer is enabled; after `/cache-optimizer disable` it is stored and applied on `/cache-optimizer enable`. `/cache-optimizer config`, the runtime status and `/cache-optimizer doctor` show `Retention: <mode> (<source>)`, where the source is `config`, `env` or `default`. `/cache-optimizer config reset` keeps `retention`, as it keeps `footerMode`. An invalid `retention` value is ignored on its own: the rest of the file still applies, and the status line names the source actually used. `/cache-optimizer disable` and session shutdown restore the value Pi started with, as upstream does.
+
+Why not always `long`: a 1-hour Anthropic cache write costs 2× the base input price, against 1.25× for 5 minutes, so short or bursty sessions pay more under `long`. On Anthropic-direct models Pi sends the 1-hour TTL only when the model's `supportsLongCacheRetention` compat allows it (default true); setting it to `false` in `models.json` is a per-model workaround, but this extension's diagnostics then still report `long`. On Amazon Bedrock, Pi sends the 1-hour TTL whenever retention is `long`, with no compat gate, so `short` is the only way to keep the 5-minute TTL there with every other feature still active.
 
 ## Opt-in deterministic tool ordering
 
